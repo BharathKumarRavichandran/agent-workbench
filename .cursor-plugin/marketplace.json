@@ -1,0 +1,21 @@
+{
+  "name": "bharath-agent-plugins",
+  "owner": {
+    "name": "Bharath Kumar Ravichandran"
+  },
+  "metadata": {
+    "description": "Bharath's portable plugins and skills for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "pstack",
+      "source": "vendor/cursor-plugins/pstack",
+      "description": "if you want to go fast, go deep first. pstack helps you write less, but higher quality code. rigorous agent workflows you can parallelize with confidence."
+    },
+    {
+      "name": "karpathy-guidelines",
+      "source": "plugins/karpathy-guidelines",
+      "description": "Behavioral guidelines for simple, surgical, verifiable coding changes."
+    }
+  ]
+}

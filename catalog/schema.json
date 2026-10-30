@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/agent-plugins/catalog.schema.json",
+  "title": "Agent plugin catalog",
+  "type": "object",
+  "required": ["schemaVersion", "marketplace", "plugins"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "marketplace": {
+      "type": "object",
+      "required": ["name", "owner", "description"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "owner": {
+          "type": "object",
+          "required": ["name"],
+          "properties": { "name": { "type": "string", "minLength": 1 } },
+          "additionalProperties": true
+        },
+        "description": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "plugins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "origin", "upstream", "packages"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "origin": { "enum": ["local", "copied", "submodule"] },
+          "upstream": { "type": "string", "format": "uri" },
+          "packages": {
+            "type": "object",
+            "required": ["cursor", "claude", "skills"],
+            "properties": {
+              "cursor": { "type": "string" },
+              "claude": { "type": "string" },
+              "skills": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": 1,
+  "marketplace": {
+    "name": "bharath-agent-plugins",
+    "owner": {
+      "name": "Bharath Kumar Ravichandran"
+    },
+    "description": "Bharath's portable plugins and skills for coding agents."
+  },
+  "plugins": [
+    {
+      "id": "pstack",
+      "origin": "submodule",
+      "upstream": "https://github.com/cursor/plugins/tree/main/pstack",
+      "packages": {
+        "cursor": "vendor/cursor-plugins/pstack",
+        "claude": "vendor/cursor-plugins/harness/pstack/claude-code",
+        "skills": "vendor/cursor-plugins/pstack/skills"
+      }
+    },
+    {
+      "id": "karpathy-guidelines",
+      "origin": "copied",
+      "upstream": "https://github.com/multica-ai/andrej-karpathy-skills/blob/main/skills/karpathy-guidelines/SKILL.md",
+      "packages": {
+        "cursor": "plugins/karpathy-guidelines",
+        "claude": "plugins/karpathy-guidelines",
+        "skills": "plugins/karpathy-guidelines/skills"
+      }
+    }
+  ]
+}
