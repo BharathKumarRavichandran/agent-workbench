@@ -14,6 +14,7 @@ import os
 import re
 import stat
 from contextlib import contextmanager, ExitStack
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, TYPE_CHECKING
 
@@ -102,17 +103,33 @@ def _tree(value: dict[str, object]) -> bundles.Tree:
     return bundles.Tree(directories, files)
 
 
-def _capture(root: _DestinationRoot, operation: InstallOperation) -> dict[str, object] | None:
-    from .installation import _read_regular
+def _path_revision(fd: int, name: str) -> tuple[int, ...] | None:
     try:
-        os.stat(operation.destination.name, dir_fd=root.fd, follow_symlinks=False)
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _capture_at(fd: int, operation: InstallOperation) -> dict[str, object] | None:
+    from .installation import _read_regular
+    name = operation.destination.name
+    before = _path_revision(fd, name)
+    if before is None:
+        return None
     if isinstance(operation.resource, DirectoryCopy):
-        return {'tree': _tree_data(bundles.read_tree(operation.destination.name, root.fd))}
-    if isinstance(operation.resource, DirectorySymlink):
-        return {'link': str(root.readlink(operation))}
-    return {'file': _pack(_read_regular(operation.destination.name, root.fd))}
+        value = {'tree': _tree_data(bundles.read_tree(name, fd))}
+    elif isinstance(operation.resource, DirectorySymlink):
+        value = {'link': os.readlink(name, dir_fd=fd)}
+    else:
+        value = {'file': _pack(_read_regular(name, fd))}
+    if _path_revision(fd, name) != before:
+        raise ValueError('managed path changed while reading; journal retained')
+    return value
+
+
+def _capture(root: _DestinationRoot, operation: InstallOperation) -> dict[str, object] | None:
+    return _capture_at(root.fd, operation)
 
 
 def _fingerprint(value: object) -> str:
@@ -131,39 +148,110 @@ def _discard_snapshot(root: _DestinationRoot, name: str) -> None:
         os.unlink(name, dir_fd=root.fd)
 
 
+@dataclass(frozen=True)
+class _PathRestore:
+    before: dict[str, object] | None
+    expected: dict[str, object] | None
+    allowed: tuple[object, ...]
+    revision: tuple[int, ...] | None
+
+
 def _restore_path(root: _DestinationRoot, operation: InstallOperation,
-                  value: dict[str, object] | None, quarantine: str) -> None:
-    current = _capture(root, operation)
-    if _fingerprint(current) == _fingerprint(value):
-        _discard_snapshot(root, quarantine)
-        return
+                  restore: _PathRestore, quarantine: str) -> None:
+    value, expected, allowed = restore.before, restore.expected, restore.allowed
+
+    def capture(name: str) -> dict[str, object] | None:
+        return _capture(root, replace(operation, destination=operation.destination.with_name(name)))
+
+    def check(content: object) -> None:
+        if _fingerprint(content) not in {_fingerprint(item) for item in allowed}:
+            raise ValueError('recovery blocked by modified managed path; journal retained')
+
     name = operation.destination.name
-    # Keep a partially deleted tree away from the active path, so another crash
-    # during rollback still leaves either a complete snapshot or an absent path.
-    _discard_snapshot(root, quarantine)
-    if current is not None:
-        bundles.rename_new(name, quarantine, root.fd)
-        os.fsync(root.fd)
-    if value is not None:
-        if 'tree' in value:
-            temporary = quarantine + '-tree'
-            _discard_snapshot(root, temporary)
-            bundles.write_tree(temporary, root.fd, _tree(value['tree']))
-            bundles.rename_new(temporary, name, root.fd)
-        elif 'link' in value:
-            os.symlink(value['link'], name, dir_fd=root.fd)
-        else:
-            temporary = quarantine + '-file'
-            _discard_snapshot(root, temporary)
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=root.fd)
-            with os.fdopen(fd, 'wb') as handle:
-                handle.write(_unpack(value['file']))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.link(temporary, name, src_dir_fd=root.fd, dst_dir_fd=root.fd, follow_symlinks=False)
-            os.unlink(temporary, dir_fd=root.fd)
+    current = capture(name)
+    if (_fingerprint(current) != _fingerprint(expected)
+            or _path_revision(root.fd, name) != restore.revision):
+        raise ValueError('recovery blocked by modified managed path; journal retained')
+    # A prior recovery may have captured an entry before a second crash.
+    saved = capture(quarantine)
+    if saved is not None:
+        check(saved)
+    if _fingerprint(current) != _fingerprint(value):
+        if current is not None:
+            if saved is not None:
+                raise ValueError('recovery blocked by occupied path quarantine; journal retained')
+            bundles.rename_new(name, quarantine, root.fd)
+            os.fsync(root.fd)
+            saved = capture(quarantine)
+            captured_revision = _path_revision(root.fd, quarantine)
+            if (_fingerprint(saved) != _fingerprint(expected)
+                    or captured_revision is None or restore.revision is None
+                    or captured_revision[:5] != restore.revision[:5]):
+                # Return a captured foreign object only without replacement.
+                try:
+                    bundles.rename_new(quarantine, name, root.fd)
+                    os.fsync(root.fd)
+                except FileExistsError:
+                    pass
+                raise ValueError('recovery blocked by modified managed path during capture; journal retained')
+        if value is not None:
+            if 'tree' in value:
+                temporary = quarantine + '-tree'
+                staged = capture(temporary)
+                if staged is not None:
+                    if _fingerprint(staged) != _fingerprint(value):
+                        raise ValueError('recovery blocked by modified staged path; journal retained')
+                else:
+                    bundles.write_tree(temporary, root.fd, _tree(value['tree']))
+                bundles.rename_new(temporary, name, root.fd)
+            elif 'link' in value:
+                os.symlink(value['link'], name, dir_fd=root.fd)
+            else:
+                temporary = quarantine + '-file'
+                staged = capture(temporary)
+                if staged is not None and _fingerprint(staged) != _fingerprint(value):
+                    raise ValueError('recovery blocked by modified staged path; journal retained')
+                if staged is None:
+                    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=root.fd)
+                    with os.fdopen(fd, 'wb') as handle:
+                        handle.write(_unpack(value['file']))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                bundles.rename_new(temporary, name, root.fd)
+        elif capture(name) is not None:
+            raise ValueError('recovery blocked by new managed path; journal retained')
     os.fsync(root.fd)
+    # Only discard authenticated captured content after publication is durable.
+    if _fingerprint(capture(quarantine)) != _fingerprint(saved):
+        raise ValueError('recovery blocked by modified path quarantine; journal retained')
     _discard_snapshot(root, quarantine)
+    os.fsync(root.fd)
+
+
+def _discard_path_evidence(root: _DestinationRoot, operation: InstallOperation,
+                           item: dict[str, object]) -> None:
+    name = item['quarantine']
+    try:
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root.fd)
+    except FileNotFoundError:
+        return
+    try:
+        if set(os.listdir(child)) - {'entry'}:
+            raise ValueError('recovery blocked by foreign path evidence; journal retained')
+        captured = _capture_at(child, replace(operation, destination=operation.destination.with_name('entry')))
+        before = item['before']
+        if captured is not None and _fingerprint(captured) != _fingerprint(before):
+            # Apply may have died part way through deleting the old bundle.
+            if before is None or 'tree' not in captured or 'tree' not in before:
+                raise ValueError('recovery blocked by modified path evidence; journal retained')
+            partial, complete = _tree(captured['tree']), _tree(before['tree'])
+            if (not set(partial.directories) <= set(complete.directories)
+                    or not set(partial.files) <= set(complete.files)):
+                raise ValueError('recovery blocked by modified path evidence; journal retained')
+    finally:
+        os.close(child)
+    bundles.delete_tree(name, root.fd)
+    os.fsync(root.fd)
 
 
 def _journal_path(roots: dict[ComponentKind, Path]) -> Path:
@@ -230,10 +318,10 @@ def _check_document_quarantines(item: dict[str, object], fd: int) -> bool:
         except FileNotFoundError:
             continue
         try:
-            if set(os.listdir(child)) - {'entry', 'new'}:
+            if set(os.listdir(child)) - {'entry', 'new', 'recovery'}:
                 raise ValueError('recovery blocked by foreign document quarantine; journal retained')
             for entry in os.listdir(child):
-                if entry == 'new':
+                if entry in {'new', 'recovery'}:
                     # Staging may have stopped mid-write; only a prefix of an
                     # authenticated planned document can be our partial temp.
                     partial = _read_regular(entry, child)
@@ -248,6 +336,52 @@ def _check_document_quarantines(item: dict[str, object], fd: int) -> bool:
     return evidence
 
 
+def _prepare_document_recovery(item: dict[str, object], current: shared_config.DocumentSnapshot,
+                               fd: int) -> shared_config.DocumentSnapshot:
+    if shared_config.snapshot(current.path, fd) != current:
+        raise ValueError('recovery blocked by modified document; journal retained')
+    evidence = _check_document_quarantines(item, fd)
+    if current.content is None and evidence:
+        # Publish the deactivated document from authenticated journal bytes.
+        # The captured entry remains evidence through publication AND fsync.
+        content = _unpack(item['removed'])
+        if content is None:
+            content = _unpack(item['before'])
+        if content is not None:
+            for name in _document_quarantines(item):
+                try:
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        os.unlink('recovery', dir_fd=child)
+                    except FileNotFoundError:
+                        pass
+                    out = os.open('recovery', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=child)
+                    with os.fdopen(out, 'wb') as handle:
+                        handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    bundles.rename_new('recovery', current.path.name, child, fd)
+                    os.fsync(fd)
+                    current = shared_config.snapshot(current.path, fd)
+                    if current.content != content:
+                        raise ValueError('recovery blocked by modified document publication; journal retained')
+                    break
+                finally:
+                    os.close(child)
+    os.fsync(fd)
+    _check_document_quarantines(item, fd)
+    for name in _document_quarantines(item):
+        try:
+            bundles.delete_tree(name, fd)
+        except FileNotFoundError:
+            pass
+    os.fsync(fd)
+    return current
+
+
 def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
     from .installation import _DestinationRoot, DestinationSnapshot, InstallOperation, OperationKind, _destination_anchor, _destination_identity
     journal = _journal_path(roots)
@@ -259,7 +393,16 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
         data = _journal_record(saved, file)
         state_before = _unpack(data['stateBefore'])
         state_after = _unpack(data['stateAfter'])
-        if shared_config.snapshot(file).content not in (state_before, state_after):
+        state_item = {'path': str(file), 'before': data['stateBefore'],
+                      'removed': data['stateBefore'], 'after': data['stateAfter'],
+                      'quarantine': '.agent-workbench-document-' + hashlib.sha256(str(file).encode()).hexdigest()[:16]}
+        state_fd = bundles.open_directory(file.parent)
+        try:
+            state_evidence = _check_document_quarantines(state_item, state_fd)
+            state_snapshot = shared_config.snapshot(file, state_fd)
+        finally:
+            os.close(state_fd)
+        if state_snapshot.content not in (state_before, state_after) and not (state_snapshot.content is None and state_evidence):
             raise ValueError('recovery blocked by externally modified ownership state; journal retained')
         allowed_documents = {str(shared_config.document_path(roots, component)) for component in (ComponentKind.HOOKS, ComponentKind.MCP)}
         allowed_documents.add(str(journal.parent / '.agent-workbench-owners.json'))
@@ -305,46 +448,43 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
                 current = _capture(root, operation)
                 if _fingerprint(current) not in {_fingerprint(item['before']), _fingerprint(item['after']), _fingerprint(None)}:
                     raise ValueError('recovery blocked by modified managed path; journal retained')
-                records.append((root, operation, item))
+                records.append((root, operation, item, current, _path_revision(root.fd, path.name)))
             # Deactivate changing slots before undoing bundle mutations. Restore
             # old slots only after every prior bundle is back in place.
             for item in documents:
-                for name in _document_quarantines(item):
-                    try:
-                        bundles.delete_tree(name, fd)
-                    except FileNotFoundError:
-                        pass
                 current = document_snapshots[item['path']]
+                # Restore an interrupted document durably before discarding
+                # its capture evidence. Keep hooks deactivated during rollback.
+                current = _prepare_document_recovery(item, current, fd)
+                document_snapshots[item['path']] = current
                 if current.content != _unpack(item['removed']):
                     document_snapshots[item['path']] = shared_config.compare_replace_document(
                         current, _unpack(item['removed']), fd, item['quarantine'] + '-recover-remove')
                 elif shared_config.snapshot(current.path, fd) != current:
                     raise ValueError('recovery blocked by modified document; journal retained')
-            for root, operation, item in reversed(records):
-                _restore_path(root, operation, item['before'], item['quarantine'] + '-rollback')
+            for root, operation, item, current, revision in reversed(records):
+                _restore_path(root, operation, _PathRestore(item['before'], current,
+                              (item['before'], item['after'], None), revision), item['quarantine'] + '-rollback')
                 quarantine = item['quarantine']
                 if not quarantine.startswith('.agent-workbench-quarantine-') or Path(quarantine).name != quarantine:
                     raise ValueError('invalid journal quarantine')
-                try:
-                    bundles.delete_tree(quarantine, root.fd)
-                except FileNotFoundError:
-                    pass
+                _discard_path_evidence(root, operation, item)
             for item in documents:
                 current = document_snapshots[item['path']]
                 if current.content != _unpack(item['before']):
                     shared_config.compare_replace_document(current, _unpack(item['before']), fd,
                                                            item['quarantine'] + '-recover-before')
             # The state path comes from the current API request, never the journal.
-            from .state import remove_state
-            before_state = _unpack(data['stateBefore'])
-            if before_state is None:
-                remove_state(file)
-            else:
-                state_fd = bundles.open_directory(file.parent)
-                try:
-                    shared_config.replace_document(file, before_state, state_fd)
-                finally:
-                    os.close(state_fd)
+            state_fd = bundles.open_directory(file.parent)
+            try:
+                if shared_config.snapshot(file, state_fd) != state_snapshot:
+                    raise ValueError('recovery blocked by externally modified ownership state; journal retained')
+                current_state = _prepare_document_recovery(state_item, state_snapshot, state_fd)
+                if current_state.content != state_before:
+                    shared_config.compare_replace_document(current_state, state_before, state_fd,
+                        state_item['quarantine'] + '-recover-before')
+            finally:
+                os.close(state_fd)
             os.unlink(journal.name, dir_fd=fd)
             os.fsync(fd)
     finally:
@@ -409,6 +549,13 @@ def apply_lifecycle(plan: InstallPlan, uninstall: bool) -> None:
             paths.append({'path': str(operation.destination), 'component': operation.component.value,
                           'resource': operation.resource.kind, 'before': before, 'after': after,
                           'quarantine': '.agent-workbench-quarantine-' + os.urandom(8).hex()})
+        from .trust import record_proof
+        signed_entries = {key: replace(item, trust_proof=record_proof(item, plan.state_file, True))
+                          if isinstance(item.resource, DirectoryCopy) else item
+                          for key, item in plan.next_state.entries.items()}
+        signed_slots = {key: replace(item, trust_proof=record_proof(item, plan.state_file, True))
+                        for key, item in plan.next_state.slots.items()}
+        plan = replace(plan, next_state=replace(plan.next_state, entries=signed_entries, slots=signed_slots))
         record = {'version': 1, 'stateFile': str(plan.state_file),
                   'stateBefore': _pack(plan.state_file.read_bytes() if plan.state_file.exists() else None),
                   'stateAfter': _pack(None if uninstall else shared_config.encode(plan.next_state.as_dict())),

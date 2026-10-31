@@ -853,3 +853,262 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(before, self.mcp_config.read_bytes())
         self.assertFalse(quarantine.exists())
         self.assertFalse(journal.exists())
+
+    def test_state_token_edit_cannot_forge_persisted_trust(self):
+        apply_plan(self.trusted((C.MCP,)))
+        source = self.fixture.root / 'plugins/sample/mcp.json'
+        source.write_text('{"mcpServers":{"sample-server":{"command":"changed-code"}}}')
+        pending = self.plan((C.MCP,))
+        token = next(op.trust_token for op in pending.all_operations if op.trust_token)
+        data = json.loads(pending.state_file.read_text())
+        next(iter(data['slots'].values()))['trust'] = token
+        pending.state_file.write_bytes(shared_config.encode(data))
+        self.assertTrue(self.plan((C.MCP,)).has_conflicts)
+
+    def test_recovery_path_mutation_preserves_late_foreign_tree(self):
+        apply_plan(self.trusted())
+        journal = self.persist_pending_journal(self.plan())
+        real = transactions._restore_path
+        def inject(root, operation, *args, **kwargs):
+            if operation.destination == self.bundle:
+                (self.bundle / 'foreign.txt').write_text('preserve')
+            return real(root, operation, *args, **kwargs)
+        with mock.patch.object(transactions, '_restore_path', inject):
+            with self.assertRaisesRegex(ValueError, 'recovery blocked'):
+                self.plan()
+        self.assertEqual('preserve', (self.bundle / 'foreign.txt').read_text())
+        self.assertTrue(journal.exists())
+        (self.bundle / 'foreign.txt').unlink()
+        self.plan()
+        self.assertFalse(journal.exists())
+
+    def test_recovery_state_mutation_preserves_late_external_state(self):
+        apply_plan(self.trusted())
+        plan = self.plan()
+        journal = self.persist_pending_journal(plan)
+        data = json.loads(plan.state_file.read_text())
+        data['profile'] = 'external'
+        foreign = shared_config.encode(data)
+        real = transactions._restore_path
+        def inject(*args, **kwargs):
+            result = real(*args, **kwargs)
+            plan.state_file.write_bytes(foreign)
+            return result
+        with mock.patch.object(transactions, '_restore_path', inject):
+            with self.assertRaisesRegex(ValueError, 'changed|recovery blocked'):
+                self.plan()
+        self.assertEqual(foreign, plan.state_file.read_bytes())
+        self.assertTrue(journal.exists())
+        plan.state_file.write_bytes(transactions._unpack(json.loads(journal.read_text())['stateBefore']))
+        self.plan()
+        self.assertFalse(journal.exists())
+
+    def test_second_crash_after_document_cleanup_is_retryable(self):
+        apply_plan(self.trusted((C.MCP,)))
+        before = self.mcp_config.read_bytes()
+        journal = self.persist_pending_journal(self.plan((C.MCP,)))
+        item = next(i for i in json.loads(journal.read_text())['documents'] if i['path'] == str(self.mcp_config))
+        quarantine = self.mcp_config.parent / (item['quarantine'] + '-remove')
+        quarantine.mkdir(mode=0o700)
+        self.mcp_config.rename(quarantine / 'entry')
+        real = transactions.bundles.delete_tree
+        def crash(name, fd):
+            result = real(name, fd)
+            if name == quarantine.name:
+                raise KeyboardInterrupt('second crash after old cleanup point')
+            return result
+        with mock.patch.object(transactions.bundles, 'delete_tree', crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.plan()
+        self.assertTrue(journal.exists())
+        self.plan()
+        self.assertEqual(before, self.mcp_config.read_bytes())
+        self.assertFalse(journal.exists())
+
+    def test_legacy_trust_requires_grant_but_remains_uninstallable(self):
+        apply_plan(self.trusted())
+        file = self.plan().state_file
+        data = json.loads(file.read_text())
+        for item in list(data['entries'].values()) + list(data['slots'].values()):
+            item.pop('trustProof', None)
+        file.write_bytes(shared_config.encode(data))
+        self.assertTrue(self.plan().has_conflicts)
+        self.assertFalse(self.trusted().has_conflicts)
+        self.assertFalse(self.uninstall().has_conflicts)
+        apply_uninstall(self.uninstall())
+        self.assertFalse(file.exists())
+
+    def test_proofs_strict_decode_and_planning_does_not_create_authority(self):
+        plan = self.trusted()
+        key = plan.state_file.with_name('.' + plan.state_file.name + '.transaction-key')
+        self.assertFalse(key.exists())
+        self.assertTrue(all(item.trust_proof is None for item in plan.next_state.slots.values()))
+        apply_plan(plan)
+        saved = json.loads(plan.state_file.read_text())
+        for mapping in ('entries', 'slots'):
+            for invalid in (None, 1, [], {}, '', 'aw-proof-v1:' + 'A' * 64):
+                data = json.loads(json.dumps(saved))
+                next(iter(data[mapping].values()))['trustProof'] = invalid
+                plan.state_file.write_bytes(shared_config.encode(data))
+                with self.assertRaisesRegex(ValueError, 'invalid trust proof'):
+                    load_state(plan.state_file)
+        plan.state_file.write_bytes(shared_config.encode(saved))
+        self.assertFalse(self.plan().has_conflicts)
+
+    def test_hook_state_token_edit_cannot_forge_persisted_trust(self):
+        apply_plan(self.trusted((C.HOOKS,)))
+        (self.hooks / 'stop.sh').write_text('#!/bin/sh\necho changed\n')
+        plan = self.plan((C.HOOKS,))
+        token = next(op.trust_token for op in plan.all_operations if op.trust_token)
+        data = json.loads(plan.state_file.read_text())
+        for item in list(data['entries'].values()) + list(data['slots'].values()):
+            item['trust'] = token
+        plan.state_file.write_bytes(shared_config.encode(data))
+        self.assertTrue(self.plan((C.HOOKS,)).has_conflicts)
+
+    def test_recovery_capture_retains_foreign_tree(self):
+        apply_plan(self.trusted())
+        (self.hooks / 'stop.sh').write_text('#!/bin/sh\necho changed\n')
+        plan = self.trusted()
+        real_write = installation.write_state
+        def crash(file, state):
+            real_write(file, state)
+            raise KeyboardInterrupt('state published')
+        with mock.patch.object(installation, 'write_state', crash):
+            with self.assertRaises(KeyboardInterrupt):
+                apply_plan(plan)
+        real = transactions.bundles.rename_new
+        injected = []
+        def race(source, destination, parent, destination_fd=None):
+            if source == 'sample' and destination.endswith('-rollback'):
+                (self.bundle / 'foreign.txt').write_text('preserve')
+                injected.append(True)
+            return real(source, destination, parent, destination_fd)
+        with mock.patch.object(transactions.bundles, 'rename_new', race):
+            with self.assertRaisesRegex(ValueError, 'recovery blocked'):
+                self.plan()
+        self.assertTrue(injected)
+        self.assertEqual('preserve', (self.bundle / 'foreign.txt').read_text())
+        self.assertTrue((self.mcp_config.parent / '.agent-workbench-transaction.json').exists())
+
+    def test_recovery_state_capture_preserves_foreign_state(self):
+        apply_plan(self.trusted())
+        (self.hooks / 'stop.sh').write_text('#!/bin/sh\necho changed\n')
+        plan = self.trusted()
+        real_write = installation.write_state
+        def crash(file, state):
+            real_write(file, state)
+            raise KeyboardInterrupt('state published')
+        with mock.patch.object(installation, 'write_state', crash):
+            with self.assertRaises(KeyboardInterrupt):
+                apply_plan(plan)
+        data = json.loads(plan.state_file.read_text())
+        data['profile'] = 'external'
+        foreign = shared_config.encode(data)
+        real = transactions.bundles.rename_new
+        injected = []
+        def race(source, destination, parent, destination_fd=None):
+            if source == plan.state_file.name and destination == 'entry':
+                plan.state_file.write_bytes(foreign)
+                injected.append(True)
+            return real(source, destination, parent, destination_fd)
+        with mock.patch.object(transactions.bundles, 'rename_new', race):
+            with self.assertRaisesRegex(ValueError, 'changed|recovery blocked'):
+                self.plan()
+        self.assertTrue(injected)
+        self.assertEqual(foreign, plan.state_file.read_bytes())
+        self.assertTrue((self.mcp_config.parent / '.agent-workbench-transaction.json').exists())
+
+    def test_document_recovery_publication_crash_boundaries_are_retryable(self):
+        for boundary in ('published', 'fsynced'):
+            with self.subTest(boundary=boundary):
+                apply_plan(self.trusted((C.MCP,)))
+                before = self.mcp_config.read_bytes()
+                journal = self.persist_pending_journal(self.plan((C.MCP,)))
+                item = next(i for i in json.loads(journal.read_text())['documents'] if i['path'] == str(self.mcp_config))
+                quarantine = self.mcp_config.parent / (item['quarantine'] + '-remove')
+                quarantine.mkdir(mode=0o700)
+                self.mcp_config.rename(quarantine / 'entry')
+                real_rename = transactions.bundles.rename_new
+                real_sync = os.fsync
+                published = []
+                def publish(source, destination, parent, destination_fd=None):
+                    result = real_rename(source, destination, parent, destination_fd)
+                    if source == 'recovery' and destination == self.mcp_config.name:
+                        published.append(True)
+                        if boundary == 'published':
+                            raise KeyboardInterrupt('published')
+                    return result
+                def sync(fd):
+                    real_sync(fd)
+                    if published and boundary == 'fsynced':
+                        raise KeyboardInterrupt('fsynced')
+                with mock.patch.object(transactions.bundles, 'rename_new', publish), mock.patch.object(os, 'fsync', sync):
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.plan((C.MCP,))
+                self.assertTrue(journal.exists())
+                self.plan((C.MCP,))
+                self.assertEqual(before, self.mcp_config.read_bytes())
+                self.assertFalse(journal.exists())
+
+    def test_recovery_file_and_symlink_capture_preserves_foreign_objects(self):
+        from agent_workbench.model import FileCopy, DirectorySymlink
+        from types import SimpleNamespace
+        root_path = self.base / 'managed'
+        root_path.mkdir()
+        fd = os.open(root_path, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        root = SimpleNamespace(fd=fd)
+        for resource in (FileCopy(''), DirectorySymlink()):
+            with self.subTest(resource=resource.kind):
+                path = root_path / 'entry'
+                if path.is_symlink() or path.exists():
+                    path.unlink()
+                if isinstance(resource, FileCopy):
+                    path.write_bytes(b'owned')
+                else:
+                    path.symlink_to('owned-target')
+                op = installation.InstallOperation(Op.KEEP, '', path, None, '', resource=resource)
+                expected = transactions._capture(root, op)
+                restore = transactions._PathRestore(None, expected, (expected, None), transactions._path_revision(fd, path.name))
+                real = transactions.bundles.rename_new
+                def race(source, destination, parent, destination_fd=None):
+                    if source == 'entry':
+                        if isinstance(resource, FileCopy):
+                            path.write_bytes(b'foreign')
+                        else:
+                            path.unlink()
+                            path.symlink_to('foreign-target')
+                    return real(source, destination, parent, destination_fd)
+                with mock.patch.object(transactions.bundles, 'rename_new', race):
+                    with self.assertRaisesRegex(ValueError, 'recovery blocked'):
+                        transactions._restore_path(root, op, restore, 'rollback')
+                if isinstance(resource, FileCopy):
+                    self.assertEqual(b'foreign', path.read_bytes())
+                else:
+                    self.assertEqual('foreign-target', os.readlink(path))
+
+    def test_second_crash_during_state_recovery_is_retryable(self):
+        apply_plan(self.trusted())
+        before = self.plan().state_file.read_bytes()
+        (self.hooks / 'stop.sh').write_text('#!/bin/sh\necho changed\n')
+        plan = self.trusted()
+        real_write = installation.write_state
+        def crash(file, state):
+            real_write(file, state)
+            raise KeyboardInterrupt('state published')
+        with mock.patch.object(installation, 'write_state', crash):
+            with self.assertRaises(KeyboardInterrupt):
+                apply_plan(plan)
+        real = transactions.bundles.rename_new
+        def capture(source, destination, parent, destination_fd=None):
+            result = real(source, destination, parent, destination_fd)
+            if source == plan.state_file.name and destination == 'entry':
+                raise KeyboardInterrupt('second crash during state capture')
+            return result
+        with mock.patch.object(transactions.bundles, 'rename_new', capture):
+            with self.assertRaises(KeyboardInterrupt):
+                self.plan()
+        self.plan()
+        self.assertEqual(before, plan.state_file.read_bytes())
+        self.assertFalse((self.mcp_config.parent / '.agent-workbench-transaction.json').exists())

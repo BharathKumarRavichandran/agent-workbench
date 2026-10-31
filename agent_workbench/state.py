@@ -26,9 +26,11 @@ class StateEntry:
     source_repository: str
 
     trust: str | None = None
+    trust_proof: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
+            **({"trustProof": self.trust_proof} if self.trust_proof is not None else {}),
             "key": self.key,
             "plugin": self.plugin,
             "source": self.source,
@@ -50,9 +52,11 @@ class SlotState:
     slot: str
     digest: str
     trust: str
+    trust_proof: str | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {"key": self.key, "plugin": self.plugin, "component": self.component.value,
+        return {**({"trustProof": self.trust_proof} if self.trust_proof is not None else {}),
+                "key": self.key, "plugin": self.plugin, "component": self.component.value,
                 "document": self.document, "slot": self.slot, "digest": self.digest, "trust": self.trust}
 
 
@@ -166,6 +170,12 @@ def _trust(value: Any) -> str:
     return token
 
 
+def _proof(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"aw-proof-v1:[0-9a-f]{64}", value):
+        raise ValueError("invalid trust proof")
+    return value
+
+
 def load_state(path: Path) -> InstallState | None:
     if not path.is_file():
         return None
@@ -201,6 +211,9 @@ def load_state(path: Path) -> InstallState | None:
                     _trust(value.get("trust"))
             elif kind != "directory-symlink":
                 raise ValueError("installation state entry resourceKind is unsupported")
+        if "trustProof" in value and isinstance(resource, DirectoryCopy):
+            fields.add("trustProof")
+            _proof(value["trustProof"])
         _keys(value, fields, f"installation state.entries[{key!r}]")
         prefix = {ComponentKind.SKILLS: "skill", ComponentKind.AGENTS: "agent",
                   ComponentKind.RULES: "rule", ComponentKind.COMMANDS: "command", ComponentKind.HOOKS: "hook"}.get(component)
@@ -213,6 +226,7 @@ def load_state(path: Path) -> InstallState | None:
             raise ValueError(f"installation state entry key does not match mapping key: {key!r}")
         entries[key] = StateEntry(
             trust=value.get("trust"),
+            trust_proof=value.get("trustProof"),
             key=embedded_key,
             plugin=_identifier(value["plugin"], f"installation state.entries[{key!r}].plugin"),
             source=_source_path(value["source"], f"installation state.entries[{key!r}].source"),
@@ -243,7 +257,9 @@ def load_state(path: Path) -> InstallState | None:
     if version == 4:
         for key, raw in _object(data["slots"], "installation state.slots").items():
             value = _object(raw, "slot")
-            _keys(value, {"key", "plugin", "component", "document", "slot", "digest", "trust"}, "slot")
+            if "trustProof" in value:
+                _proof(value["trustProof"])
+            _keys(value, {"key", "plugin", "component", "document", "slot", "digest", "trust"} | ({"trustProof"} if "trustProof" in value else set()), "slot")
             component = ComponentKind(value["component"])
             if component not in {ComponentKind.HOOKS, ComponentKind.MCP} or key != value["key"]:
                 raise ValueError("invalid shared slot identity")
@@ -255,7 +271,7 @@ def load_state(path: Path) -> InstallState | None:
             if not re.fullmatch(r"[0-9a-f]{64}", digest):
                 raise ValueError("invalid shared slot digest")
             slots[key] = SlotState(key, plugin, component,
-                _absolute_path(value["document"], "slot document"), slot, digest, _trust(value["trust"]))
+                _absolute_path(value["document"], "slot document"), slot, digest, _trust(value["trust"]), value.get("trustProof"))
     return InstallState(
         slots=slots,
         schema_version=version,

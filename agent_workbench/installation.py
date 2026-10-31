@@ -25,7 +25,7 @@ from .model import TargetId, ComponentKind, DirectorySymlink, FileCopy, Director
 from .state import InstallState, StateEntry, load_state, remove_state, state_path, write_state
 from .workspace import Workspace
 from . import bundles, shared_config
-from .trust import grant_token
+from .trust import grant_token, authenticated, reuse_proof
 from .state import SlotState
 
 
@@ -707,7 +707,7 @@ def plan_install(
             plugin = next(plugin for plugin in workspace.resolved.plugins if str(plugin.plugin.id) == entry.plugin_id)
             token = grant_token(plugin, ComponentKind.HOOKS, target_id,
                                 shared_config.document_path(roots, ComponentKind.HOOKS), entry.resource.digest, workspace.root)
-            required = token not in trust and not (prior is not None and prior.trust == token)
+            required = token not in trust and not (prior is not None and prior.trust == token and authenticated(prior, file))
             if required:
                 kind, reason = OperationKind.CONFLICT, "content-bound grant required; pass --trust " + token
         operations.append(InstallOperation(kind, entry.key, entry.destination, entry.source, reason,
@@ -723,6 +723,7 @@ def plan_install(
             resource=entry.resource,
             source_repository=str(workspace.root),
         )
+        next_entries[entry.key] = reuse_proof(next_entries[entry.key], prior, file)
     for key, prior in sorted(owned.items()):
         if key not in desired_by_key:
             assert previous is not None
@@ -779,15 +780,16 @@ def _plan_documents(workspace: Workspace, target_id: str, roots: dict[ComponentK
                         raise ValueError('MCP requires an mcpServers object of objects')
                     values = list(servers.items())
                 token = grant_token(plugin, component, target_id, path, content_digest, workspace.root)
-                recorded = any(item.plugin == plugin.plugin.id and item.trust == token for item in owned.values())
+                recorded = any(item.plugin == plugin.plugin.id and item.trust == token and authenticated(item, file) for item in owned.values())
                 if component is ComponentKind.HOOKS and previous:
                     bundle = previous.entries.get(f"hook:{plugin.plugin.id}")
-                    recorded = recorded or (bundle is not None and bundle.trust == token)
+                    recorded = recorded or (bundle is not None and bundle.trust == token and authenticated(bundle, file))
                 granted = token in trust or recorded
                 for name, value in values:
                     key = f"{component.value}:{plugin.plugin.id}:{name}"
                     state = SlotState(key, str(plugin.plugin.id), component, str(path), name,
                                       shared_config.digest(value), token)
+                    state = reuse_proof(state, owned.get(key), file)
                     desired.append(shared_config.DesiredSlot(state, value, source, content_digest, granted))
                 # An empty hook bundle still requires a grant on its path.
                 if values:
