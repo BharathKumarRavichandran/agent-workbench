@@ -44,6 +44,10 @@ class DocumentSnapshot:
     revision: tuple[int, int, int, int, int] | None
 
 
+def _revision(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 def snapshot(path: Path, parent_fd: int | None = None) -> DocumentSnapshot:
     owned_fd = None
     try:
@@ -63,11 +67,10 @@ def snapshot(path: Path, parent_fd: int | None = None) -> DocumentSnapshot:
                 raise ValueError(f'shared document must be a regular file: {path}')
             content = handle.read()
             after = os.fstat(handle.fileno())
-            revision = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
-            if revision(info) != revision(after):
+            if _revision(info) != _revision(after):
                 raise ValueError('shared document changed while reading')
             parse(content)
-            return DocumentSnapshot(path, content, revision(info))
+            return DocumentSnapshot(path, content, _revision(info))
     finally:
         if owned_fd is not None:
             os.close(owned_fd)
@@ -95,6 +98,66 @@ def replace_document(path: Path, content: bytes | None, parent_fd: int) -> None:
             except FileNotFoundError:
                 pass
     os.fsync(parent_fd)
+
+
+def compare_replace_document(expected: DocumentSnapshot, content: bytes | None,
+                             parent_fd: int, quarantine: str) -> DocumentSnapshot:
+    """Capture the entry atomically, validate it, then publish without replacement.
+
+    A foreign entry arriving before capture is returned without replacement. A
+    foreign entry arriving after capture remains active and the captured file
+    stays in the journal's quarantine for explicit recovery.
+    """
+    from .bundles import rename_new
+    path = expected.path
+    result = DocumentSnapshot(path, None, None)
+    if snapshot(path, parent_fd) != expected:
+        raise ValueError('shared document changed at mutation; journal retained')
+    os.mkdir(quarantine, 0o700, dir_fd=parent_fd)
+    fd = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        if expected.content is not None:
+            rename_new(path.name, 'entry', parent_fd, fd)
+            os.fsync(parent_fd)
+            os.fsync(fd)
+            captured = snapshot(Path('entry'), fd)
+            # rename can change ctime; all other revision fields and bytes must
+            # still match the planned snapshot of the captured inode.
+            if (captured.content != expected.content or captured.revision[:4] != expected.revision[:4]):
+                rename_new('entry', path.name, fd, parent_fd)
+                os.fsync(parent_fd)
+                raise ValueError('shared document changed during capture; journal retained')
+        if content is not None:
+            out = os.open('new', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+            with os.fdopen(out, 'wb') as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                rename_new('new', path.name, fd, parent_fd)
+                result = DocumentSnapshot(path, content, _revision(os.fstat(handle.fileno())))
+        elif snapshot(path, parent_fd).content is not None:
+            raise ValueError('shared document changed during removal; journal retained')
+        os.fsync(parent_fd)
+        # Keep evidence until the new entry is durable.
+        try:
+            os.unlink('entry', dir_fd=fd)
+        except FileNotFoundError:
+            pass
+    except BaseException:
+        # Never use replace to put an entry back: a racing foreign file wins.
+        try:
+            rename_new('entry', path.name, fd, parent_fd)
+            os.fsync(parent_fd)
+        except FileNotFoundError:
+            pass
+        except FileExistsError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+    os.rmdir(quarantine, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+    return result
 
 
 def compile_hooks(tree: Tree, destination: Path) -> dict[str, list[dict[str, Any]]]:
@@ -312,10 +375,7 @@ def plan_document(before: DocumentSnapshot, component: ComponentKind,
     return DocumentPlan(before, removed, after, tuple(operations)), next_slots
 
 
-def plan_ownership(base: Path, file: Path, documents: tuple[DocumentPlan, ...],
-                   previous: Mapping[str, SlotState], desired: Mapping[str, SlotState]) -> tuple[tuple[DocumentPlan, ...], DocumentPlan]:
-    """The ledger prevents two profile state files from adopting the same slot."""
-    from .installation import OperationKind as Op
+def ownership_snapshot(base: Path) -> DocumentSnapshot:
     before = snapshot(base / '.agent-workbench-owners.json')
     original = parse(before.content) if before.content is not None else {'version': 1, 'slots': {}}
     if set(original) != {'version', 'slots'} or original['version'] != 1 or not isinstance(original['slots'], dict):
@@ -323,15 +383,39 @@ def plan_ownership(base: Path, file: Path, documents: tuple[DocumentPlan, ...],
     for key, value in original['slots'].items():
         if not re.fullmatch('[0-9a-f]{64}', key) or not isinstance(value, dict) or set(value) != {'owner', 'digest'} or not isinstance(value['owner'], str) or not re.fullmatch('[0-9a-f]{64}', value['digest']):
             raise ValueError('invalid Cursor ownership record')
+    return before
+
+
+def slot_identity(item: SlotState) -> str:
+    return digest([item.document, item.component.value, item.slot])
+
+
+def ownership_conflicts(before: DocumentSnapshot, file: Path,
+                        previous: Mapping[str, SlotState]) -> tuple[SlotOperation, ...]:
+    from .installation import OperationKind as Op
+    records = parse(before.content)['slots'] if before.content is not None else {}
+    return tuple(SlotOperation(Op.CONFLICT, item.key, Path(item.document), item.component,
+                 item.slot, 'prior slot lacks matching resource ownership authority',
+                 'SLOT_OWNERSHIP_MISMATCH') for item in previous.values()
+                 if records.get(slot_identity(item)) != {'owner': str(file), 'digest': item.digest})
+
+
+def plan_ownership(file: Path, documents: tuple[DocumentPlan, ...],
+                   previous: Mapping[str, SlotState], desired: Mapping[str, SlotState],
+                   before: DocumentSnapshot) -> tuple[tuple[DocumentPlan, ...], DocumentPlan]:
+    """The ledger prevents two profile state files from adopting the same slot."""
+    from .installation import OperationKind as Op
+    original = parse(before.content) if before.content is not None else {'version': 1, 'slots': {}}
+    if ownership_conflicts(before, file, previous):
+        return documents, DocumentPlan(before, before.content, before.content, ())
     data = copy.deepcopy(original)
-    identity = lambda item: digest([item.document, item.component.value, item.slot])
     for item in previous.values():
-        key = identity(item)
+        key = slot_identity(item)
         if key in data['slots'] and data['slots'][key]['owner'] == str(file):
             del data['slots'][key]
     rejected = set()
     for item in desired.values():
-        key = identity(item)
+        key = slot_identity(item)
         recorded = data['slots'].get(key)
         if recorded is not None and recorded['owner'] != str(file):
             rejected.add(item.key)

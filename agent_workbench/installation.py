@@ -665,10 +665,10 @@ def plan_install(
     for entry in desired:
         _require_contained(roots[entry.component], entry.destination)
     previous = _validated_state(workspace, target_id, file, roots)
-    document_plans, slots, executable_sources = _plan_documents(workspace, target_id, roots, previous, tuple(item for item in requested if item not in rejected), adopt, trust)
+    ledger_before = shared_config.ownership_snapshot(roots[ComponentKind.HOOKS].parent) if target_id == 'cursor' else None
+    document_plans, slots, executable_sources = _plan_documents(workspace, target_id, roots, previous, tuple(item for item in requested if item not in rejected), adopt, trust, file, ledger_before)
     if document_plans:
-        document_plans, ledger = shared_config.plan_ownership(roots[ComponentKind.HOOKS].parent,
-            file, document_plans, previous.slots if previous else {}, slots)
+        document_plans, ledger = shared_config.plan_ownership(file, document_plans, previous.slots if previous else {}, slots, ledger_before)
         document_plans += (ledger,)
     owned = previous.entries if previous else {}
     operations = [InstallOperation(OperationKind.CONFLICT, f"component:{conflict.component.value}",
@@ -738,13 +738,20 @@ def plan_install(
 
 def _plan_documents(workspace: Workspace, target_id: str, roots: dict[ComponentKind, Path],
                     previous: InstallState | None, requested: tuple[ComponentKind, ...],
-                    adopt: bool, trust: tuple[str, ...]) -> tuple[tuple[shared_config.DocumentPlan, ...], dict[str, SlotState], tuple[shared_config.DesiredSlot, ...]]:
+                    adopt: bool, trust: tuple[str, ...], file: Path, ledger_before: shared_config.DocumentSnapshot | None) -> tuple[tuple[shared_config.DocumentPlan, ...], dict[str, SlotState], tuple[shared_config.DesiredSlot, ...]]:
     if target_id != "cursor":
         return (), {}, ()
     documents = []
     states: dict[str, SlotState] = {}
     sources = []
     old_slots = previous.slots if previous else {}
+    conflicts = shared_config.ownership_conflicts(ledger_before, file, old_slots)
+    if conflicts:
+        for component in (ComponentKind.HOOKS, ComponentKind.MCP):
+            before = shared_config.snapshot(shared_config.document_path(roots, component))
+            operations = tuple(item for item in conflicts if item.component is component)
+            documents.append(shared_config.DocumentPlan(before, before.content, before.content, operations))
+        return tuple(documents), {}, ()
     for component in (ComponentKind.HOOKS, ComponentKind.MCP):
         owned = {key: value for key, value in old_slots.items() if value.component is component}
         has_bundle = component is ComponentKind.HOOKS and previous and any(entry.component is component for entry in previous.entries.values())
@@ -972,10 +979,10 @@ def plan_uninstall(
     file = state_path(state_root, workspace.catalog.marketplace.id, str(workspace.profile.id), target_id)
     _recover_lifecycle(file, roots)
     previous = _validated_state(workspace, target_id, file, roots)
-    documents, _, sources = _plan_documents(workspace, target_id, roots, previous, (), False, ())
+    ledger_before = shared_config.ownership_snapshot(roots[ComponentKind.HOOKS].parent) if target_id == 'cursor' else None
+    documents, _, sources = _plan_documents(workspace, target_id, roots, previous, (), False, (), file, ledger_before)
     if documents:
-        documents, ledger = shared_config.plan_ownership(roots[ComponentKind.HOOKS].parent,
-            file, documents, previous.slots if previous else {}, {})
+        documents, ledger = shared_config.plan_ownership(file, documents, previous.slots if previous else {}, {}, ledger_before)
         documents += (ledger,)
     operations = []
     hook_document = next(

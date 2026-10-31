@@ -1,4 +1,4 @@
-"""One Cursor document lock and a private rollback journal across paths and state.
+"""One Cursor document lock and an authenticated rollback journal across paths and state.
 
 The journal is durable before any activation changes. A retry by its owning
 profile rolls back to the complete prior state. Other profiles fail closed until
@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
+import stat
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from typing import Iterator, TYPE_CHECKING
@@ -20,6 +22,62 @@ if TYPE_CHECKING:
 
 from . import bundles, shared_config
 from .model import ComponentKind, DirectoryCopy, DirectorySymlink
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True,
+                      allow_nan=False).encode('ascii')
+
+
+def _journal_key(file: Path, create: bool = False) -> bytes:
+    """Private authority belongs to the exact profile state file, never the project."""
+    parent = bundles.open_directory(file.parent)
+    name = '.' + file.name + '.transaction-key'
+    try:
+        if create:
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=parent)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(fd, 'wb') as handle:
+                    os.fchmod(handle.fileno(), 0o600)
+                    handle.write(os.urandom(32))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.fsync(parent)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, 'rb') as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_size != 32):
+                raise ValueError('unsafe private transaction key')
+            key = handle.read(33)
+            if len(key) != 32:
+                raise ValueError('unsafe private transaction key')
+            return key
+    finally:
+        os.close(parent)
+
+
+def _authenticate(data: dict[str, object], file: Path) -> None:
+    signature = data.pop('mac', None)
+    try:
+        key = _journal_key(file)
+    except (OSError, ValueError) as error:
+        raise ValueError('unauthenticated Cursor recovery journal; journal retained') from error
+    expected = hmac.new(key, _canonical(data), hashlib.sha256).hexdigest()
+    if not isinstance(signature, str) or not re.fullmatch('[0-9a-f]{64}', signature) or not hmac.compare_digest(signature, expected):
+        raise ValueError('unauthenticated Cursor recovery journal; journal retained')
+
+
+def _journal_record(saved: bytes, file: Path) -> dict[str, object]:
+    data = shared_config.parse(saved)
+    if data.get('version') != 1 or data.get('stateFile') != str(file):
+        raise ValueError('pending Cursor recovery belongs to another profile; run status for its owning profile')
+    _authenticate(data, file)
+    return data
 
 
 def _pack(content: bytes | None) -> str | None:
@@ -144,11 +202,50 @@ def _document_lock(base: Path, create: bool) -> Iterator[None]:
 
 def recover(file: Path, roots: dict[ComponentKind, Path]) -> None:
     journal = _journal_path(roots)
-    if shared_config.snapshot(journal).content is None:
+    saved = shared_config.snapshot(journal).content
+    if saved is None:
         return
+    # Reject untrusted project bytes without even creating a config/state lock.
+    # Read and authenticate again under both locks before any restoration.
+    _journal_record(saved, file)
     from .installation import _state_lock
     with _state_lock(file), _document_lock(journal.parent, False):
         _recover_locked(file, roots)
+
+
+def _document_quarantines(item: dict[str, object]) -> tuple[str, ...]:
+    name = item.get('quarantine')
+    if not isinstance(name, str) or not re.fullmatch(r'\.agent-workbench-document-[0-9a-f]{16}', name):
+        raise ValueError('invalid journal document quarantine')
+    return tuple(name + suffix for suffix in ('-remove', '-activate', '-recover-remove', '-recover-before'))
+
+
+def _check_document_quarantines(item: dict[str, object], fd: int) -> bool:
+    from .installation import _read_regular
+    evidence = False
+    allowed = [_unpack(item[key]) for key in ('before', 'removed', 'after')]
+    for name in _document_quarantines(item):
+        try:
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except FileNotFoundError:
+            continue
+        try:
+            if set(os.listdir(child)) - {'entry', 'new'}:
+                raise ValueError('recovery blocked by foreign document quarantine; journal retained')
+            for entry in os.listdir(child):
+                if entry == 'new':
+                    # Staging may have stopped mid-write; only a prefix of an
+                    # authenticated planned document can be our partial temp.
+                    partial = _read_regular(entry, child)
+                    matches = any(value is not None and value.startswith(partial) for value in allowed)
+                else:
+                    matches = shared_config.snapshot(Path(entry), child).content in allowed
+                    evidence = True
+                if not matches:
+                    raise ValueError('recovery blocked by modified document quarantine; journal retained')
+        finally:
+            os.close(child)
+    return evidence
 
 
 def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
@@ -159,9 +256,7 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
         saved = shared_config.snapshot(journal, fd).content
         if saved is None:
             return
-        data = shared_config.parse(saved)
-        if data.get('version') != 1 or data.get('stateFile') != str(file):
-            raise ValueError('pending Cursor recovery belongs to another profile; run status for its owning profile')
+        data = _journal_record(saved, file)
         state_before = _unpack(data['stateBefore'])
         state_after = _unpack(data['stateAfter'])
         if shared_config.snapshot(file).content not in (state_before, state_after):
@@ -169,12 +264,16 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
         allowed_documents = {str(shared_config.document_path(roots, component)) for component in (ComponentKind.HOOKS, ComponentKind.MCP)}
         allowed_documents.add(str(journal.parent / '.agent-workbench-owners.json'))
         documents = data['documents']
+        document_snapshots = {}
         for item in documents:
             path = Path(item['path'])
             if str(path) not in allowed_documents:
                 raise ValueError('journal document is outside adapter-authorized paths')
-            current = shared_config.snapshot(path, fd).content
-            if current not in [_unpack(item[key]) for key in ('before', 'removed', 'after')]:
+            quarantined = _check_document_quarantines(item, fd)
+            captured = shared_config.snapshot(path, fd)
+            document_snapshots[str(path)] = captured
+            current = captured.content
+            if current not in [_unpack(item[key]) for key in ('before', 'removed', 'after')] and not (current is None and quarantined):
                 raise ValueError('recovery blocked by externally modified document; journal retained')
         with ExitStack() as stack:
             records = []
@@ -210,7 +309,17 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
             # Deactivate changing slots before undoing bundle mutations. Restore
             # old slots only after every prior bundle is back in place.
             for item in documents:
-                shared_config.replace_document(Path(item['path']), _unpack(item['removed']), fd)
+                for name in _document_quarantines(item):
+                    try:
+                        bundles.delete_tree(name, fd)
+                    except FileNotFoundError:
+                        pass
+                current = document_snapshots[item['path']]
+                if current.content != _unpack(item['removed']):
+                    document_snapshots[item['path']] = shared_config.compare_replace_document(
+                        current, _unpack(item['removed']), fd, item['quarantine'] + '-recover-remove')
+                elif shared_config.snapshot(current.path, fd) != current:
+                    raise ValueError('recovery blocked by modified document; journal retained')
             for root, operation, item in reversed(records):
                 _restore_path(root, operation, item['before'], item['quarantine'] + '-rollback')
                 quarantine = item['quarantine']
@@ -221,7 +330,10 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
                 except FileNotFoundError:
                     pass
             for item in documents:
-                shared_config.replace_document(Path(item['path']), _unpack(item['before']), fd)
+                current = document_snapshots[item['path']]
+                if current.content != _unpack(item['before']):
+                    shared_config.compare_replace_document(current, _unpack(item['before']), fd,
+                                                           item['quarantine'] + '-recover-before')
             # The state path comes from the current API request, never the journal.
             from .state import remove_state
             before_state = _unpack(data['stateBefore'])
@@ -301,13 +413,17 @@ def apply_lifecycle(plan: InstallPlan, uninstall: bool) -> None:
                   'stateBefore': _pack(plan.state_file.read_bytes() if plan.state_file.exists() else None),
                   'stateAfter': _pack(None if uninstall else shared_config.encode(plan.next_state.as_dict())),
                   'documents': [{'path': str(item.before.path), 'before': _pack(item.before.content),
-                                 'removed': _pack(item.removed), 'after': _pack(item.after)} for item in plan.documents],
+                                 'removed': _pack(item.removed), 'after': _pack(item.after),
+                                 'quarantine': '.agent-workbench-document-' + os.urandom(8).hex()} for item in plan.documents],
                   'paths': paths}
+        record['mac'] = hmac.new(_journal_key(plan.state_file, True), _canonical(record), hashlib.sha256).hexdigest()
         shared_config.replace_document(journal, shared_config.encode(record), doc_root.fd)
         try:
-            for document in plan.documents:
+            document_snapshots = {str(document.before.path): document.before for document in plan.documents}
+            for document, item in zip(plan.documents, record['documents']):
                 if document.removed != document.before.content:
-                    shared_config.replace_document(document.before.path, document.removed, doc_root.fd)
+                    document_snapshots[str(document.before.path)] = shared_config.compare_replace_document(
+                        document.before, document.removed, doc_root.fd, item['quarantine'] + '-remove')
             for operation, item in zip(plan.operations, paths):
                 root = opened[operation.destination.parent]
                 root.verify()
@@ -324,12 +440,13 @@ def apply_lifecycle(plan: InstallPlan, uninstall: bool) -> None:
             for operation in plan.operations:
                 if operation.kind is not install.OperationKind.REMOVE_OWNED and not opened[operation.destination.parent].same_resource(operation):
                     raise install._changed(operation)
-            for document in plan.documents:
+            for document, item in zip(plan.documents, record['documents']):
                 doc_root.verify()
-                if shared_config.snapshot(document.before.path, doc_root.fd).content != document.removed:
+                current = document_snapshots[str(document.before.path)]
+                if shared_config.snapshot(current.path, doc_root.fd) != current:
                     raise ValueError('shared document changed during transaction')
                 if document.after != document.removed:
-                    shared_config.replace_document(document.before.path, document.after, doc_root.fd)
+                    shared_config.compare_replace_document(current, document.after, doc_root.fd, item['quarantine'] + '-activate')
             for root in opened.values():
                 root.verify()
                 os.fsync(root.fd)

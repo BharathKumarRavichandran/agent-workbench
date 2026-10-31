@@ -250,12 +250,14 @@ class ActivationTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'path unavailable'):
                 apply_plan(plan)
         self.assertFalse(self.hook_config.exists())
-        real = shared_config.replace_document
-        def crash(path, content, fd):
-            real(path, content, fd)
+        real = shared_config.compare_replace_document
+        def crash(expected, content, fd, quarantine):
+            path = expected.path
+            result = real(expected, content, fd, quarantine)
             if path.name == 'hooks.json' and content and b'command' in content:
                 raise KeyboardInterrupt('crash after activation')
-        with mock.patch.object(shared_config, 'replace_document', crash):
+            return result
+        with mock.patch.object(shared_config, 'compare_replace_document', crash):
             with self.assertRaises(KeyboardInterrupt):
                 apply_plan(self.trusted())
         self.assertTrue(self.hook_config.exists())
@@ -267,12 +269,13 @@ class ActivationTests(unittest.TestCase):
         self.assertFalse((self.hook_config.parent / '.agent-workbench-transaction.json').exists())
 
     def test_config_write_failure_preserves_recoverable_journal(self):
-        real = shared_config.replace_document
-        def failure(path, content, fd):
+        real = shared_config.compare_replace_document
+        def failure(expected, content, fd, quarantine):
+            path = expected.path
             if path.name == 'mcp.json':
                 raise OSError('config unavailable')
-            return real(path, content, fd)
-        with mock.patch.object(shared_config, 'replace_document', failure):
+            return real(expected, content, fd, quarantine)
+        with mock.patch.object(shared_config, 'compare_replace_document', failure):
             with self.assertRaisesRegex(OSError, 'config unavailable'):
                 apply_plan(self.trusted())
         self.plan()
@@ -424,12 +427,14 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual({Op.KEEP}, {item.kind for item in self.plan().all_operations})
 
     def test_recovery_refuses_external_document_edits_and_keeps_evidence(self):
-        real = shared_config.replace_document
-        def crash(path, content, fd):
-            real(path, content, fd)
+        real = shared_config.compare_replace_document
+        def crash(expected, content, fd, quarantine):
+            path = expected.path
+            result = real(expected, content, fd, quarantine)
             if path.name == 'hooks.json' and content and b'command' in content:
                 raise KeyboardInterrupt('crash')
-        with mock.patch.object(shared_config, 'replace_document', crash):
+            return result
+        with mock.patch.object(shared_config, 'compare_replace_document', crash):
             with self.assertRaises(KeyboardInterrupt):
                 apply_plan(self.trusted())
         data = json.loads(self.hook_config.read_text())
@@ -457,12 +462,14 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(before_inode, self.bundle.stat().st_ino)
 
     def test_trust_is_read_only_with_pending_journal(self):
-        real = shared_config.replace_document
-        def crash(path, content, fd):
-            real(path, content, fd)
+        real = shared_config.compare_replace_document
+        def crash(expected, content, fd, quarantine):
+            path = expected.path
+            result = real(expected, content, fd, quarantine)
             if path.name == 'hooks.json' and content and b'command' in content:
                 raise KeyboardInterrupt('crash')
-        with mock.patch.object(shared_config, 'replace_document', crash):
+            return result
+        with mock.patch.object(shared_config, 'compare_replace_document', crash):
             with self.assertRaises(KeyboardInterrupt):
                 apply_plan(self.trusted())
         before = self.hook_config.read_bytes()
@@ -472,12 +479,14 @@ class ActivationTests(unittest.TestCase):
         self.assertTrue(self.bundle.exists())
 
     def test_recovery_precedes_inspection_of_changed_source(self):
-        real = shared_config.replace_document
-        def crash(path, content, fd):
-            real(path, content, fd)
+        real = shared_config.compare_replace_document
+        def crash(expected, content, fd, quarantine):
+            path = expected.path
+            result = real(expected, content, fd, quarantine)
             if path.name == 'hooks.json' and content and b'command' in content:
                 raise KeyboardInterrupt('crash')
-        with mock.patch.object(shared_config, 'replace_document', crash):
+            return result
+        with mock.patch.object(shared_config, 'compare_replace_document', crash):
             with self.assertRaises(KeyboardInterrupt):
                 apply_plan(self.trusted())
         (self.hooks / 'hooks.json').write_text('invalid JSON')
@@ -597,3 +606,250 @@ class ActivationTests(unittest.TestCase):
         replacement.replace(self.hook_config)
         with self.assertRaisesRegex(ValueError, 'document changed since planning'):
             apply_plan(plan)
+
+    def test_forged_project_journal_cannot_activate_untrusted_hooks(self):
+        plan = self.plan()
+        self.hook_config.parent.mkdir(parents=True)
+        journal = self.hook_config.parent / '.agent-workbench-transaction.json'
+        payload = shared_config.encode({'version': 1, 'hooks': {'stop': [{'command': 'attacker-command'}]}})
+        journal.write_bytes(shared_config.encode({
+            'version': 1, 'stateFile': str(plan.state_file), 'stateBefore': None,
+            'stateAfter': None, 'paths': [], 'documents': [{
+                'path': str(self.hook_config), 'before': transactions._pack(payload),
+                'removed': None, 'after': None}]}))
+        before = {p.name: p.read_bytes() for p in self.hook_config.parent.iterdir()}
+        with self.assertRaisesRegex(ValueError, 'unauthenticated'):
+            self.plan()
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.hook_config.parent.iterdir()})
+        self.assertFalse(self.bundle.exists())
+        self.assertFalse(plan.state_file.exists())
+
+    def test_stale_state_cannot_remove_another_profiles_server(self):
+        plan = self.trusted((C.MCP,))
+        apply_plan(plan)
+        stale = plan.state_file.read_bytes()
+        apply_uninstall(self.uninstall())
+        profile_path = self.fixture.root / 'profiles/default.json'
+        profile = json.loads(profile_path.read_text())
+        profile['id'] = 'other'
+        (profile_path.parent / 'other.json').write_text(json.dumps(profile))
+        other = Workspace.load(self.fixture.root, 'other')
+        pending = plan_install(other, 'cursor', self.state, components=(C.MCP,), project_root=self.project)
+        tokens = tuple(op.trust_token for op in pending.all_operations if op.trust_token)
+        apply_plan(plan_install(other, 'cursor', self.state, components=(C.MCP,), project_root=self.project, trust=tokens))
+        plan.state_file.write_bytes(stale)
+        self.assert_removal_authority_conflict()
+
+    def test_forged_state_cannot_remove_unmanaged_foreign_server(self):
+        plan = self.trusted((C.MCP,))
+        apply_plan(plan)
+        data = json.loads(plan.state_file.read_text())
+        slot = next(iter(data['slots'].values()))
+        foreign = {'command': 'foreign-command'}
+        slot['slot'] = 'foreign'
+        slot['digest'] = shared_config.digest(foreign)
+        slot['key'] = 'mcp:sample:foreign'
+        data['slots'] = {slot['key']: slot}
+        plan.state_file.write_text(json.dumps(data))
+        self.mcp_config.write_bytes(shared_config.encode({'mcpServers': {'foreign': foreign}}))
+        self.assert_removal_authority_conflict()
+
+    def assert_removal_authority_conflict(self):
+        ledger = self.mcp_config.parent / '.agent-workbench-owners.json'
+        before = (self.mcp_config.read_bytes(), ledger.read_bytes())
+        plan = self.uninstall()
+        self.assertTrue(plan.has_conflicts)
+        self.assertTrue(any(op.diagnostic == 'SLOT_OWNERSHIP_MISMATCH' for op in plan.all_operations))
+        self.assertTrue(all(doc.before.content == doc.after == doc.removed for doc in plan.documents))
+        with self.assertRaises(ValueError):
+            apply_uninstall(plan)
+        self.assertEqual(before, (self.mcp_config.read_bytes(), ledger.read_bytes()))
+
+    def test_foreign_edit_after_journal_write_survives_deactivation(self):
+        apply_plan(self.trusted((C.MCP,)))
+        plan = self.uninstall()
+        real = shared_config.replace_document
+        def inject(path, content, fd):
+            real(path, content, fd)
+            if path.name == '.agent-workbench-transaction.json':
+                data = json.loads(self.mcp_config.read_text())
+                data['mcpServers']['foreign'] = {'command': 'preserve-me'}
+                self.mcp_config.write_bytes(shared_config.encode(data))
+        with mock.patch.object(shared_config, 'replace_document', inject):
+            with self.assertRaisesRegex(ValueError, 'changed|recovery blocked'):
+                apply_uninstall(plan)
+        self.assertEqual({'command': 'preserve-me'}, json.loads(self.mcp_config.read_text())['mcpServers']['foreign'])
+        self.assertTrue((self.mcp_config.parent / '.agent-workbench-transaction.json').exists())
+
+    def persist_pending_journal(self, plan):
+        real = shared_config.replace_document
+        def crash(path, content, fd):
+            real(path, content, fd)
+            if path.name == '.agent-workbench-transaction.json':
+                raise KeyboardInterrupt('durable journal')
+        with mock.patch.object(shared_config, 'replace_document', crash):
+            with self.assertRaises(KeyboardInterrupt):
+                apply_plan(plan)
+        return self.hook_config.parent / '.agent-workbench-transaction.json'
+
+    def test_tampered_authenticated_journal_is_never_restored(self):
+        plan = self.trusted()
+        journal = self.persist_pending_journal(plan)
+        data = json.loads(journal.read_text())
+        data['documents'][0]['before'] = transactions._pack(shared_config.encode(
+            {'hooks': {'stop': [{'command': 'attacker-command'}]}}))
+        journal.write_bytes(shared_config.encode(data))
+        with self.assertRaisesRegex(ValueError, 'unauthenticated'):
+            self.plan()
+        self.assertTrue(journal.exists())
+        self.assertFalse(self.hook_config.exists())
+        self.assertFalse(self.bundle.exists())
+
+    def test_private_journal_key_rejects_symlinks_and_public_permissions(self):
+        plan = self.trusted((C.MCP,))
+        key = plan.state_file.with_name('.' + plan.state_file.name + '.transaction-key')
+        key.parent.mkdir(parents=True)
+        outside = self.base / 'outside-key'
+        outside.write_bytes(b'x' * 32)
+        outside.chmod(0o600)
+        key.symlink_to(outside)
+        with self.assertRaises(OSError):
+            apply_plan(plan)
+        self.assertEqual(b'x' * 32, outside.read_bytes())
+        key.unlink()
+        key.write_bytes(b'x' * 32)
+        key.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, 'unsafe private transaction key'):
+            apply_plan(plan)
+        self.assertFalse(self.mcp_config.exists())
+
+    def test_pending_journal_only_owning_profile_can_recover(self):
+        plan = self.trusted()
+        journal = self.persist_pending_journal(plan)
+        key = plan.state_file.with_name('.' + plan.state_file.name + '.transaction-key')
+        self.assertEqual(0o600, key.stat().st_mode & 0o777)
+        profile_path = self.fixture.root / 'profiles/default.json'
+        profile = json.loads(profile_path.read_text())
+        profile['id'] = 'other'
+        (profile_path.parent / 'other.json').write_text(json.dumps(profile))
+        other = Workspace.load(self.fixture.root, 'other')
+        before = journal.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'another profile'):
+            plan_install(other, 'cursor', self.state, components=(C.MCP,), project_root=self.project)
+        self.assertEqual(before, journal.read_bytes())
+        # Whitespace/key ordering are not part of the authenticated canonical bytes.
+        journal.write_text(json.dumps(json.loads(before), sort_keys=True))
+        self.plan()
+        self.assertFalse(journal.exists())
+        self.assertFalse(self.hook_config.exists())
+
+    def test_document_capture_preserves_racing_foreign_content(self):
+        apply_plan(self.trusted((C.MCP,)))
+        plan = self.uninstall()
+        real = transactions.bundles.rename_new
+        injected = []
+        def race(source, destination, parent, destination_fd=None):
+            if source == 'mcp.json' and destination == 'entry' and not injected:
+                data = json.loads(self.mcp_config.read_text())
+                data['mcpServers']['foreign'] = {'command': 'preserve-me'}
+                self.mcp_config.write_bytes(shared_config.encode(data))
+                injected.append(True)
+            return real(source, destination, parent, destination_fd)
+        with mock.patch.object(transactions.bundles, 'rename_new', race):
+            with self.assertRaisesRegex(ValueError, 'changed|recovery blocked'):
+                apply_uninstall(plan)
+        self.assertTrue(injected)
+        self.assertEqual({'command': 'preserve-me'}, json.loads(self.mcp_config.read_text())['mcpServers']['foreign'])
+        self.assertTrue((self.mcp_config.parent / '.agent-workbench-transaction.json').exists())
+
+    def test_document_publish_cannot_overwrite_racing_foreign_file(self):
+        apply_plan(self.trusted((C.MCP,)))
+        source = self.fixture.root / 'plugins/sample/mcp.json'
+        source.write_text('{"mcpServers":{"sample-server":{"command":"updated-command"}}}')
+        plan = self.trusted((C.MCP,))
+        real = transactions.bundles.rename_new
+        injected = []
+        foreign = shared_config.encode({'mcpServers': {'foreign': {'command': 'preserve-me'}}})
+        def race(source, destination, parent, destination_fd=None):
+            if source == 'new' and destination == 'mcp.json' and not injected:
+                self.mcp_config.write_bytes(foreign)
+                injected.append(True)
+            return real(source, destination, parent, destination_fd)
+        with mock.patch.object(transactions.bundles, 'rename_new', race):
+            with self.assertRaises((ValueError, FileExistsError)):
+                apply_plan(plan)
+        self.assertTrue(injected)
+        self.assertEqual(foreign, self.mcp_config.read_bytes())
+        journal = self.mcp_config.parent / '.agent-workbench-transaction.json'
+        self.assertTrue(journal.exists())
+        self.assertTrue(any(self.mcp_config.parent.glob('.agent-workbench-document-*/entry')))
+
+    def test_crash_with_document_quarantine_and_staged_file_recovers(self):
+        apply_plan(self.trusted((C.MCP,)))
+        before = self.mcp_config.read_bytes()
+        plan = self.uninstall()
+        real = transactions.bundles.rename_new
+        def crash(source, destination, parent, destination_fd=None):
+            if source == 'new' and destination == 'mcp.json':
+                # Leave a durable staged file, as on an interrupted publish.
+                raise KeyboardInterrupt('staged document')
+            return real(source, destination, parent, destination_fd)
+        with mock.patch.object(transactions.bundles, 'rename_new', crash):
+            with self.assertRaises(KeyboardInterrupt):
+                apply_uninstall(plan)
+        self.assertTrue(list(self.mcp_config.parent.glob('.agent-workbench-document-*/new')))
+        self.plan()
+        self.assertEqual(before, self.mcp_config.read_bytes())
+        self.assertFalse(list(self.mcp_config.parent.glob('.agent-workbench-document-*')))
+
+    def test_changed_ledger_digest_blocks_prior_slot_removal(self):
+        apply_plan(self.trusted((C.MCP,)))
+        ledger = self.mcp_config.parent / '.agent-workbench-owners.json'
+        data = json.loads(ledger.read_text())
+        next(iter(data['slots'].values()))['digest'] = '0' * 64
+        ledger.write_bytes(shared_config.encode(data))
+        self.assert_removal_authority_conflict()
+
+    def test_crash_after_capture_recovers_absent_document_from_quarantine(self):
+        apply_plan(self.trusted((C.MCP,)))
+        before = self.mcp_config.read_bytes()
+        plan = self.plan((C.MCP,))
+        journal = self.persist_pending_journal(plan)
+        record = next(item for item in json.loads(journal.read_text())['documents']
+                      if item['path'] == str(self.mcp_config))
+        # Reconstruct the exact durable layout of process death after capture,
+        # before staging/publishing. No Python cleanup runs in a killed process.
+        quarantine = self.mcp_config.parent / (record['quarantine'] + '-remove')
+        quarantine.mkdir(mode=0o700)
+        self.mcp_config.rename(quarantine / 'entry')
+        self.assertFalse(self.mcp_config.exists())
+        self.plan()
+        self.assertEqual(before, self.mcp_config.read_bytes())
+        self.assertFalse(quarantine.exists())
+        self.assertFalse(journal.exists())
+
+    def test_shared_document_lock_blocks_recovery_across_profiles(self):
+        journal = self.persist_pending_journal(self.trusted())
+        before = journal.read_bytes()
+        with transactions._document_lock(self.hook_config.parent, False):
+            with self.assertRaisesRegex(FileExistsError, 'locked by another operation'):
+                self.plan()
+        self.assertEqual(before, journal.read_bytes())
+        self.plan()
+        self.assertFalse(journal.exists())
+
+    def test_partial_staged_document_can_be_recovered(self):
+        apply_plan(self.trusted((C.MCP,)))
+        before = self.mcp_config.read_bytes()
+        journal = self.persist_pending_journal(self.plan((C.MCP,)))
+        record = next(item for item in json.loads(journal.read_text())['documents']
+                      if item['path'] == str(self.mcp_config))
+        quarantine = self.mcp_config.parent / (record['quarantine'] + '-recover-before')
+        quarantine.mkdir(mode=0o700)
+        self.mcp_config.rename(quarantine / 'entry')
+        # A killed writer can leave an incomplete JSON prefix in its known temp.
+        (quarantine / 'new').write_bytes(before[:5])
+        self.plan()
+        self.assertEqual(before, self.mcp_config.read_bytes())
+        self.assertFalse(quarantine.exists())
+        self.assertFalse(journal.exists())
