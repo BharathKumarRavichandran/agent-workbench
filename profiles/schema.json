@@ -3,35 +3,137 @@
   "$id": "https://example.invalid/agent-workbench/profile.schema.json",
   "title": "Agent workbench profile",
   "type": "object",
-  "required": ["schemaVersion", "id", "plugins", "targets"],
+  "required": [
+    "schemaVersion",
+    "id",
+    "plugins",
+    "targets"
+  ],
   "properties": {
-    "$schema": { "type": "string" },
-    "schemaVersion": { "const": 1 },
-    "id": { "$ref": "#/$defs/id" },
+    "$schema": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "enum": [
+        1,
+        2
+      ]
+    },
+    "id": {
+      "$ref": "#/$defs/id"
+    },
     "plugins": {
       "type": "object",
-      "required": ["include", "exclude"],
+      "required": [
+        "include",
+        "exclude"
+      ],
       "properties": {
-        "include": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-        "exclude": { "type": "array", "items": { "$ref": "#/$defs/id" } }
+        "include": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
       },
       "additionalProperties": false
     },
     "targets": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["id"],
-        "properties": {
-          "id": { "$ref": "#/$defs/id" },
-          "destination": { "type": "string", "minLength": 1 }
-        },
-        "additionalProperties": false
-      }
+      "type": "array"
     }
   },
   "$defs": {
-    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "targetV1": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "destination": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "targetV2": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "destination": {
+          "type": "string",
+          "minLength": 1
+        },
+        "components": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "skills",
+              "agents",
+              "rules",
+              "commands",
+              "hooks",
+              "mcp"
+            ]
+          }
+        },
+        "projectRoot": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute project directory; ~ is expanded by the decoder."
+        }
+      },
+      "additionalProperties": false
+    }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "schemaVersion": {
+            "const": 1
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "targets": {
+            "items": {
+              "$ref": "#/$defs/targetV1"
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "targets": {
+            "items": {
+              "$ref": "#/$defs/targetV2"
+            }
+          }
+        }
+      }
+    }
+  ]
 }

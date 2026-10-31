@@ -9,6 +9,7 @@
   "targets": [
     { "id": "agents" },
     { "id": "claude" },
+    { "id": "cursor" },
     { "id": "codex" },
     { "id": "grok" },
     { "id": "hermes" }

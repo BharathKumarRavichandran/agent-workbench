@@ -25,6 +25,7 @@ class AdapterRegistry:
 def build_registry() -> AdapterRegistry:
     home = str(Path.home())
     targets = (
+        SkillDirectoryTarget(TargetId("cursor"), DestinationSpec(None, f"{home}/.cursor", ("skills",))),
         SkillDirectoryTarget(TargetId("agents"), DestinationSpec(None, f"{home}/.agents", ("skills",))),
         SkillDirectoryTarget(TargetId("claude"), DestinationSpec(None, f"{home}/.claude", ("skills",))),
         SkillDirectoryTarget(TargetId("codex"), DestinationSpec("CODEX_HOME", f"{home}/.codex", ("skills",))),

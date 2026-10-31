@@ -1,12 +1,13 @@
-"""Plan and apply safe skill-directory installations."""
+"""Plan and reconcile owned directory symlinks and copied component files."""
 
 from __future__ import annotations
 
 import os
+import hashlib
 import secrets
 import stat
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import contextmanager, ExitStack
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Iterator
@@ -16,9 +17,11 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
-from .adapters.base import InstallTarget
+from .adapters.base import InstallTarget, DesiredEntry
+from .adapters.projections import project_paths
+from .artifacts import COMPONENT_ARTIFACTS, semantic_exports
 from .inspection import validate_skill_tree
-from .model import TargetId
+from .model import TargetId, ComponentKind, DirectorySymlink, FileCopy, PathResource
 from .state import InstallState, StateEntry, load_state, remove_state, state_path, write_state
 from .workspace import Workspace
 
@@ -40,6 +43,10 @@ class InstallOperation:
     source: Path | None
     reason: str
     expected_link: Path | None = None
+    component: ComponentKind = ComponentKind.SKILLS
+    resource: PathResource = DirectorySymlink()
+    expected_digest: str | None = None
+    diagnostic: str | None = None
 
     def as_dict(self) -> dict[str, str | None]:
         return {
@@ -48,7 +55,19 @@ class InstallOperation:
             "destination": str(self.destination),
             "source": str(self.source) if self.source else None,
             "reason": self.reason,
+            "component": self.component.value,
+            "resourceKind": self.resource.kind if self.source is not None else None,
+            "digest": self.resource.digest if isinstance(self.resource, FileCopy) else None,
+            "diagnostic": self.diagnostic,
         }
+
+
+@dataclass(frozen=True)
+class DestinationSnapshot:
+    destination: Path
+    destination_identity: tuple[int, int] | None
+    destination_anchor: Path
+    destination_anchor_identity: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -63,6 +82,7 @@ class InstallPlan:
     destination_identity: tuple[int, int] | None
     destination_anchor: Path
     destination_anchor_identity: tuple[int, int]
+    roots: tuple[DestinationSnapshot, ...]
 
     @property
     def has_conflicts(self) -> bool:
@@ -77,7 +97,7 @@ class _QuarantinedEntry:
 
 
 class _DestinationRoot:
-    def __init__(self, plan: InstallPlan, create: bool) -> None:
+    def __init__(self, plan: DestinationSnapshot, create: bool) -> None:
         self.path = plan.destination
         self.expected = plan.destination_identity
         self.fd: int | None = None
@@ -196,9 +216,44 @@ class _DestinationRoot:
         except FileExistsError as error:
             raise _changed(operation) from error
 
+    def same_resource(self, operation: InstallOperation) -> bool:
+        if isinstance(operation.resource, DirectorySymlink):
+            assert operation.source is not None
+            return self.same_link(operation, operation.source)
+        if self.secure:
+            assert self.fd is not None
+            return _file_digest(self._name(operation), self.fd) == operation.resource.digest
+        self.verify()
+        return _file_digest(operation.destination) == operation.resource.digest
+
+    def create(self, operation: InstallOperation, content: bytes | None) -> None:
+        if isinstance(operation.resource, DirectorySymlink):
+            self.create_link(operation)
+            return
+        assert content is not None
+        name = self._name(operation)
+        temporary = f".agent-workbench-copy-{secrets.token_hex(8)}"
+        if not self.secure:
+            raise OSError("managed copies require descriptor-relative filesystem operations")
+        assert self.fd is not None
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                             0o644, dir_fd=self.fd)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd,
+                        follow_symlinks=False)
+            except FileExistsError as error:
+                raise _changed(operation) from error
+        finally:
+            os.unlink(temporary, dir_fd=self.fd)
+
     def quarantine(self, operation: InstallOperation) -> _QuarantinedEntry:
-        if operation.expected_link is None:
-            raise ValueError(f"owned removal lacks an expected link target: {operation.destination}")
+        if operation.expected_link is None and operation.expected_digest is None:
+            raise ValueError(f"owned removal lacks expected ownership evidence: {operation.destination}")
         name = self._name(operation)
         directory_name = f".agent-workbench-quarantine-{secrets.token_hex(8)}"
         if self.secure:
@@ -224,7 +279,13 @@ class _DestinationRoot:
                 directory.rmdir()
                 raise
             moved = _QuarantinedEntry(self, directory_name, None)
-        if self.quarantined_link(moved) == operation.expected_link:
+        if isinstance(operation.resource, DirectorySymlink):
+            matches = self.quarantined_link(moved) == operation.expected_link
+        else:
+            digest = (_file_digest("entry", moved.directory_fd) if moved.directory_fd is not None
+                      else _file_digest(self.path / moved.directory_name / "entry"))
+            matches = digest == operation.expected_digest
+        if matches:
             return moved
         self.restore(moved, operation)
         raise _changed(operation)
@@ -285,6 +346,36 @@ class _DestinationRoot:
             directory = self.path / moved.directory_name
             (directory / "entry").unlink()
             directory.rmdir()
+
+
+def _read_regular(path: Path | str, directory_fd: int | None = None) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags, dir_fd=directory_fd)
+    with os.fdopen(descriptor, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError(f"copy requires a regular file: {path}")
+        return handle.read()
+
+
+def _file_digest(path: Path | str, directory_fd: int | None = None) -> str | None:
+    try:
+        return hashlib.sha256(_read_regular(path, directory_fd)).hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
+def _source_content(repository: Path, source: Path) -> bytes:
+    relative = source.relative_to(repository)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(repository, flags)
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return _read_regular(relative.name, descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _same_link(path: Path, source: Path) -> bool:
@@ -376,148 +467,185 @@ def _state_metadata(workspace: Workspace, target_id: str) -> tuple[str, str, str
 
 
 def _validated_state(
-    workspace: Workspace,
-    target_id: str,
-    file: Path,
-    destination_root: Path,
+    workspace: Workspace, target_id: str, file: Path,
+    roots: dict[ComponentKind, Path],
 ) -> InstallState | None:
     previous = load_state(file)
     if previous is None:
         return None
-    expected_metadata = _state_metadata(workspace, target_id)
-    actual_metadata = (previous.marketplace, previous.profile, previous.target)
-    if actual_metadata != expected_metadata:
+    if (previous.marketplace, previous.profile, previous.target) != _state_metadata(workspace, target_id):
         raise ValueError("installation state metadata does not match marketplace, profile, and target")
-    recorded_root = Path(previous.destination_root).resolve()
-    if recorded_root != destination_root.resolve():
-        raise ValueError(
-            f"recorded destination root differs from requested destination: {recorded_root}; "
-            "pass the same explicit --destination used for installation"
-        )
-    repository = Path(previous.repository)
-    for key, entry in previous.entries.items():
-        if entry.key != key:
-            raise ValueError(f"installation state entry key does not match mapping key: {key!r}")
-        expected_name = key.partition(":")[2]
-        source = repository.joinpath(*Path(entry.source).parts)
-        if source == repository or repository not in source.parents:
-            raise ValueError(f"installation state source escapes repository: {entry.source!r}")
-        destination = Path(entry.destination)
-        if destination.name != expected_name:
-            raise ValueError(f"installation state entry key does not match destination: {key!r}")
-        _require_contained(recorded_root, destination)
+    if Path(previous.destination_root) != roots[ComponentKind.SKILLS]:
+        raise ValueError("recorded destination root differs from requested destination; pass the same explicit --destination used for installation")
+    for component, recorded in previous.destination_roots.items():
+        if component not in roots or Path(recorded) != roots[component]:
+            raise ValueError("recorded destination root differs from adapter-authorized root; pass the same --project-root")
     return previous
 
 
-def _empty_state(workspace: Workspace, target_id: str, destination_root: Path) -> InstallState:
-    return InstallState(
-        schema_version=2,
-        repository=str(workspace.root),
-        marketplace=workspace.catalog.marketplace.id,
-        profile=str(workspace.profile.id),
-        target=target_id,
-        destination_root=str(destination_root.resolve()),
-        entries={},
+def _request_roots(workspace: Workspace, target: InstallTarget, destination: Path | None,
+                   project_root: Path | None) -> dict[ComponentKind, Path]:
+    selected = next(item for item in workspace.profile.targets if item.id == target.id)
+    project = project_root or (Path(selected.project_root) if selected.project_root else None)
+    if project is not None:
+        project = project.expanduser().absolute()
+        if ".." in project.parts:
+            raise ValueError("project root must be contained")
+        project = project.resolve()
+    skills = destination or (Path(selected.destination) if selected.destination else None)
+    if skills is None:
+        skills = project / f".{target.id}" / "skills" if project else target.default_destination()
+    skills = skills.expanduser().absolute()
+    # Explicit legacy destinations retain their canonical path semantics. Project
+    # destinations stay lexical so an adapter subdirectory cannot redirect them.
+    if destination is not None or selected.destination is not None or project is None:
+        if skills.is_symlink():
+            raise ValueError(f"destination root may not be a symlink: {skills}")
+        skills = skills.resolve()
+    return target.destination_roots(skills, project)
+
+
+def _empty_state(workspace: Workspace, target_id: str, roots: dict[ComponentKind, Path]) -> InstallState:
+    return InstallState(3, str(workspace.root), workspace.catalog.marketplace.id,
+                        str(workspace.profile.id), target_id, str(roots[ComponentKind.SKILLS]), {},
+                        {component: str(root) for component, root in roots.items()})
+
+
+def _make_plan(workspace: Workspace, target_id: str, file: Path,
+               roots: dict[ComponentKind, Path], previous: InstallState | None,
+               operations: list[InstallOperation], entries: dict[str, StateEntry]) -> InstallPlan:
+    snapshots = []
+    needed = {operation.destination.parent for operation in operations}
+    needed.add(roots[ComponentKind.SKILLS])
+    for root in sorted(set(roots.values()) & needed):
+        # Refuse redirected adapter directories, including existing parents.
+        anchor, identity = _destination_anchor(root)
+        current = root
+        while current != current.parent:
+            if current.is_symlink():
+                raise ValueError(f"destination root may not contain a symlink: {current}")
+            current = current.parent
+        snapshots.append(DestinationSnapshot(root, _destination_identity(root), anchor, identity))
+    destination = roots[ComponentKind.SKILLS]
+    main = next(snapshot for snapshot in snapshots if snapshot.destination == destination)
+    state_roots = {component: root for component, root in roots.items()
+                   if component is ComponentKind.SKILLS or any(entry.component is component for entry in entries.values())}
+    state = replace(_empty_state(workspace, target_id, state_roots), entries=entries)
+    return InstallPlan(TargetId(target_id), workspace.root, destination, tuple(operations), state,
+                       previous, file, main.destination_identity, main.destination_anchor,
+                       main.destination_anchor_identity, tuple(snapshots))
+
+
+def _matches_resource(destination: Path, source: Path, resource: PathResource) -> bool:
+    if isinstance(resource, FileCopy):
+        return _file_digest(destination) == resource.digest
+    return _same_link(destination, source)
+
+
+def _matches_owned(entry: StateEntry) -> bool:
+    return _matches_resource(Path(entry.destination), Path(entry.source_repository) / entry.source,
+                             entry.resource)
+
+
+def _removal(key: str, entry: StateEntry, reason: str) -> InstallOperation | None:
+    destination = Path(entry.destination)
+    if _is_absent(destination):
+        return None
+    matches = _matches_owned(entry)
+    return InstallOperation(
+        OperationKind.REMOVE_OWNED if matches else OperationKind.CONFLICT,
+        key, destination, Path(entry.source_repository) / entry.source,
+        reason if matches else "managed path was modified",
+        destination.readlink() if matches and isinstance(entry.resource, DirectorySymlink) else None,
+        entry.component, entry.resource,
+        entry.resource.digest if isinstance(entry.resource, FileCopy) else None,
     )
 
 
 def plan_install(
-    workspace: Workspace,
-    target_id: str,
-    state_root: Path,
-    destination: Path | None = None,
-    adopt: bool = False,
+    workspace: Workspace, target_id: str, state_root: Path,
+    destination: Path | None = None, adopt: bool = False,
+    components: tuple[ComponentKind, ...] | None = None,
+    project_root: Path | None = None,
 ) -> InstallPlan:
     target = _target(workspace, target_id)
     selected = next(item for item in workspace.profile.targets if item.id == target.id)
-    destination_path = (destination or (Path(selected.destination).expanduser() if selected.destination else target.default_destination())).resolve()
-    desired = target.desired_entries(workspace.resolved, destination_path)
-    for entry in desired:
-        _require_contained(destination_path, entry.destination)
+    requested = components if components is not None else selected.components
+    roots = _request_roots(workspace, target, destination, project_root)
+    _, unsupported = project_paths(target.id, requested, (), roots)
+    rejected = {conflict.component for conflict in unsupported}
+    exports = []
+    for plugin in workspace.resolved.plugins:
+        for component in requested:
+            if component in rejected:
+                continue
+            artifact, _ = COMPONENT_ARTIFACTS[component]
+            if artifact in plugin.artifact_paths:
+                inspector = workspace.registry.artifact_inspectors[artifact]
+                exports.extend(semantic_exports(inspector.inspect(plugin)))
+    projected, conflicts = project_paths(target.id, requested, tuple(exports), roots)
+    desired = tuple(DesiredEntry(
+        item.key, str(item.export.plugin_id), item.export.source, item.destination,
+        item.export.component,
+        DirectorySymlink() if item.export.component is ComponentKind.SKILLS else
+        FileCopy(hashlib.sha256(_source_content(workspace.root, item.export.source)).hexdigest()),
+    ) for item in projected)
     desired_by_key = {entry.key: entry for entry in desired}
-    if len(desired_by_key) != len(desired):
-        raise ValueError("desired installation keys must be unique")
-
+    if len(desired_by_key) != len(desired) or len({entry.destination for entry in desired}) != len(desired):
+        raise ValueError("desired installation keys and destinations must be unique")
+    for entry in desired:
+        _require_contained(roots[entry.component], entry.destination)
     file = state_path(state_root, workspace.catalog.marketplace.id, str(workspace.profile.id), target_id)
-    previous = _validated_state(workspace, target_id, file, destination_path)
+    previous = _validated_state(workspace, target_id, file, roots)
     owned = previous.entries if previous else {}
-    operations: list[InstallOperation] = []
+    operations = [InstallOperation(OperationKind.CONFLICT, f"component:{conflict.component.value}",
+                  roots.get(conflict.component, roots[ComponentKind.SKILLS]), None, conflict.reason,
+                  component=conflict.component, diagnostic=conflict.code) for conflict in conflicts]
     next_entries: dict[str, StateEntry] = {}
-
     for entry in desired:
         prior = owned.get(entry.key)
         expected_link = None
+        expected_digest = None
+        same_owner = (prior is not None and Path(prior.destination) == entry.destination
+                      and prior.component is entry.component
+                      and type(prior.resource) is type(entry.resource))
         if _is_absent(entry.destination):
             kind, reason = OperationKind.CREATE, "destination is absent"
-        elif _same_link(entry.destination, entry.source):
-            if prior:
-                kind, reason = OperationKind.KEEP, "managed link already matches"
+        elif same_owner and previous and not _matches_owned(prior):
+            kind, reason = OperationKind.CONFLICT, "managed path was modified"
+        elif _matches_resource(entry.destination, entry.source, entry.resource):
+            if same_owner:
+                kind, reason = OperationKind.KEEP, "managed resource already matches"
             elif adopt:
-                kind, reason = OperationKind.ADOPT, "matching unmanaged link explicitly adopted"
+                kind, reason = OperationKind.ADOPT, "matching unmanaged resource explicitly adopted"
             else:
-                kind, reason = OperationKind.CONFLICT, "matching link is not recorded as owned; use --adopt"
-        elif prior and previous and Path(prior.destination) == entry.destination and entry.destination.is_symlink():
-            prior_source = Path(previous.repository).joinpath(*Path(prior.source).parts)
-            if _same_link(entry.destination, prior_source):
-                kind, reason = OperationKind.REPLACE_OWNED, "managed link points to a stale source"
+                kind, reason = OperationKind.CONFLICT, "matching resource is not recorded as owned; use --adopt"
+        elif same_owner and previous and _matches_owned(prior):
+            kind, reason = OperationKind.REPLACE_OWNED, "managed resource has a new source"
+            if isinstance(prior.resource, FileCopy):
+                expected_digest = prior.resource.digest
+            else:
                 expected_link = entry.destination.readlink()
-            else:
-                kind, reason = OperationKind.CONFLICT, "managed path was changed to a foreign link"
         else:
             kind, reason = OperationKind.CONFLICT, "destination is a foreign file or link"
-        operations.append(InstallOperation(kind, entry.key, entry.destination, entry.source, reason, expected_link))
+        operations.append(InstallOperation(kind, entry.key, entry.destination, entry.source, reason,
+                          expected_link, entry.component, entry.resource, expected_digest))
         next_entries[entry.key] = StateEntry(
             key=entry.key,
             plugin=entry.plugin_id,
             source=entry.source.relative_to(workspace.root).as_posix(),
             destination=str(entry.destination),
+            component=entry.component,
+            resource=entry.resource,
+            source_repository=str(workspace.root),
         )
-
     for key, prior in sorted(owned.items()):
-        if key in desired_by_key:
-            continue
-        removal_destination = Path(prior.destination)
-        prior_repository = Path(previous.repository) if previous else workspace.root
-        expected_source = prior_repository.joinpath(*Path(prior.source).parts)
-        if _is_absent(removal_destination):
-            continue
-        if _same_link(removal_destination, expected_source):
-            operations.append(
-                InstallOperation(
-                    OperationKind.REMOVE_OWNED,
-                    key,
-                    removal_destination,
-                    expected_source,
-                    "managed entry is no longer selected",
-                    removal_destination.readlink(),
-                )
-            )
-        else:
-            operations.append(InstallOperation(OperationKind.CONFLICT, key, removal_destination, expected_source, "stale state points at a modified path"))
-
-    state = InstallState(
-        schema_version=2,
-        repository=str(workspace.root),
-        marketplace=workspace.catalog.marketplace.id,
-        profile=str(workspace.profile.id),
-        target=target_id,
-        destination_root=str(destination_path),
-        entries=next_entries,
-    )
-    destination_identity = _destination_identity(destination_path)
-    destination_anchor, destination_anchor_identity = _destination_anchor(destination_path)
-    return InstallPlan(
-        target=TargetId(target_id),
-        repository=workspace.root,
-        destination=destination_path,
-        operations=tuple(operations),
-        next_state=state,
-        previous_state=previous,
-        state_file=file,
-        destination_identity=destination_identity,
-        destination_anchor=destination_anchor,
-        destination_anchor_identity=destination_anchor_identity,
-    )
+        if key not in desired_by_key:
+            assert previous is not None
+            operation = _removal(key, prior, "managed entry is no longer selected")
+            if operation:
+                operations.append(operation)
+    return _make_plan(workspace, target_id, file, roots, previous, operations, next_entries)
 
 
 def _current_entries(plan: InstallPlan) -> dict[str, StateEntry]:
@@ -528,6 +656,10 @@ def _current_entries(plan: InstallPlan) -> dict[str, StateEntry]:
 
 
 def _write_progress(plan: InstallPlan, entries: dict[str, StateEntry]) -> None:
+    roots = dict(plan.previous_state.destination_roots) if plan.previous_state else {}
+    roots.update(plan.next_state.destination_roots)
+    roots = {component: root for component, root in roots.items()
+             if component is ComponentKind.SKILLS or any(entry.component is component for entry in entries.values())}
     state = InstallState(
         schema_version=plan.next_state.schema_version,
         repository=plan.next_state.repository,
@@ -536,41 +668,58 @@ def _write_progress(plan: InstallPlan, entries: dict[str, StateEntry]) -> None:
         target=plan.next_state.target,
         destination_root=plan.next_state.destination_root,
         entries=dict(entries),
+        destination_roots=roots,
     )
     write_state(plan.state_file, state)
 
 
-def _remove_created_link(root: _DestinationRoot, operation: InstallOperation) -> None:
+def _remove_created_resource(root: _DestinationRoot, operation: InstallOperation) -> None:
     assert operation.source is not None
     cleanup = InstallOperation(
         kind=OperationKind.REMOVE_OWNED,
         key=operation.key,
         destination=operation.destination,
         source=operation.source,
-        reason="roll back newly created link",
-        expected_link=_relative_link(operation.source, operation.destination.parent),
+        reason="roll back newly created resource",
+        expected_link=_relative_link(operation.source, operation.destination.parent) if isinstance(operation.resource, DirectorySymlink) else None,
+        component=operation.component,
+        resource=operation.resource,
+        expected_digest=operation.resource.digest if isinstance(operation.resource, FileCopy) else None,
     )
     moved = root.quarantine(cleanup)
     root.discard(moved)
 
 
-def _validate_install_source(plan: InstallPlan, operation: InstallOperation) -> None:
+def _validate_install_source(plan: InstallPlan, operation: InstallOperation) -> bytes | None:
     if operation.source is None:
-        raise ValueError(f"install operation has no skill source: {operation.destination}")
-    validate_skill_tree(plan.repository, operation.source)
+        raise ValueError(f"install operation has no source: {operation.destination}")
+    if isinstance(operation.resource, DirectorySymlink):
+        validate_skill_tree(plan.repository, operation.source)
+        return None
+    content = _source_content(plan.repository, operation.source)
+    if hashlib.sha256(content).hexdigest() != operation.resource.digest:
+        raise ValueError(f"copy source changed since planning: {operation.source}")
+    return content
 
 
-def _apply_plan_locked(plan: InstallPlan) -> None:
+def _apply_plan_locked(plan: InstallPlan, uninstall: bool = False) -> None:
     if plan.has_conflicts:
         raise ValueError("installation plan has conflicts")
     entries = _current_entries(plan)
-    with _DestinationRoot(plan, create=True) as root:
+    for operation in plan.operations:
+        if operation.kind is not OperationKind.REMOVE_OWNED:
+            _validate_install_source(plan, operation)
+    with ExitStack() as stack:
+        needed = {operation.destination.parent for operation in plan.operations}
+        roots = {snapshot.destination: stack.enter_context(_DestinationRoot(snapshot, create=not uninstall))
+                 for snapshot in plan.roots if snapshot.destination in needed}
         for operation in plan.operations:
+            root = roots[operation.destination.parent]
             root.verify()
             if operation.kind in {OperationKind.KEEP, OperationKind.ADOPT}:
                 _validate_install_source(plan, operation)
                 assert operation.source is not None
-                if not root.same_link(operation, operation.source):
+                if not root.same_resource(operation):
                     raise _changed(operation)
                 entries[operation.key] = plan.next_state.entries[operation.key]
                 _write_progress(plan, entries)
@@ -591,31 +740,33 @@ def _apply_plan_locked(plan: InstallPlan) -> None:
                 root.discard(moved)
                 continue
             if operation.kind is OperationKind.CREATE:
-                _validate_install_source(plan, operation)
-                root.create_link(operation)
+                content = _validate_install_source(plan, operation)
+                root.create(operation, content)
                 try:
                     root.verify()
                 except Exception:
-                    _remove_created_link(root, operation)
+                    _remove_created_resource(root, operation)
                     raise
                 entries[operation.key] = plan.next_state.entries[operation.key]
                 try:
                     _write_progress(plan, entries)
                 except Exception:
-                    _remove_created_link(root, operation)
+                    _remove_created_resource(root, operation)
                     raise
                 continue
             if operation.kind is OperationKind.REPLACE_OWNED:
-                _validate_install_source(plan, operation)
+                content = _validate_install_source(plan, operation)
                 assert operation.source is not None
                 old = root.quarantine(operation)
+                created = False
                 try:
                     root.verify()
-                    root.create_link(operation)
+                    root.create(operation, content)
+                    created = True
                     root.verify()
                 except Exception:
-                    if root.same_link(operation, operation.source):
-                        _remove_created_link(root, operation)
+                    if created:
+                        _remove_created_resource(root, operation)
                     root.restore(old, operation)
                     raise
                 entries[operation.key] = plan.next_state.entries[operation.key]
@@ -623,7 +774,7 @@ def _apply_plan_locked(plan: InstallPlan) -> None:
                     _write_progress(plan, entries)
                 except Exception:
                     try:
-                        _remove_created_link(root, operation)
+                        _remove_created_resource(root, operation)
                         root.restore(old, operation)
                     except Exception as rollback_error:
                         raise RuntimeError(
@@ -631,7 +782,10 @@ def _apply_plan_locked(plan: InstallPlan) -> None:
                         ) from rollback_error
                     raise
                 root.discard(old)
-    write_state(plan.state_file, plan.next_state)
+    if uninstall:
+        remove_state(plan.state_file)
+    else:
+        write_state(plan.state_file, plan.next_state)
 
 
 def apply_plan(plan: InstallPlan) -> None:
@@ -640,95 +794,22 @@ def apply_plan(plan: InstallPlan) -> None:
 
 
 def plan_uninstall(
-    workspace: Workspace,
-    target_id: str,
-    state_root: Path,
-    destination: Path | None = None,
+    workspace: Workspace, target_id: str, state_root: Path,
+    destination: Path | None = None, project_root: Path | None = None,
 ) -> InstallPlan:
     target = _target(workspace, target_id)
-    selected = next(item for item in workspace.profile.targets if item.id == target.id)
-    installation_root = (
-        destination.expanduser()
-        if destination
-        else (Path(selected.destination).expanduser() if selected.destination else target.default_destination())
-    ).resolve()
+    roots = _request_roots(workspace, target, destination, project_root)
     file = state_path(state_root, workspace.catalog.marketplace.id, str(workspace.profile.id), target_id)
-    previous = _validated_state(workspace, target_id, file, installation_root)
-    destination_identity = _destination_identity(installation_root)
-    destination_anchor, destination_anchor_identity = _destination_anchor(installation_root)
-    if previous is None:
-        return InstallPlan(
-            target=TargetId(target_id),
-            repository=workspace.root,
-            destination=installation_root,
-            operations=(),
-            next_state=_empty_state(workspace, target_id, installation_root),
-            previous_state=None,
-            state_file=file,
-            destination_identity=destination_identity,
-            destination_anchor=destination_anchor,
-            destination_anchor_identity=destination_anchor_identity,
-        )
-    operations: list[InstallOperation] = []
-    for key, entry in sorted(previous.entries.items()):
-        removal_destination = Path(entry.destination)
-        source = Path(previous.repository).joinpath(*Path(entry.source).parts)
-        if _is_absent(removal_destination):
-            continue
-        if _same_link(removal_destination, source):
-            operations.append(
-                InstallOperation(
-                    OperationKind.REMOVE_OWNED,
-                    key,
-                    removal_destination,
-                    source,
-                    "remove managed entry",
-                    removal_destination.readlink(),
-                )
-            )
-        else:
-            operations.append(InstallOperation(OperationKind.CONFLICT, key, removal_destination, source, "managed path was modified"))
-    return InstallPlan(
-        target=TargetId(target_id),
-        repository=workspace.root,
-        destination=installation_root,
-        operations=tuple(operations),
-        next_state=_empty_state(workspace, target_id, installation_root),
-        previous_state=previous,
-        state_file=file,
-        destination_identity=destination_identity,
-        destination_anchor=destination_anchor,
-        destination_anchor_identity=destination_anchor_identity,
-    )
-
-
-def _apply_uninstall_locked(plan: InstallPlan) -> None:
-    if plan.has_conflicts:
-        raise ValueError("uninstall plan has conflicts")
-    entries = _current_entries(plan)
-    if not plan.operations:
-        remove_state(plan.state_file)
-        return
-    with _DestinationRoot(plan, create=False) as root:
-        for operation in plan.operations:
-            root.verify()
-            if operation.kind is OperationKind.REMOVE_OWNED:
-                moved = root.quarantine(operation)
-                try:
-                    root.verify()
-                except Exception:
-                    root.restore(moved, operation)
-                    raise
-                entries.pop(operation.key, None)
-                try:
-                    _write_progress(plan, entries)
-                except Exception:
-                    root.restore(moved, operation)
-                    raise
-                root.discard(moved)
-    remove_state(plan.state_file)
+    previous = _validated_state(workspace, target_id, file, roots)
+    operations = []
+    if previous:
+        for key, entry in sorted(previous.entries.items()):
+            operation = _removal(key, entry, "remove managed entry")
+            if operation:
+                operations.append(operation)
+    return _make_plan(workspace, target_id, file, roots, previous, operations, {})
 
 
 def apply_uninstall(plan: InstallPlan) -> None:
     with _state_lock(plan.state_file):
-        _apply_uninstall_locked(plan)
+        _apply_plan_locked(plan, uninstall=True)

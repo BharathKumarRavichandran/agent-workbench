@@ -6,9 +6,11 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
+
+from .model import ComponentKind, DirectorySymlink, FileCopy, PathResource
 
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
@@ -19,13 +21,20 @@ class StateEntry:
     plugin: str
     source: str
     destination: str
+    component: ComponentKind
+    resource: PathResource
+    source_repository: str
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "key": self.key,
             "plugin": self.plugin,
             "source": self.source,
             "destination": self.destination,
+            "component": self.component.value,
+            "resourceKind": self.resource.kind,
+            "sourceRepository": self.source_repository,
+            **({"digest": self.resource.digest} if isinstance(self.resource, FileCopy) else {}),
         }
 
 
@@ -38,8 +47,14 @@ class InstallState:
     target: str
     destination_root: str
     entries: Mapping[str, StateEntry]
+    destination_roots: Mapping[ComponentKind, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
+        entries = {key: entry.as_dict() for key, entry in sorted(self.entries.items())}
+        if self.schema_version == 2:
+            entries = {key: {name: value for name, value in entry.items()
+                            if name in {"key", "plugin", "source", "destination"}}
+                       for key, entry in entries.items()}
         return {
             "schemaVersion": self.schema_version,
             "repository": self.repository,
@@ -47,7 +62,9 @@ class InstallState:
             "profile": self.profile,
             "target": self.target,
             "destinationRoot": self.destination_root,
-            "entries": {key: entry.as_dict() for key, entry in sorted(self.entries.items())},
+            "entries": entries,
+            **({"destinationRoots": {key.value: value for key, value in sorted(self.destination_roots.items())}}
+               if self.schema_version == 3 else {}),
         }
 
 
@@ -99,7 +116,7 @@ def _identifier(value: Any, location: str) -> str:
 
 def _absolute_path(value: Any, location: str) -> str:
     result = _string(value, location)
-    if not Path(result).is_absolute():
+    if not Path(result).is_absolute() or ".." in Path(result).parts:
         raise ValueError(f"{location} must be absolute")
     return result
 
@@ -115,7 +132,7 @@ def _source_path(value: Any, location: str) -> str:
 def _entry_key(value: Any, location: str) -> str:
     result = _string(value, location)
     prefix, separator, name = result.partition(":")
-    if prefix != "skill" or not separator or name in {".", ".."} or Path(name).name != name or "/" in name or "\\" in name:
+    if prefix not in {"skill", "agent", "rule", "command"} or not separator or not name or name in {".", ".."} or Path(name).name != name or "/" in name or "\\" in name:
         raise ValueError(f"{location} is not a valid entry key")
     return result
 
@@ -128,15 +145,35 @@ def load_state(path: Path) -> InstallState | None:
         str(path),
     )
     required = {"schemaVersion", "repository", "marketplace", "profile", "target", "destinationRoot", "entries"}
-    _keys(data, required, "installation state")
-    if data["schemaVersion"] != 2:
+    version = data.get("schemaVersion")
+    if type(version) is not int or version not in (2, 3):
         raise ValueError(f"unsupported installation state: {path}")
+    _keys(data, required | ({"destinationRoots"} if version == 3 else set()), "installation state")
     raw_entries = _object(data["entries"], "installation state.entries")
     entries: dict[str, StateEntry] = {}
     for raw_key, raw_value in raw_entries.items():
         key = _entry_key(raw_key, "installation state entry key")
         value = _object(raw_value, f"installation state.entries[{key!r}]")
-        _keys(value, {"key", "plugin", "source", "destination"}, f"installation state.entries[{key!r}]")
+        resource: PathResource = DirectorySymlink()
+        component = ComponentKind.SKILLS
+        fields = {"key", "plugin", "source", "destination"}
+        if version == 3:
+            component = ComponentKind(value.get("component"))
+            kind = value.get("resourceKind")
+            fields |= {"component", "resourceKind", "sourceRepository"}
+            if kind == "file-copy":
+                fields.add("digest")
+                digest = _string(value.get("digest"), "installation state entry digest")
+                if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    raise ValueError("installation state entry digest must be SHA-256")
+                resource = FileCopy(digest)
+            elif kind != "directory-symlink":
+                raise ValueError("installation state entry resourceKind is unsupported")
+        _keys(value, fields, f"installation state.entries[{key!r}]")
+        prefix = {ComponentKind.SKILLS: "skill", ComponentKind.AGENTS: "agent",
+                  ComponentKind.RULES: "rule", ComponentKind.COMMANDS: "command"}.get(component)
+        if key.partition(":")[0] != prefix or (isinstance(resource, DirectorySymlink) != (component is ComponentKind.SKILLS)):
+            raise ValueError("installation state entry key, component and resource kind disagree")
         embedded_key = _entry_key(value["key"], f"installation state.entries[{key!r}].key")
         if embedded_key != key:
             raise ValueError(f"installation state entry key does not match mapping key: {key!r}")
@@ -145,15 +182,37 @@ def load_state(path: Path) -> InstallState | None:
             plugin=_identifier(value["plugin"], f"installation state.entries[{key!r}].plugin"),
             source=_source_path(value["source"], f"installation state.entries[{key!r}].source"),
             destination=_absolute_path(value["destination"], f"installation state.entries[{key!r}].destination"),
+            component=component,
+            resource=resource,
+            source_repository=_absolute_path(value["sourceRepository"] if version == 3 else data["repository"],
+                                             f"installation state.entries[{key!r}].sourceRepository"),
         )
+    roots = ({ComponentKind(key): _absolute_path(value, "installation state.destinationRoots")
+              for key, value in _object(data["destinationRoots"], "installation state.destinationRoots").items()}
+             if version == 3 else {ComponentKind.SKILLS: data["destinationRoot"]})
+    if roots.get(ComponentKind.SKILLS) != data["destinationRoot"]:
+        raise ValueError("installation state destinationRoots skills must match destinationRoot")
+    if any(entry.component not in roots for entry in entries.values()):
+        raise ValueError("installation state entry lacks a destination root")
+    destinations: set[Path] = set()
+    for key, entry in entries.items():
+        destination = Path(entry.destination)
+        if destination.name != key.partition(":")[2]:
+            raise ValueError(f"installation state entry key does not match destination: {key!r}")
+        if destination.parent != Path(roots[entry.component]):
+            raise ValueError(f"state destination must be a direct child of installation root: {destination}")
+        if destination in destinations:
+            raise ValueError("installation state destinations must be unique")
+        destinations.add(destination)
     return InstallState(
-        schema_version=2,
+        schema_version=version,
         repository=_absolute_path(data["repository"], "installation state.repository"),
         marketplace=_identifier(data["marketplace"], "installation state.marketplace"),
         profile=_identifier(data["profile"], "installation state.profile"),
         target=_identifier(data["target"], "installation state.target"),
         destination_root=_absolute_path(data["destinationRoot"], "installation state.destinationRoot"),
         entries=entries,
+        destination_roots=roots,
     )
 
 

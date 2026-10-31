@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Protocol
 
 from ..diagnostics import Issue
-from ..model import ArtifactInventory, ArtifactKind, Catalog, ResolvedPlugin, ResolvedProfile, TargetId
+from ..model import ArtifactInventory, ArtifactKind, Catalog, ResolvedPlugin, ResolvedProfile, TargetId, ComponentKind, DirectorySymlink, PathResource
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,8 @@ class DesiredEntry:
     plugin_id: str
     source: Path
     destination: Path
+    component: ComponentKind = ComponentKind.SKILLS
+    resource: PathResource = DirectorySymlink()
 
 
 class ArtifactInspector(Protocol):
@@ -53,8 +55,4 @@ class InstallTarget(Protocol):
 
     def default_destination(self) -> Path: ...
 
-    def desired_entries(
-        self,
-        profile: ResolvedProfile,
-        destination: Path,
-    ) -> tuple[DesiredEntry, ...]: ...
+    def destination_roots(self, skills: Path, project_root: Path | None) -> dict[ComponentKind, Path]: ...

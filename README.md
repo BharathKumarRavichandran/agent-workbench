@@ -18,7 +18,7 @@ catalog JSON
     ↓ strict decoder
 immutable domain model
     ├── marketplace renderers
-    ├── skill-directory targets
+    ├── component path projections
     ├── profile resolution
     ├── layered validation
     └── install planner
@@ -66,7 +66,32 @@ python3 -m agent_workbench --profile pstack uninstall --target hermes
 python3 -m agent_workbench update --source cursor-plugins
 ```
 
-Use `--destination` and `--state-dir` for isolated, project-local, or CI installations.
+`--destination` overrides the skills directory. `--project-root` selects project directories for components. `--state-dir` overrides machine-local ownership storage.
+
+To install pstack agents into a project:
+
+```bash
+python3 -m agent_workbench --profile pstack plan --target cursor --component agents --project-root /path/to/project
+python3 -m agent_workbench --profile pstack install --target cursor --component agents --project-root /path/to/project
+python3 -m agent_workbench --profile pstack uninstall --target cursor --project-root /path/to/project
+```
+
+Repeat `--component` to select more than one kind, such as `--component skills --component agents`. The same flags apply to `plan`, `install`, and `status`. Text and JSON operations identify the component and resource kind. Unsupported requests produce `COMPONENT_UNSUPPORTED` conflicts before mutation, even when selected plugins export none of that component.
+
+## Supported components
+
+The table describes current artifact formats. The workbench copies supported documents without format conversion.
+
+| Target | Skills | Markdown agents | Cursor `.mdc` rules | Legacy Markdown commands |
+|---|---|---|---|---|
+| `agents` | directory symlink | unsupported | unsupported | unsupported |
+| `cursor` | directory symlink | managed copy | managed copy, project only | unsupported |
+| `claude` | directory symlink | managed copy | unsupported | managed copy |
+| `codex`, `hermes`, `grok` | directory symlink | unsupported | unsupported | unsupported |
+
+For Cursor and Claude, `--project-root /path/to/project` selects `.cursor` or `.claude` under that project. Each component uses its own directory: `skills`, `agents`, `rules`, or `commands`. Without a project root, supported components use the target's home directory. Cursor rules require `--project-root` and otherwise produce `PROJECT_ROOT_REQUIRED`. An explicit `--destination` overrides only the skills directory, including when a project root is present.
+
+Hooks and MCP activation remain unsupported. Inspection never executes hooks or starts servers.
 
 ## Profiles
 
@@ -76,19 +101,38 @@ Use `--destination` and `--state-dir` for isolated, project-local, or CI install
 
 Profiles select plugins and allowed targets. They cannot change source provenance or artifact paths.
 
+Version 1 profiles normalize every target to `skills` only. The checked-in profiles remain version 1, including the new Cursor target. Version 2 adds optional `components` and `projectRoot` fields to each target:
+
+```json
+{
+  "schemaVersion": 2,
+  "id": "project",
+  "plugins": {"include": ["pstack"], "exclude": []},
+  "targets": [{
+    "id": "cursor",
+    "components": ["skills", "agents"],
+    "projectRoot": "/path/to/project"
+  }]
+}
+```
+
+Without `--component`, commands use the profile's selection, which defaults to skills. Explicit component flags replace that selection for the request. Installation removes previously owned resources that are no longer selected. Uninstall removes all recorded resources regardless of the current component selection. Custom destinations and project roots must match the installation request during uninstall. State cannot authorize an arbitrary destination.
+
 ## Safety behavior
 
 The installer builds a complete plan before writing anything.
 
-- Regular files and foreign symlinks are conflicts.
-- Matching unmanaged links require `--adopt`.
+- Foreign paths and modified owned paths are conflicts.
+- Matching unmanaged skill links and byte-identical regular files require `--adopt`.
 - Repeated installation converges to `keep` operations.
 - State writes are atomic and guarded by an operation lock; stale plans are rejected against the full ownership snapshot.
 - Destination roots are created and mutated through pinned directory descriptors, preventing parent/root symlink swaps from redirecting writes.
-- Uninstall removes only state-owned links that still point to the expected source.
+- Copied files carry a SHA-256 digest in the plan and state. Apply checks source bytes again, then publishes the complete file atomically.
+- Replacement and removal quarantine each resource and check its ownership evidence before deletion.
+- Uninstall removes owned links that still point to the expected source and owned files whose digest still matches.
 - Moved checkouts produce `replace-owned` operations rather than silent deletion.
 
-Machine-local ownership state is stored under:
+New installations write strict state schema v3 with tagged path resources and component roots. State v2 remains uninstallable and migrates to v3 during installation. State-file locations remain unchanged:
 
 ```text
 ${XDG_STATE_HOME:-~/.local/state}/agent-workbench/<marketplace>/<profile>/<target>.json
@@ -129,7 +173,7 @@ agent-workbench/
 4. Add it to the appropriate profiles.
 5. Run `make render check`.
 
-Component artifacts are validated and reported, but only `agent-skills` are currently installed into target directories. A `hooks` artifact points to the complete bundle directory containing `hooks.json` and its companion scripts; an `mcp` artifact points directly to its JSON file. Executable hooks and MCP configuration require a later explicit trust and activation design.
+Component artifacts are validated and reported independently of installation. Skills and the supported document formats listed above can be installed into target directories. A `hooks` artifact points to the complete bundle directory containing `hooks.json` and its companion scripts; an `mcp` artifact points directly to its JSON file. Executable hooks and MCP configuration require a later explicit trust and activation design.
 
 ## Adding an agent
 

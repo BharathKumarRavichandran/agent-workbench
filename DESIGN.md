@@ -39,6 +39,7 @@ Artifacts use registered string identifiers. Built-in inspectors recognize `agen
 | `profiles.py` | Resolve selectors and source-relative artifacts. |
 | `artifacts.py` | Resolve every catalog artifact and dispatch its registered inspector. |
 | `adapters/components.py` | Validate and inventory portable component layouts without activating them. |
+| `adapters/projections.py` | Define the capability table and pure projections of semantic exports into target paths. |
 | `adapters/*` | Own native format or destination knowledge. |
 | `rendering.py` | Detect output collisions and atomically write deterministic files. |
 | `installation.py` | Reconcile desired entries with filesystem state and produce operations. |
@@ -57,7 +58,9 @@ A renderer declares one required artifact, validates its native package, and ret
 
 ### Install target
 
-An install target declares one required artifact, resolves its default destination, and expands selected plugins into desired entries. Codex, Claude, Grok, Hermes, and the shared Agent Skills directory are configurations of the same skill-directory target.
+An install target resolves authorized destination roots. Inspectors expose semantic `ComponentExport` values with a closed `ComponentKind` and an explicit representation. Pure projections select exact supported representations through `CAPABILITIES` and return paths or stable conflicts. They perform no mutation or format conversion.
+
+`PathResource` is a closed union of `DirectorySymlink` and `FileCopy`. Future shared-document operations belong in a separate union. A copied file carries a SHA-256 digest. One reconciler executes both resource kinds, including uninstall. Cursor, Claude, Codex, Grok, Hermes, and the shared Agent Skills directory use the same path executor.
 
 ### Source updater
 
@@ -77,7 +80,7 @@ Validation rejects:
 - unknown artifact kinds;
 - generated output collisions and drift.
 
-Artifact recognition is explicit in the adapter registry rather than inferred from renderer or install-target dependencies. Component inspection is inert: hook commands are not executed, MCP servers are not started, and configuration bodies are not copied into the lock report. Only `agent-skills` cross the installation boundary in the current design.
+Artifact recognition is explicit in the adapter registry rather than inferred from renderer or install-target dependencies. Component inspection is inert: hook commands are not executed, MCP servers are not started, and configuration bodies are not copied into the lock report. Skills and supported agents, rules, and commands cross the path installation boundary. Hooks and MCP remain inert.
 
 JSON Schema files provide editor support. The strict decoder and semantic validation are authoritative.
 
@@ -88,13 +91,17 @@ Planning is side-effect free. Applying a plan is allowed only when no conflict e
 | Filesystem state | Recorded ownership | Result |
 |---|---|---|
 | destination absent | either | `create` |
-| exact expected link | owned | `keep` |
-| exact expected link | unowned | conflict, or `adopt` with explicit flag |
-| stale symlink | owned | `replace-owned` |
-| regular file or foreign link | any | conflict |
-| no longer selected expected link | owned | `remove-owned` |
+| exact expected resource | owned and unchanged | `keep` |
+| matching link or byte-identical regular file | unowned | conflict, or `adopt` with explicit flag |
+| unchanged resource with updated desired source | owned | `replace-owned` |
+| foreign or modified owned path | either | conflict |
+| unchanged resource no longer selected | owned | `remove-owned` |
 
-State is evidence of ownership, not proof that the filesystem still matches. Every plan inspects the live path. Apply acquires a target-state lock and compares the complete state snapshot captured during planning, so concurrent or stale plans cannot erase newer ownership. Destination creation and mutations are performed relative to pinned directory descriptors; parent and root swaps therefore fail instead of redirecting writes. Uninstall removes only an owned link that still resolves to its expected source.
+State is evidence of ownership, not proof that the filesystem still matches. Every plan inspects the live path. Apply acquires a target-state lock and compares the complete state snapshot captured during planning, so concurrent or stale plans cannot erase newer ownership. Destination creation and mutations are performed relative to pinned directory descriptors; parent and root swaps therefore fail instead of redirecting writes. Each destination is a direct child of a root authorized by the adapter and request. State records cannot expand those roots. All roots used by a plan have descriptor and ancestor identities captured during planning.
+
+Copied sources are read through directory descriptors without following symlinks. Apply revalidates their planned digests before destination creation and again before use. Copies are written to temporary regular files and atomically published without overwriting an existing path. Replacements first quarantine the owned file, then compare its recorded digest. Failed ownership checks restore the quarantined path. Failed state writes roll back the current mutation while preserving ownership of completed operations.
+
+Uninstall checks ownership evidence for every recorded component, independent of current profile component flags. Skills must still resolve to their expected sources. Copies must still match their recorded digests. Strict state v3 stores tagged resources and per-component roots at the existing state-file location. Each entry pins its source repository so an interrupted checkout migration preserves ownership of links that still use the old checkout. State v2 decodes as skills-only ownership and remains uninstallable. Installation writes v3.
 
 ## Upstream boundary
 
@@ -104,7 +111,9 @@ Karpathy guidelines remain a curated copy because the artifact is one small skil
 
 ## Profiles and overlays
 
-Profiles select existing plugins. They do not rewrite provenance or package layout. A private work repository should depend on this public core and add private sources, plugins, and profiles. The public core must never depend on the work overlay.
+Profiles select existing plugins. They do not rewrite provenance or package layout. Profile v1 targets normalize to skills only. Strict profile v2 adds explicit component selections and optional absolute project roots. A missing selection still means skills. CLI component flags replace the profile selection.
+
+Cursor supports skills, Markdown agents, and project `.mdc` rules. Claude supports skills, compatible Markdown agents, and legacy Markdown commands. The other built-ins support skills for the current formats. Unsupported requests return `COMPONENT_UNSUPPORTED` before mutation. Cursor rules without a project root return `PROJECT_ROOT_REQUIRED`. No conversion to unsupported native formats occurs. A private work repository should depend on this public core and add private sources, plugins, and profiles. The public core must never depend on the work overlay.
 
 ## Compatibility
 
@@ -120,7 +129,6 @@ The wrappers contain no duplicated catalog, rendering, validation, or installati
 
 These should be added only when a real target needs them:
 
-- copy installation for ephemeral cloud containers;
 - trusted installation and activation of executable hooks and MCP components;
 - external adapter discovery;
 - profile inheritance;

@@ -6,9 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..inspection import discover_skills
-from ..model import ArtifactKind, ResolvedProfile, TargetId
-from .base import DesiredEntry
+from ..model import ArtifactKind, TargetId, ComponentKind
 
 
 @dataclass(frozen=True)
@@ -32,24 +30,12 @@ class SkillDirectoryTarget:
     def default_destination(self) -> Path:
         return self.destination.resolve()
 
-    def desired_entries(self, profile: ResolvedProfile, destination: Path) -> tuple[DesiredEntry, ...]:
-        entries: list[DesiredEntry] = []
-        names: dict[str, str] = {}
-        for resolved in profile.plugins:
-            skills_root = resolved.artifact_paths.get(self.required_artifact)
-            if skills_root is None:
-                continue
-            for skill in discover_skills(skills_root):
-                previous = names.get(skill.name)
-                if previous:
-                    raise ValueError(f"duplicate skill name {skill.name!r} in {previous} and {resolved.plugin.id}")
-                names[skill.name] = str(resolved.plugin.id)
-                entries.append(
-                    DesiredEntry(
-                        key=f"skill:{skill.name}",
-                        plugin_id=str(resolved.plugin.id),
-                        source=skill.root,
-                        destination=destination / skill.name,
-                    )
-                )
-        return tuple(entries)
+    def destination_roots(self, skills: Path, project_root: Path | None) -> dict[ComponentKind, Path]:
+        from .projections import CAPABILITIES
+
+        base = project_root / f".{self.id}" if project_root else self.default_destination().parent
+        roots = {component: base / component.value
+                 for component in CAPABILITIES.get(self.id, {})
+                 if component is not ComponentKind.RULES or project_root is not None}
+        roots[ComponentKind.SKILLS] = skills
+        return roots

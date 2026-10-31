@@ -2,16 +2,57 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Mapping, NewType
+from typing import Mapping, NewType, Union, Literal
 
 PluginId = NewType("PluginId", str)
 SourceId = NewType("SourceId", str)
 ArtifactKind = NewType("ArtifactKind", str)
 ProfileId = NewType("ProfileId", str)
 TargetId = NewType("TargetId", str)
+
+
+class ComponentKind(str, Enum):
+    SKILLS = "skills"
+    AGENTS = "agents"
+    RULES = "rules"
+    COMMANDS = "commands"
+    HOOKS = "hooks"
+    MCP = "mcp"
+
+
+class Representation(str, Enum):
+    SKILL_DIRECTORY = "skill-directory"
+    MARKDOWN_AGENT = "markdown-agent"
+    CURSOR_RULE = "cursor-mdc"
+    LEGACY_COMMAND = "legacy-markdown-command"
+    HOOK_BUNDLE = "hook-bundle"
+    MCP_DOCUMENT = "mcp-document"
+
+
+@dataclass(frozen=True)
+class DirectorySymlink:
+    kind: Literal["directory-symlink"] = field(default="directory-symlink", init=False)
+
+
+@dataclass(frozen=True)
+class FileCopy:
+    digest: str
+    kind: Literal["file-copy"] = field(default="file-copy", init=False)
+
+
+PathResource = Union[DirectorySymlink, FileCopy]
+
+
+@dataclass(frozen=True)
+class ComponentExport:
+    plugin_id: PluginId
+    component: ComponentKind
+    name: str
+    source: Path
+    representation: Representation
 
 
 @dataclass(frozen=True)
@@ -89,6 +130,8 @@ class Catalog:
 class ProfileTarget:
     id: TargetId
     destination: str | None = None
+    components: tuple[ComponentKind, ...] = (ComponentKind.SKILLS,)
+    project_root: str | None = None
 
 
 @dataclass(frozen=True)

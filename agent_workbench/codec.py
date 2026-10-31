@@ -12,6 +12,7 @@ from .model import (
     Artifact,
     ArtifactKind,
     Catalog,
+    ComponentKind,
     Marketplace,
     Plugin,
     PluginId,
@@ -42,7 +43,7 @@ def _list(value: Any, location: str) -> list[Any]:
 
 
 def _string(value: Any, location: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value or "\x00" in value:
         raise ValueError(f"{location} must be a non-empty string")
     return value
 
@@ -188,7 +189,9 @@ def decode_catalog(path: Path) -> Catalog:
 def decode_profile(path: Path) -> Profile:
     data = load_json(path)
     _keys(data, {"schemaVersion", "id", "plugins", "targets"}, {"$schema"}, "profile")
-    _schema_version(data["schemaVersion"], 1, "profile.schemaVersion")
+    version = data["schemaVersion"]
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("profile.schemaVersion must be integer 1 or 2")
     selector = _object(data["plugins"], "profile.plugins")
     _keys(selector, {"include", "exclude"}, set(), "profile.plugins")
     include = tuple(_string(value, "profile.plugins.include[]") for value in _list(selector["include"], "profile.plugins.include"))
@@ -197,15 +200,27 @@ def decode_profile(path: Path) -> Profile:
     for index, raw in enumerate(_list(data["targets"], "profile.targets")):
         location = f"profile.targets[{index}]"
         item = _object(raw, location)
-        _keys(item, {"id"}, {"destination"}, location)
+        _keys(item, {"id"}, {"destination"} if version == 1 else {"destination", "components", "projectRoot"}, location)
+        components = (ComponentKind.SKILLS,)
+        if "components" in item:
+            components = tuple(ComponentKind(_string(value, f"{location}.components[]")) for value in _list(item["components"], f"{location}.components"))
+            if len(set(components)) != len(components):
+                raise ValueError(f"{location}.components must be unique")
+        project_root = _string(item["projectRoot"], f"{location}.projectRoot") if "projectRoot" in item else None
+        if project_root is not None and ("\x00" in project_root or not Path(project_root).expanduser().is_absolute() or ".." in Path(project_root).parts):
+            raise ValueError(f"{location}.projectRoot must be an absolute contained path")
         targets.append(
             ProfileTarget(
                 id=TargetId(_identifier(item["id"], f"{location}.id")),
                 destination=_string(item["destination"], f"{location}.destination") if "destination" in item else None,
+                components=components,
+                project_root=project_root,
             )
         )
+    if version == 2 and len({target.id for target in targets}) != len(targets):
+        raise ValueError("profile target ids must be unique")
     return Profile(
-        schema_version=1,
+        schema_version=version,
         id=ProfileId(_identifier(data["id"], "profile.id")),
         include_plugins=include,
         exclude_plugins=exclude,

@@ -8,7 +8,8 @@ from typing import Mapping
 
 from .adapters.base import ArtifactInspector
 from .diagnostics import Issue, Severity
-from .model import ArtifactInventory, ArtifactKind, Catalog, PluginId, ResolvedPlugin
+from .model import (ArtifactInventory, ArtifactKind, Catalog, PluginId, ResolvedPlugin,
+                    ComponentExport, ComponentKind, Representation)
 
 
 @dataclass(frozen=True)
@@ -71,3 +72,25 @@ def component_counts(
         if plugin_id in selected and inventory.components:
             counts[kind] = counts.get(kind, 0) + len(inventory.components)
     return dict(sorted(counts.items(), key=lambda item: str(item[0])))
+
+
+# Semantic formats describe the bytes we have, independent of target support.
+COMPONENT_ARTIFACTS = {
+    ComponentKind.SKILLS: (ArtifactKind("agent-skills"), Representation.SKILL_DIRECTORY),
+    ComponentKind.AGENTS: (ArtifactKind("agents"), Representation.MARKDOWN_AGENT),
+    ComponentKind.RULES: (ArtifactKind("rules"), Representation.CURSOR_RULE),
+    ComponentKind.COMMANDS: (ArtifactKind("commands"), Representation.LEGACY_COMMAND),
+    ComponentKind.HOOKS: (ArtifactKind("hooks"), Representation.HOOK_BUNDLE),
+    ComponentKind.MCP: (ArtifactKind("mcp"), Representation.MCP_DOCUMENT),
+}
+
+
+def semantic_exports(inventory: ArtifactInventory) -> tuple[ComponentExport, ...]:
+    for component, (artifact, representation) in COMPONENT_ARTIFACTS.items():
+        if artifact == inventory.kind:
+            return tuple(ComponentExport(
+                inventory.plugin_id, component, item.name,
+                inventory.root if component is ComponentKind.MCP else inventory.root / item.path,
+                representation,
+            ) for item in inventory.components)
+    return ()

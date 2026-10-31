@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from .model import ComponentKind
 from .artifacts import component_counts, inspect_catalog
 from .installation import apply_plan, apply_uninstall, plan_install, plan_uninstall
 from .rendering import render
@@ -23,7 +24,10 @@ def _print_operations(plan: object, as_json: bool) -> None:
         return
     for operation in operations:
         source = f" -> {operation.source}" if operation.source else ""
-        print(f"{operation.kind.value:14} {operation.destination}{source}  ({operation.reason})")
+        resource = operation.resource.kind if operation.source is not None else "unsupported"
+        reason = f"{operation.diagnostic}: {operation.reason}" if operation.diagnostic else operation.reason
+        print(f"{operation.kind.value:14} {operation.component.value}/{resource} "
+              f"{operation.destination}{source}  ({reason})")
 
 
 def _workspace(args: argparse.Namespace) -> Workspace:
@@ -46,7 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("plan", "install", "status"):
         command = subcommands.add_parser(name)
         command.add_argument("--target", required=True)
-        command.add_argument("--destination", type=Path)
+        command.add_argument("--destination", type=Path, help="skills directory override")
+        command.add_argument("--component", action="append", choices=[kind.value for kind in ComponentKind])
+        command.add_argument("--project-root", type=Path)
         command.add_argument("--state-dir", type=Path, default=default_state_root())
         command.add_argument("--adopt", action="store_true")
         command.add_argument("--json", action="store_true")
@@ -54,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall = subcommands.add_parser("uninstall")
     uninstall.add_argument("--target", required=True)
     uninstall.add_argument("--destination", type=Path)
+    uninstall.add_argument("--project-root", type=Path)
     uninstall.add_argument("--state-dir", type=Path, default=default_state_root())
     uninstall.add_argument("--json", action="store_true")
 
@@ -90,7 +97,10 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"plan", "install", "status"}:
-        plan = plan_install(workspace, args.target, args.state_dir, args.destination, args.adopt)
+        components = (tuple(dict.fromkeys(ComponentKind(value) for value in args.component))
+                      if args.component is not None else None)
+        plan = plan_install(workspace, args.target, args.state_dir, args.destination,
+                            args.adopt, components, args.project_root)
         _print_operations(plan, args.json)
         if args.command == "install":
             if plan.has_conflicts:
@@ -99,7 +109,7 @@ def run(args: argparse.Namespace) -> int:
         return 1 if plan.has_conflicts else 0
 
     if args.command == "uninstall":
-        plan = plan_uninstall(workspace, args.target, args.state_dir, args.destination)
+        plan = plan_uninstall(workspace, args.target, args.state_dir, args.destination, args.project_root)
         _print_operations(plan, args.json)
         if not plan.has_conflicts:
             apply_uninstall(plan)

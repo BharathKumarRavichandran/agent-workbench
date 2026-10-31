@@ -609,7 +609,7 @@ class InstallationTests(unittest.TestCase):
             apply_plan(plan_install(Workspace.load(fixture.root), "agents", state, base / "skills"))
             path = state_path(state, "test-marketplace", "default", "agents")
             content = path.read_text(encoding="utf-8")
-            path.write_text(content.replace('"schemaVersion": 2', '"schemaVersion": 2, "schemaVersion": 2', 1), encoding="utf-8")
+            path.write_text(content.replace('"schemaVersion": 3', '"schemaVersion": 3, "schemaVersion": 3', 1), encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
                 load_state(path)
