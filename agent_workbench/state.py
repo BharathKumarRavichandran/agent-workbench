@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
-from .model import ComponentKind, DirectorySymlink, FileCopy, PathResource
+from .model import ComponentKind, DirectorySymlink, FileCopy, DirectoryCopy, PathResource
 
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
@@ -25,6 +25,8 @@ class StateEntry:
     resource: PathResource
     source_repository: str
 
+    trust: str | None = None
+
     def as_dict(self) -> dict[str, object]:
         return {
             "key": self.key,
@@ -34,8 +36,24 @@ class StateEntry:
             "component": self.component.value,
             "resourceKind": self.resource.kind,
             "sourceRepository": self.source_repository,
-            **({"digest": self.resource.digest} if isinstance(self.resource, FileCopy) else {}),
+            **({"trust": self.trust} if isinstance(self.resource, DirectoryCopy) else {}),
+            **({"digest": self.resource.digest} if isinstance(self.resource, (FileCopy, DirectoryCopy)) else {}),
         }
+
+
+@dataclass(frozen=True)
+class SlotState:
+    key: str
+    plugin: str
+    component: ComponentKind
+    document: str
+    slot: str
+    digest: str
+    trust: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {"key": self.key, "plugin": self.plugin, "component": self.component.value,
+                "document": self.document, "slot": self.slot, "digest": self.digest, "trust": self.trust}
 
 
 @dataclass(frozen=True)
@@ -48,6 +66,8 @@ class InstallState:
     destination_root: str
     entries: Mapping[str, StateEntry]
     destination_roots: Mapping[ComponentKind, str] = field(default_factory=dict)
+
+    slots: Mapping[str, SlotState] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         entries = {key: entry.as_dict() for key, entry in sorted(self.entries.items())}
@@ -63,8 +83,10 @@ class InstallState:
             "target": self.target,
             "destinationRoot": self.destination_root,
             "entries": entries,
+            **({"slots": {key: slot.as_dict() for key, slot in sorted(self.slots.items())}}
+               if self.schema_version == 4 else {}),
             **({"destinationRoots": {key.value: value for key, value in sorted(self.destination_roots.items())}}
-               if self.schema_version == 3 else {}),
+               if self.schema_version >= 3 else {}),
         }
 
 
@@ -74,7 +96,7 @@ def default_state_root() -> Path:
 
 
 def state_path(root: Path, marketplace: str, profile: str, target: str) -> Path:
-    return root / "agent-workbench" / marketplace / profile / f"{target}.json"
+    return root.expanduser().resolve() / "agent-workbench" / marketplace / profile / f"{target}.json"
 
 
 def _object(value: Any, location: str) -> dict[str, Any]:
@@ -132,9 +154,16 @@ def _source_path(value: Any, location: str) -> str:
 def _entry_key(value: Any, location: str) -> str:
     result = _string(value, location)
     prefix, separator, name = result.partition(":")
-    if prefix not in {"skill", "agent", "rule", "command"} or not separator or not name or name in {".", ".."} or Path(name).name != name or "/" in name or "\\" in name:
+    if prefix not in {"skill", "agent", "rule", "command", "hook"} or not separator or not name or name in {".", ".."} or Path(name).name != name or "/" in name or "\\" in name:
         raise ValueError(f"{location} is not a valid entry key")
     return result
+
+
+def _trust(value: Any) -> str:
+    token = _string(value, "trust grant")
+    if not re.fullmatch(r"aw-trust-v1:[0-9a-f]{64}", token):
+        raise ValueError("invalid trust grant")
+    return token
 
 
 def load_state(path: Path) -> InstallState | None:
@@ -146,9 +175,9 @@ def load_state(path: Path) -> InstallState | None:
     )
     required = {"schemaVersion", "repository", "marketplace", "profile", "target", "destinationRoot", "entries"}
     version = data.get("schemaVersion")
-    if type(version) is not int or version not in (2, 3):
+    if type(version) is not int or version not in (2, 3, 4):
         raise ValueError(f"unsupported installation state: {path}")
-    _keys(data, required | ({"destinationRoots"} if version == 3 else set()), "installation state")
+    _keys(data, required | ({"destinationRoots"} if version >= 3 else set()) | ({"slots"} if version == 4 else set()), "installation state")
     raw_entries = _object(data["entries"], "installation state.entries")
     entries: dict[str, StateEntry] = {}
     for raw_key, raw_value in raw_entries.items():
@@ -157,39 +186,45 @@ def load_state(path: Path) -> InstallState | None:
         resource: PathResource = DirectorySymlink()
         component = ComponentKind.SKILLS
         fields = {"key", "plugin", "source", "destination"}
-        if version == 3:
+        if version >= 3:
             component = ComponentKind(value.get("component"))
             kind = value.get("resourceKind")
             fields |= {"component", "resourceKind", "sourceRepository"}
-            if kind == "file-copy":
+            if kind == "file-copy" or (kind == "directory-copy" and version == 4):
                 fields.add("digest")
                 digest = _string(value.get("digest"), "installation state entry digest")
                 if not re.fullmatch(r"[0-9a-f]{64}", digest):
                     raise ValueError("installation state entry digest must be SHA-256")
-                resource = FileCopy(digest)
+                resource = DirectoryCopy(digest) if kind == "directory-copy" else FileCopy(digest)
+                if kind == "directory-copy":
+                    fields.add("trust")
+                    _trust(value.get("trust"))
             elif kind != "directory-symlink":
                 raise ValueError("installation state entry resourceKind is unsupported")
         _keys(value, fields, f"installation state.entries[{key!r}]")
         prefix = {ComponentKind.SKILLS: "skill", ComponentKind.AGENTS: "agent",
-                  ComponentKind.RULES: "rule", ComponentKind.COMMANDS: "command"}.get(component)
+                  ComponentKind.RULES: "rule", ComponentKind.COMMANDS: "command", ComponentKind.HOOKS: "hook"}.get(component)
         if key.partition(":")[0] != prefix or (isinstance(resource, DirectorySymlink) != (component is ComponentKind.SKILLS)):
             raise ValueError("installation state entry key, component and resource kind disagree")
+        if (component is ComponentKind.HOOKS) != isinstance(resource, DirectoryCopy):
+            raise ValueError("hook bundles require directory-copy")
         embedded_key = _entry_key(value["key"], f"installation state.entries[{key!r}].key")
         if embedded_key != key:
             raise ValueError(f"installation state entry key does not match mapping key: {key!r}")
         entries[key] = StateEntry(
+            trust=value.get("trust"),
             key=embedded_key,
             plugin=_identifier(value["plugin"], f"installation state.entries[{key!r}].plugin"),
             source=_source_path(value["source"], f"installation state.entries[{key!r}].source"),
             destination=_absolute_path(value["destination"], f"installation state.entries[{key!r}].destination"),
             component=component,
             resource=resource,
-            source_repository=_absolute_path(value["sourceRepository"] if version == 3 else data["repository"],
+            source_repository=_absolute_path(value["sourceRepository"] if version >= 3 else data["repository"],
                                              f"installation state.entries[{key!r}].sourceRepository"),
         )
     roots = ({ComponentKind(key): _absolute_path(value, "installation state.destinationRoots")
               for key, value in _object(data["destinationRoots"], "installation state.destinationRoots").items()}
-             if version == 3 else {ComponentKind.SKILLS: data["destinationRoot"]})
+             if version >= 3 else {ComponentKind.SKILLS: data["destinationRoot"]})
     if roots.get(ComponentKind.SKILLS) != data["destinationRoot"]:
         raise ValueError("installation state destinationRoots skills must match destinationRoot")
     if any(entry.component not in roots for entry in entries.values()):
@@ -204,7 +239,25 @@ def load_state(path: Path) -> InstallState | None:
         if destination in destinations:
             raise ValueError("installation state destinations must be unique")
         destinations.add(destination)
+    slots: dict[str, SlotState] = {}
+    if version == 4:
+        for key, raw in _object(data["slots"], "installation state.slots").items():
+            value = _object(raw, "slot")
+            _keys(value, {"key", "plugin", "component", "document", "slot", "digest", "trust"}, "slot")
+            component = ComponentKind(value["component"])
+            if component not in {ComponentKind.HOOKS, ComponentKind.MCP} or key != value["key"]:
+                raise ValueError("invalid shared slot identity")
+            plugin = _identifier(value["plugin"], "slot plugin")
+            slot = _string(value["slot"], "slot name")
+            if key != f"{component.value}:{plugin}:{slot}":
+                raise ValueError("invalid shared slot key")
+            digest = _string(value["digest"], "slot digest")
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("invalid shared slot digest")
+            slots[key] = SlotState(key, plugin, component,
+                _absolute_path(value["document"], "slot document"), slot, digest, _trust(value["trust"]))
     return InstallState(
+        slots=slots,
         schema_version=version,
         repository=_absolute_path(data["repository"], "installation state.repository"),
         marketplace=_identifier(data["marketplace"], "installation state.marketplace"),
@@ -226,6 +279,7 @@ def write_state(path: Path, state: InstallState) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _sync_parent(path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -234,3 +288,12 @@ def write_state(path: Path, state: InstallState) -> None:
 def remove_state(path: Path) -> None:
     if path.exists():
         path.unlink()
+        _sync_parent(path)
+
+
+def _sync_parent(path: Path) -> None:
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

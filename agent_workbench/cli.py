@@ -18,16 +18,19 @@ from .workspace import Workspace
 
 
 def _print_operations(plan: object, as_json: bool) -> None:
-    operations = getattr(plan, "operations")
+    operations = getattr(plan, "all_operations")
     if as_json:
         print(json.dumps([operation.as_dict() for operation in operations], indent=2))
         return
     for operation in operations:
         source = f" -> {operation.source}" if operation.source else ""
-        resource = operation.resource.kind if operation.source is not None else "unsupported"
+        resource = operation.resource.kind if operation.source is not None else ("shared-json-slot" if hasattr(operation, "slot") else "unsupported")
         reason = f"{operation.diagnostic}: {operation.reason}" if operation.diagnostic else operation.reason
+        if operation.trust_token:
+            reason += f"; trust {'required' if operation.trust_required else 'granted'}: {operation.trust_token}"
+        slot = f" [{operation.slot}]" if hasattr(operation, "slot") else ""
         print(f"{operation.kind.value:14} {operation.component.value}/{resource} "
-              f"{operation.destination}{source}  ({reason})")
+              f"{operation.destination}{slot}{source}  ({reason})")
 
 
 def _workspace(args: argparse.Namespace) -> Workspace:
@@ -47,13 +50,14 @@ def build_parser() -> argparse.ArgumentParser:
     rendering = subcommands.add_parser("render")
     rendering.add_argument("--check", action="store_true")
 
-    for name in ("plan", "install", "status"):
+    for name in ("plan", "install", "status", "trust"):
         command = subcommands.add_parser(name)
         command.add_argument("--target", required=True)
         command.add_argument("--destination", type=Path, help="skills directory override")
         command.add_argument("--component", action="append", choices=[kind.value for kind in ComponentKind])
         command.add_argument("--project-root", type=Path)
         command.add_argument("--state-dir", type=Path, default=default_state_root())
+        command.add_argument("--trust", action="append", default=[], metavar="TOKEN", help="repeatable content-bound activation grant")
         command.add_argument("--adopt", action="store_true")
         command.add_argument("--json", action="store_true")
 
@@ -96,11 +100,11 @@ def run(args: argparse.Namespace) -> int:
             print(f"wrote {path.relative_to(workspace.root)}")
         return 0
 
-    if args.command in {"plan", "install", "status"}:
+    if args.command in {"plan", "install", "status", "trust"}:
         components = (tuple(dict.fromkeys(ComponentKind(value) for value in args.component))
                       if args.component is not None else None)
         plan = plan_install(workspace, args.target, args.state_dir, args.destination,
-                            args.adopt, components, args.project_root)
+                            args.adopt, components, args.project_root, tuple(args.trust), repair=args.command != "trust")
         _print_operations(plan, args.json)
         if args.command == "install":
             if plan.has_conflicts:

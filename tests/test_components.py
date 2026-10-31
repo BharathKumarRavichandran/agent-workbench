@@ -92,7 +92,7 @@ class ProfileComponentTests(unittest.TestCase):
 
 class ProjectionTests(unittest.TestCase):
     def test_exact_capability_matrix_and_inert_rejection(self):
-        expected = {'agents': {C.SKILLS}, 'cursor': {C.SKILLS, C.AGENTS, C.RULES},
+        expected = {'agents': {C.SKILLS}, 'cursor': {C.SKILLS, C.AGENTS, C.RULES, C.HOOKS, C.MCP},
                     'claude': {C.SKILLS, C.AGENTS, C.COMMANDS},
                     'codex': {C.SKILLS}, 'hermes': {C.SKILLS}, 'grok': {C.SKILLS}}
         with tempfile.TemporaryDirectory() as directory:
@@ -106,6 +106,10 @@ class ProjectionTests(unittest.TestCase):
                     with self.subTest(target=target, component=component):
                         plan = plan_install(workspace, target, base / 'state', components=(component,),
                                             project_root=base / 'project')
+                        if target == 'cursor' and component in {C.HOOKS, C.MCP}:
+                            self.assertTrue(plan.has_conflicts)
+                            self.assertTrue(any(item.diagnostic == 'TRUST_REQUIRED' for item in plan.all_operations))
+                            continue
                         self.assertEqual(component not in supported, plan.has_conflicts)
                         if plan.has_conflicts:
                             self.assertEqual('COMPONENT_UNSUPPORTED', plan.operations[0].diagnostic)
@@ -159,7 +163,7 @@ class ProjectionTests(unittest.TestCase):
             fixture = Fixture(base / 'repo')
             configure(fixture)
             (fixture.root / 'plugins/sample/hooks/hooks.json').write_text('invalid JSON')
-            plan = plan_install(Workspace.load(fixture.root), 'cursor', base / 'state',
+            plan = plan_install(Workspace.load(fixture.root), 'codex', base / 'state',
                                 components=(C.HOOKS,), project_root=base / 'project')
             self.assertEqual('COMPONENT_UNSUPPORTED', plan.operations[0].diagnostic)
 

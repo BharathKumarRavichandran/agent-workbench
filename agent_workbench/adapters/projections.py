@@ -13,7 +13,9 @@ BUILTIN_CAPABILITIES: Mapping[TargetId, Mapping[ComponentKind, Representation]] 
     TargetId(target): {
         ComponentKind.SKILLS: Representation.SKILL_DIRECTORY,
         **({ComponentKind.AGENTS: Representation.MARKDOWN_AGENT,
-            ComponentKind.RULES: Representation.CURSOR_RULE} if target == "cursor" else {}),
+            ComponentKind.RULES: Representation.CURSOR_RULE,
+            ComponentKind.HOOKS: Representation.HOOK_BUNDLE,
+            ComponentKind.MCP: Representation.MCP_DOCUMENT} if target == "cursor" else {}),
         **({ComponentKind.AGENTS: Representation.MARKDOWN_AGENT,
             ComponentKind.COMMANDS: Representation.LEGACY_COMMAND} if target == "claude" else {}),
     }
@@ -57,6 +59,8 @@ def project_paths(
     prefixes = {ComponentKind.SKILLS: "skill", ComponentKind.AGENTS: "agent",
                 ComponentKind.RULES: "rule", ComponentKind.COMMANDS: "command"}
     for export in exports:
+        if export.component in {ComponentKind.HOOKS, ComponentKind.MCP}:
+            continue
         if export.component not in components or export.component not in supported or export.component not in roots:
             continue
         if export.representation is not supported[export.component]:

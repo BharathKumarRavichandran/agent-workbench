@@ -91,7 +91,29 @@ The table describes current artifact formats. The workbench copies supported doc
 
 For Cursor and Claude, `--project-root /path/to/project` selects `.cursor` or `.claude` under that project. Each component uses its own directory: `skills`, `agents`, `rules`, or `commands`. Without a project root, supported components use the target's home directory. Cursor rules require `--project-root` and otherwise produce `PROJECT_ROOT_REQUIRED`. An explicit `--destination` overrides only the skills directory, including when a project root is present.
 
-Hooks and MCP activation remain unsupported. Inspection never executes hooks or starts servers.
+Cursor supports explicit hook and MCP activation. Other targets report `COMPONENT_UNSUPPORTED` for these Cursor-native formats. Inspection, planning, and installation never execute hooks or start servers.
+
+To activate Cursor hooks and MCP for a project, first inspect the plan and its trust tokens:
+
+```bash
+python3 -m agent_workbench trust --target cursor --project-root /path/to/project \
+  --component hooks --component mcp --json
+python3 -m agent_workbench install --target cursor --project-root /path/to/project \
+  --component hooks --component mcp \
+  --trust aw-trust-v1:<hooks-token> --trust aw-trust-v1:<mcp-token>
+```
+
+`trust` is read-only and exits with code 1 while grants are required. It reports the same tokens as `plan` and `status`. Repeat `--trust` for each required plugin and component. Tokens bind content, artifact location, source provenance, target, and config path. Unchanged owned activations reuse their grants. Changed content requires new tokens. MCP definitions always require trust, including remote servers.
+
+Project activation merges `.cursor/hooks.json` and `.cursor/mcp.json`. Without `--project-root` or a profile `projectRoot`, Cursor uses `~/.cursor/hooks.json` and `~/.cursor/mcp.json`. `--destination` still changes only the skills directory. Hook commands run from the project root for project scope and from `~/.cursor` for user scope.
+
+Each hook bundle is copied into `.cursor/.agent-workbench-hooks/<plugin>/hooks/`, with executable modes preserved. Static `./hooks/...`, `${CURSOR_PLUGIN_ROOT}/hooks/...`, and artifact-relative `./...` references become absolute managed paths. Escaping, missing, or unresolved local path references are rejected. Shell text and event entry fields otherwise stay unchanged. Commands never point into the checkout.
+
+MCP ownership covers individual `mcpServers/<name>` objects. Hook ownership covers exact entries in `hooks/<event>` arrays. Foreign entries and keys survive installation and uninstall. Matching unmanaged slots require `--adopt` as well as trust. Different MCP content, duplicate hook entries, and edited owned slots are conflicts. An ownership ledger prevents another profile from adopting an already-owned slot.
+
+Cursor activation uses a shared document lock and a private recovery journal under `.cursor`. The journal may contain config values and bundle backups, has mode `0600`, and is removed after commit. On interruption, run `status` with the same profile, state directory, and scope to restore the prior activation. Other profiles wait for that recovery. If an external edit prevents safe recovery, the command fails and retains the journal and bundle evidence for repair. A pending journal makes `trust` fail without modifying anything.
+
+Run `python3 scripts/check_cursor_activation.py` to repeat the isolated CLI scenario with the vendored ralph-loop hooks and Playwright MCP definition. The script checks installed bytes, modes, state, reinstall, and foreign-content preservation after uninstall.
 
 ## Profiles
 
@@ -132,7 +154,7 @@ The installer builds a complete plan before writing anything.
 - Uninstall removes owned links that still point to the expected source and owned files whose digest still matches.
 - Moved checkouts produce `replace-owned` operations rather than silent deletion.
 
-New installations write strict state schema v3 with tagged path resources and component roots. State v2 remains uninstallable and migrates to v3 during installation. State-file locations remain unchanged:
+Path-only installations write strict state schema v3. Cursor activation writes v4 with bundle digests, content-bound grants, and logical slot evidence. States v2 and v3 remain uninstallable and migrate during activation. State-file locations remain unchanged:
 
 ```text
 ${XDG_STATE_HOME:-~/.local/state}/agent-workbench/<marketplace>/<profile>/<target>.json
@@ -156,6 +178,10 @@ agent-workbench/
 │   ├── model.py               # immutable domain values
 │   ├── installation.py        # plan, reconcile, apply, uninstall
 │   ├── state.py               # atomic ownership state
+│   ├── bundles.py             # inert trees and managed directory copies
+│   ├── shared_config.py       # Cursor JSON slots and document revisions
+│   ├── trust.py               # content-bound activation tokens
+│   ├── transactions.py        # shared lock, journal, and recovery
 │   └── validation.py
 ├── catalog/                   # canonical catalog, schema, lock report
 ├── profiles/                  # package and target selections
@@ -173,7 +199,7 @@ agent-workbench/
 4. Add it to the appropriate profiles.
 5. Run `make render check`.
 
-Component artifacts are validated and reported independently of installation. Skills and the supported document formats listed above can be installed into target directories. A `hooks` artifact points to the complete bundle directory containing `hooks.json` and its companion scripts; an `mcp` artifact points directly to its JSON file. Executable hooks and MCP configuration require a later explicit trust and activation design.
+Component artifacts are validated and reported independently of installation. Skills and the supported document formats listed above can be installed into target directories. A `hooks` artifact points to the complete bundle directory containing `hooks.json` and its companion scripts; an `mcp` artifact points directly to its JSON file. Cursor activation requires explicit component selection and content-bound trust. Other targets remain unsupported for hooks and MCP.
 
 ## Adding an agent
 

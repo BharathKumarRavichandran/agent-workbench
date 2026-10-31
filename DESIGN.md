@@ -43,7 +43,11 @@ Artifacts use registered string identifiers. Built-in inspectors recognize `agen
 | `adapters/*` | Own native format or destination knowledge. |
 | `rendering.py` | Detect output collisions and atomically write deterministic files. |
 | `installation.py` | Reconcile desired entries with filesystem state and produce operations. |
-| `state.py` | Read and atomically write path-ownership records. |
+| `state.py` | Decode legacy ownership and atomically write path and slot evidence. |
+| `bundles.py` | Snapshot and publish complete managed trees without executing them. |
+| `shared_config.py` | Compile static hook paths and plan logical JSON slots. |
+| `trust.py` | Bind explicit grants to content and provenance. |
+| `transactions.py` | Lock shared documents and recover activation transactions. |
 | `sources.py` | Advance a selected upstream and validate the result. |
 | `validation.py` | Aggregate catalog, artifact, skill, adapter, provenance, and drift checks. |
 | `cli.py` | Parse commands and present results. It owns no domain policy. |
@@ -80,7 +84,7 @@ Validation rejects:
 - unknown artifact kinds;
 - generated output collisions and drift.
 
-Artifact recognition is explicit in the adapter registry rather than inferred from renderer or install-target dependencies. Component inspection is inert: hook commands are not executed, MCP servers are not started, and configuration bodies are not copied into the lock report. Skills and supported agents, rules, and commands cross the path installation boundary. Hooks and MCP remain inert.
+Artifact recognition is explicit in the adapter registry rather than inferred from renderer or install-target dependencies. Component inspection is inert: hook commands are not executed, MCP servers are not started, and configuration bodies are not copied into the lock report. Skills and supported agents, rules, and commands cross the path installation boundary. Explicit Cursor hook and MCP selections cross separate bundle and shared-document boundaries after a content-bound grant. Every inspection path remains inert.
 
 JSON Schema files provide editor support. The strict decoder and semantic validation are authoritative.
 
@@ -101,7 +105,7 @@ State is evidence of ownership, not proof that the filesystem still matches. Eve
 
 Copied sources are read through directory descriptors without following symlinks. Apply revalidates their planned digests before destination creation and again before use. Copies are written to temporary regular files and atomically published without overwriting an existing path. Replacements first quarantine the owned file, then compare its recorded digest. Failed ownership checks restore the quarantined path. Failed state writes roll back the current mutation while preserving ownership of completed operations.
 
-Uninstall checks ownership evidence for every recorded component, independent of current profile component flags. Skills must still resolve to their expected sources. Copies must still match their recorded digests. Strict state v3 stores tagged resources and per-component roots at the existing state-file location. Each entry pins its source repository so an interrupted checkout migration preserves ownership of links that still use the old checkout. State v2 decodes as skills-only ownership and remains uninstallable. Installation writes v3.
+Uninstall checks ownership evidence for every recorded component, independent of current profile component flags. Skills must still resolve to their expected sources. Copies must still match their recorded digests. Strict state v3 stores tagged resources and per-component roots at the existing state-file location. Each entry pins its source repository so an interrupted checkout migration preserves ownership of links that still use the old checkout. State v2 decodes as skills-only ownership and remains uninstallable. Path-only installation writes v3. Cursor hook and MCP activation writes strict v4. Existing v2 and v3 ownership migrates without changing state-file locations.
 
 ## Upstream boundary
 
@@ -125,11 +129,34 @@ python3 -m agent_workbench <command>
 
 The wrappers contain no duplicated catalog, rendering, validation, or installation logic.
 
+## Cursor activation transactions
+
+`DirectoryCopy` is a closed path-resource variant for a complete hook artifact. Its synthetic plugin root contains `hooks/hooks.json` and every companion file. The digest covers relative paths, bytes, and modes, including empty directories. Symlinks, special files, and special permission bits are rejected. Descriptor-relative reads and writes pin directories, and atomic no-replace rename publishes a complete tree. This operation requires macOS `renameatx_np` or Linux `renameat2`.
+
+`shared_config.py` handles JSON documents separately from path resources. A complete byte and file-identity snapshot detects stale plans, including a rewrite with identical JSON. Duplicate keys, symlinks, and special files fail at the boundary. The pure slot planner preserves foreign keys and array order. Slots use canonical content digests; no executable definitions appear in state or plan output.
+
+Hooks own exact entries within event arrays, so a duplicate is ambiguous. MCP owns named server objects, so different unmanaged content is a collision. Matching unmanaged content requires adoption. An externally modified owned slot blocks installation and uninstall. The private `.agent-workbench-owners.json` ledger prevents profiles, even with different state directories, from adopting the same logical slot. Its complete revision participates in the plan.
+
+`trust.py` hashes plugin identity, component, target config path, artifact location, source provenance, and content into an `aw-trust-v1:` token. Both hooks and MCP require a CLI grant. A recorded grant can be reused only for unchanged content and scope. Changing any bundle file or mode invalidates hook trust; changing any MCP source byte invalidates MCP trust. Profile v1 stays skills-only, and profile v2 adds no implicit activation.
+
+`transactions.py` takes the profile state lock followed by `.cursor/.agent-workbench.lock`. That second lock covers both config documents and their ownership ledger across all profiles. Apply compares state, document revisions, and sources before preparing its durable `0600` journal. The journal records prior state, complete document revisions, and path backups. Journal destinations must match roots authorized by the current adapter request.
+
+The mutation sequence is:
+
+1. Remove deselected or changing owned hook entries and MCP slots.
+2. Copy or replace managed bundles, or remove bundles whose entries are inactive.
+3. Publish merged config additions and the ownership ledger.
+4. Persist ownership state, then remove the journal.
+
+All document writes use a temporary regular file, file fsync, atomic replacement, and directory fsync. Bundle publication and state writes also flush their containing directories. On a normal failure, rollback restores the prior activation. On a crash or failed rollback, the durable journal remains. The next `status`, `plan`, or apply for the owning profile repairs the transaction before new work. Recovery deactivates changing entries, restores bundles, restores prior documents, then restores state. Other profiles fail closed until the owner repairs the transaction.
+
+Recovery compares live documents, managed trees, and state against the journal evidence. External changes block automatic recovery and retain the evidence. Journal deletion is never a substitute for repair. The read-only `trust` command reports pending recovery without applying it. Config locking coordinates workbench processes; external editors do not honor that lock, so live revisions are checked again before config publication.
+
 ## Deferred features
 
 These should be added only when a real target needs them:
 
-- trusted installation and activation of executable hooks and MCP components;
+- hook and MCP adapters for formats beyond Cursor;
 - external adapter discovery;
 - profile inheritance;
 - a capability graph with transformations;

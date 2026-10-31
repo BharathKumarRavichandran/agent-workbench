@@ -43,7 +43,13 @@ class FileCopy:
     kind: Literal["file-copy"] = field(default="file-copy", init=False)
 
 
-PathResource = Union[DirectorySymlink, FileCopy]
+@dataclass(frozen=True)
+class DirectoryCopy:
+    digest: str
+    kind: Literal["directory-copy"] = field(default="directory-copy", init=False)
+
+
+PathResource = Union[DirectorySymlink, FileCopy, DirectoryCopy]
 
 
 @dataclass(frozen=True)

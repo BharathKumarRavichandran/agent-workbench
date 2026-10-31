@@ -21,9 +21,12 @@ from .adapters.base import InstallTarget, DesiredEntry
 from .adapters.projections import project_paths
 from .artifacts import COMPONENT_ARTIFACTS, semantic_exports
 from .inspection import validate_skill_tree
-from .model import TargetId, ComponentKind, DirectorySymlink, FileCopy, PathResource
+from .model import TargetId, ComponentKind, DirectorySymlink, FileCopy, DirectoryCopy, PathResource
 from .state import InstallState, StateEntry, load_state, remove_state, state_path, write_state
 from .workspace import Workspace
+from . import bundles, shared_config
+from .trust import grant_token
+from .state import SlotState
 
 
 class OperationKind(str, Enum):
@@ -48,7 +51,10 @@ class InstallOperation:
     expected_digest: str | None = None
     diagnostic: str | None = None
 
-    def as_dict(self) -> dict[str, str | None]:
+    trust_token: str | None = None
+    trust_required: bool = False
+
+    def as_dict(self) -> dict[str, object]:
         return {
             "kind": self.kind.value,
             "key": self.key,
@@ -57,8 +63,10 @@ class InstallOperation:
             "reason": self.reason,
             "component": self.component.value,
             "resourceKind": self.resource.kind if self.source is not None else None,
-            "digest": self.resource.digest if isinstance(self.resource, FileCopy) else None,
+            "digest": self.resource.digest if isinstance(self.resource, (FileCopy, DirectoryCopy)) else None,
             "diagnostic": self.diagnostic,
+            "trustToken": self.trust_token,
+            "trustRequired": self.trust_required,
         }
 
 
@@ -84,9 +92,16 @@ class InstallPlan:
     destination_anchor_identity: tuple[int, int]
     roots: tuple[DestinationSnapshot, ...]
 
+    documents: tuple[shared_config.DocumentPlan, ...] = ()
+    executable_sources: tuple[shared_config.DesiredSlot, ...] = ()
+
+    @property
+    def all_operations(self) -> tuple[InstallOperation | shared_config.SlotOperation, ...]:
+        return self.operations + tuple(operation for document in self.documents for operation in document.operations)
+
     @property
     def has_conflicts(self) -> bool:
-        return any(operation.kind is OperationKind.CONFLICT for operation in self.operations)
+        return any(operation.kind is OperationKind.CONFLICT for operation in self.all_operations)
 
 
 @dataclass
@@ -220,15 +235,40 @@ class _DestinationRoot:
         if isinstance(operation.resource, DirectorySymlink):
             assert operation.source is not None
             return self.same_link(operation, operation.source)
+        if isinstance(operation.resource, DirectoryCopy):
+            assert self.fd is not None
+            return bundles.tree_digest(self._name(operation), self.fd) == operation.resource.digest
         if self.secure:
             assert self.fd is not None
             return _file_digest(self._name(operation), self.fd) == operation.resource.digest
         self.verify()
         return _file_digest(operation.destination) == operation.resource.digest
 
-    def create(self, operation: InstallOperation, content: bytes | None) -> None:
+    def create(self, operation: InstallOperation, content: bytes | bundles.Tree | None) -> None:
         if isinstance(operation.resource, DirectorySymlink):
             self.create_link(operation)
+            return
+        if isinstance(operation.resource, DirectoryCopy):
+            assert isinstance(content, bundles.Tree) and self.fd is not None
+            name = self._name(operation)
+            temporary = f".agent-workbench-copy-{secrets.token_hex(8)}"
+            try:
+                bundles.write_tree(temporary, self.fd, content)
+                # Refuse foreign destinations. The document lock serializes all
+                # workbench bundle writers; quarantine handles replacements.
+                try:
+                    os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise _changed(operation)
+                bundles.rename_new(temporary, name, self.fd)
+                os.fsync(self.fd)
+            finally:
+                try:
+                    bundles.delete_tree(temporary, self.fd)
+                except FileNotFoundError:
+                    pass
             return
         assert content is not None
         name = self._name(operation)
@@ -251,11 +291,11 @@ class _DestinationRoot:
         finally:
             os.unlink(temporary, dir_fd=self.fd)
 
-    def quarantine(self, operation: InstallOperation) -> _QuarantinedEntry:
+    def quarantine(self, operation: InstallOperation, directory_name: str | None = None) -> _QuarantinedEntry:
         if operation.expected_link is None and operation.expected_digest is None:
             raise ValueError(f"owned removal lacks expected ownership evidence: {operation.destination}")
         name = self._name(operation)
-        directory_name = f".agent-workbench-quarantine-{secrets.token_hex(8)}"
+        directory_name = directory_name or f".agent-workbench-quarantine-{secrets.token_hex(8)}"
         if self.secure:
             assert self.fd is not None
             os.mkdir(directory_name, mode=0o700, dir_fd=self.fd)
@@ -281,6 +321,9 @@ class _DestinationRoot:
             moved = _QuarantinedEntry(self, directory_name, None)
         if isinstance(operation.resource, DirectorySymlink):
             matches = self.quarantined_link(moved) == operation.expected_link
+        elif isinstance(operation.resource, DirectoryCopy):
+            assert moved.directory_fd is not None
+            matches = bundles.tree_digest("entry", moved.directory_fd) == operation.expected_digest
         else:
             digest = (_file_digest("entry", moved.directory_fd) if moved.directory_fd is not None
                       else _file_digest(self.path / moved.directory_name / "entry"))
@@ -325,7 +368,10 @@ class _DestinationRoot:
         if moved.directory_fd is not None:
             assert self.fd is not None
             try:
-                os.rename("entry", name, src_dir_fd=moved.directory_fd, dst_dir_fd=self.fd)
+                if isinstance(operation.resource, DirectoryCopy):
+                    bundles.rename_new("entry", name, moved.directory_fd, self.fd)
+                else:
+                    os.rename("entry", name, src_dir_fd=moved.directory_fd, dst_dir_fd=self.fd)
             finally:
                 self._close_quarantine(moved)
             os.rmdir(moved.directory_name, dir_fd=self.fd)
@@ -338,7 +384,11 @@ class _DestinationRoot:
         if moved.directory_fd is not None:
             assert self.fd is not None
             try:
-                os.unlink("entry", dir_fd=moved.directory_fd)
+                metadata = os.stat("entry", dir_fd=moved.directory_fd, follow_symlinks=False)
+                if stat.S_ISDIR(metadata.st_mode):
+                    bundles.delete_tree("entry", moved.directory_fd)
+                else:
+                    os.unlink("entry", dir_fd=moved.directory_fd)
             finally:
                 self._close_quarantine(moved)
             os.rmdir(moved.directory_name, dir_fd=self.fd)
@@ -480,6 +530,9 @@ def _validated_state(
     for component, recorded in previous.destination_roots.items():
         if component not in roots or Path(recorded) != roots[component]:
             raise ValueError("recorded destination root differs from adapter-authorized root; pass the same --project-root")
+    for slot in previous.slots.values():
+        if target_id != "cursor" or Path(slot.document) != shared_config.document_path(roots, slot.component):
+            raise ValueError("recorded document differs from adapter-authorized path")
     return previous
 
 
@@ -517,7 +570,9 @@ def _make_plan(workspace: Workspace, target_id: str, file: Path,
     snapshots = []
     needed = {operation.destination.parent for operation in operations}
     needed.add(roots[ComponentKind.SKILLS])
-    for root in sorted(set(roots.values()) & needed):
+    if ComponentKind.HOOKS in roots:
+        needed.add(roots[ComponentKind.HOOKS].parent)
+    for root in sorted((set(roots.values()) | ({roots[ComponentKind.HOOKS].parent} if ComponentKind.HOOKS in roots else set())) & needed):
         # Refuse redirected adapter directories, including existing parents.
         anchor, identity = _destination_anchor(root)
         current = root
@@ -537,6 +592,8 @@ def _make_plan(workspace: Workspace, target_id: str, file: Path,
 
 
 def _matches_resource(destination: Path, source: Path, resource: PathResource) -> bool:
+    if isinstance(resource, DirectoryCopy):
+        return bundles.tree_digest(destination) == resource.digest
     if isinstance(resource, FileCopy):
         return _file_digest(destination) == resource.digest
     return _same_link(destination, source)
@@ -558,7 +615,7 @@ def _removal(key: str, entry: StateEntry, reason: str) -> InstallOperation | Non
         reason if matches else "managed path was modified",
         destination.readlink() if matches and isinstance(entry.resource, DirectorySymlink) else None,
         entry.component, entry.resource,
-        entry.resource.digest if isinstance(entry.resource, FileCopy) else None,
+        entry.resource.digest if isinstance(entry.resource, (FileCopy, DirectoryCopy)) else None,
     )
 
 
@@ -567,11 +624,15 @@ def plan_install(
     destination: Path | None = None, adopt: bool = False,
     components: tuple[ComponentKind, ...] | None = None,
     project_root: Path | None = None,
+    trust: tuple[str, ...] = (),
+    repair: bool = True,
 ) -> InstallPlan:
     target = _target(workspace, target_id)
     selected = next(item for item in workspace.profile.targets if item.id == target.id)
     requested = components if components is not None else selected.components
     roots = _request_roots(workspace, target, destination, project_root)
+    file = state_path(state_root, workspace.catalog.marketplace.id, str(workspace.profile.id), target_id)
+    _recover_lifecycle(file, roots, repair)
     _, unsupported = project_paths(target.id, target.capabilities, requested, (), roots)
     rejected = {conflict.component for conflict in unsupported}
     exports = []
@@ -590,13 +651,25 @@ def plan_install(
         DirectorySymlink() if item.export.component is ComponentKind.SKILLS else
         FileCopy(hashlib.sha256(_source_content(workspace.root, item.export.source)).hexdigest()),
     ) for item in projected)
+    if target_id == "cursor" and ComponentKind.HOOKS in requested and ComponentKind.HOOKS not in rejected:
+        for plugin in workspace.resolved.plugins:
+            source = plugin.artifact_paths.get(COMPONENT_ARTIFACTS[ComponentKind.HOOKS][0])
+            if source is not None:
+                tree = bundles.source_tree(source)
+                desired += (DesiredEntry(f"hook:{plugin.plugin.id}", str(plugin.plugin.id), source,
+                    roots[ComponentKind.HOOKS] / str(plugin.plugin.id), ComponentKind.HOOKS,
+                    DirectoryCopy(tree.digest)),)
     desired_by_key = {entry.key: entry for entry in desired}
     if len(desired_by_key) != len(desired) or len({entry.destination for entry in desired}) != len(desired):
         raise ValueError("desired installation keys and destinations must be unique")
     for entry in desired:
         _require_contained(roots[entry.component], entry.destination)
-    file = state_path(state_root, workspace.catalog.marketplace.id, str(workspace.profile.id), target_id)
     previous = _validated_state(workspace, target_id, file, roots)
+    document_plans, slots, executable_sources = _plan_documents(workspace, target_id, roots, previous, tuple(item for item in requested if item not in rejected), adopt, trust)
+    if document_plans:
+        document_plans, ledger = shared_config.plan_ownership(roots[ComponentKind.HOOKS].parent,
+            file, document_plans, previous.slots if previous else {}, slots)
+        document_plans += (ledger,)
     owned = previous.entries if previous else {}
     operations = [InstallOperation(OperationKind.CONFLICT, f"component:{conflict.component.value}",
                   roots.get(conflict.component, roots[ComponentKind.SKILLS]), None, conflict.reason,
@@ -622,15 +695,26 @@ def plan_install(
                 kind, reason = OperationKind.CONFLICT, "matching resource is not recorded as owned; use --adopt"
         elif same_owner and previous and _matches_owned(prior):
             kind, reason = OperationKind.REPLACE_OWNED, "managed resource has a new source"
-            if isinstance(prior.resource, FileCopy):
+            if isinstance(prior.resource, (FileCopy, DirectoryCopy)):
                 expected_digest = prior.resource.digest
             else:
                 expected_link = entry.destination.readlink()
         else:
             kind, reason = OperationKind.CONFLICT, "destination is a foreign file or link"
+        token = None
+        required = False
+        if isinstance(entry.resource, DirectoryCopy):
+            plugin = next(plugin for plugin in workspace.resolved.plugins if str(plugin.plugin.id) == entry.plugin_id)
+            token = grant_token(plugin, ComponentKind.HOOKS, target_id,
+                                shared_config.document_path(roots, ComponentKind.HOOKS), entry.resource.digest, workspace.root)
+            required = token not in trust and not (prior is not None and prior.trust == token)
+            if required:
+                kind, reason = OperationKind.CONFLICT, "content-bound grant required; pass --trust " + token
         operations.append(InstallOperation(kind, entry.key, entry.destination, entry.source, reason,
-                          expected_link, entry.component, entry.resource, expected_digest))
+                          expected_link, entry.component, entry.resource, expected_digest,
+                          "TRUST_REQUIRED" if required else None, token, required))
         next_entries[entry.key] = StateEntry(
+            trust=token,
             key=entry.key,
             plugin=entry.plugin_id,
             source=entry.source.relative_to(workspace.root).as_posix(),
@@ -645,7 +729,83 @@ def plan_install(
             operation = _removal(key, prior, "managed entry is no longer selected")
             if operation:
                 operations.append(operation)
-    return _make_plan(workspace, target_id, file, roots, previous, operations, next_entries)
+    plan = _make_plan(workspace, target_id, file, roots, previous, operations, next_entries)
+    if document_plans or any(isinstance(entry.resource, DirectoryCopy) for entry in next_entries.values()):
+        plan = replace(plan, next_state=replace(plan.next_state, schema_version=4, slots=slots),
+                       documents=document_plans, executable_sources=executable_sources)
+    return plan
+
+
+def _plan_documents(workspace: Workspace, target_id: str, roots: dict[ComponentKind, Path],
+                    previous: InstallState | None, requested: tuple[ComponentKind, ...],
+                    adopt: bool, trust: tuple[str, ...]) -> tuple[tuple[shared_config.DocumentPlan, ...], dict[str, SlotState], tuple[shared_config.DesiredSlot, ...]]:
+    if target_id != "cursor":
+        return (), {}, ()
+    documents = []
+    states: dict[str, SlotState] = {}
+    sources = []
+    old_slots = previous.slots if previous else {}
+    for component in (ComponentKind.HOOKS, ComponentKind.MCP):
+        owned = {key: value for key, value in old_slots.items() if value.component is component}
+        has_bundle = component is ComponentKind.HOOKS and previous and any(entry.component is component for entry in previous.entries.values())
+        if component not in requested and not owned and not has_bundle:
+            continue
+        path = shared_config.document_path(roots, component)
+        desired = []
+        if component in requested:
+            for plugin in workspace.resolved.plugins:
+                source = plugin.artifact_paths.get(COMPONENT_ARTIFACTS[component][0])
+                if source is None:
+                    continue
+                if component is ComponentKind.HOOKS:
+                    tree = bundles.source_tree(source)
+                    content_digest = tree.digest
+                    hooks = shared_config.compile_hooks(tree, roots[component] / str(plugin.plugin.id))
+                    values = [(f"{event}:{shared_config.digest(entry)}", entry)
+                              for event, entries in hooks.items() for entry in entries]
+                else:
+                    content = _source_content(workspace.root, source)
+                    content_digest = hashlib.sha256(content).hexdigest()
+                    data = shared_config.parse(content)
+                    servers = data.get('mcpServers')
+                    if not isinstance(servers, dict) or any(not isinstance(value, dict) for value in servers.values()):
+                        raise ValueError('MCP requires an mcpServers object of objects')
+                    values = list(servers.items())
+                token = grant_token(plugin, component, target_id, path, content_digest, workspace.root)
+                recorded = any(item.plugin == plugin.plugin.id and item.trust == token for item in owned.values())
+                if component is ComponentKind.HOOKS and previous:
+                    bundle = previous.entries.get(f"hook:{plugin.plugin.id}")
+                    recorded = recorded or (bundle is not None and bundle.trust == token)
+                granted = token in trust or recorded
+                for name, value in values:
+                    key = f"{component.value}:{plugin.plugin.id}:{name}"
+                    state = SlotState(key, str(plugin.plugin.id), component, str(path), name,
+                                      shared_config.digest(value), token)
+                    desired.append(shared_config.DesiredSlot(state, value, source, content_digest, granted))
+                # An empty hook bundle still requires a grant on its path.
+                if values:
+                    sources.extend(desired[-len(values):])
+        document, next_slots = shared_config.plan_document(shared_config.snapshot(path), component,
+                                                          tuple(desired), owned, adopt)
+        documents.append(document)
+        states.update(next_slots)
+    return tuple(documents), states, tuple(sources)
+
+
+def _recover_lifecycle(file: Path, roots: dict[ComponentKind, Path], repair: bool = True) -> None:
+    if ComponentKind.HOOKS in roots:
+        from .transactions import recover
+        try:
+            if not repair:
+                journal = roots[ComponentKind.HOOKS].parent / '.agent-workbench-transaction.json'
+                if shared_config.snapshot(journal).content is not None:
+                    raise ValueError('pending recovery; run status for the owning profile before requesting trust')
+                return
+            recover(file, roots)
+        except OSError as error:
+            if any(parent.is_symlink() for parent in (roots[ComponentKind.HOOKS].parent,) + tuple(roots[ComponentKind.HOOKS].parent.parents)):
+                raise ValueError("destination root may not contain a symlink") from error
+            raise
 
 
 def _current_entries(plan: InstallPlan) -> dict[str, StateEntry]:
@@ -669,6 +829,7 @@ def _write_progress(plan: InstallPlan, entries: dict[str, StateEntry]) -> None:
         destination_root=plan.next_state.destination_root,
         entries=dict(entries),
         destination_roots=roots,
+        slots=plan.previous_state.slots if plan.previous_state else {},
     )
     write_state(plan.state_file, state)
 
@@ -684,18 +845,23 @@ def _remove_created_resource(root: _DestinationRoot, operation: InstallOperation
         expected_link=_relative_link(operation.source, operation.destination.parent) if isinstance(operation.resource, DirectorySymlink) else None,
         component=operation.component,
         resource=operation.resource,
-        expected_digest=operation.resource.digest if isinstance(operation.resource, FileCopy) else None,
+        expected_digest=operation.resource.digest if isinstance(operation.resource, (FileCopy, DirectoryCopy)) else None,
     )
     moved = root.quarantine(cleanup)
     root.discard(moved)
 
 
-def _validate_install_source(plan: InstallPlan, operation: InstallOperation) -> bytes | None:
+def _validate_install_source(plan: InstallPlan, operation: InstallOperation) -> bytes | bundles.Tree | None:
     if operation.source is None:
         raise ValueError(f"install operation has no source: {operation.destination}")
     if isinstance(operation.resource, DirectorySymlink):
         validate_skill_tree(plan.repository, operation.source)
         return None
+    if isinstance(operation.resource, DirectoryCopy):
+        tree = bundles.source_tree(operation.source)
+        if tree.digest != operation.resource.digest:
+            raise ValueError(f"copy source changed since planning: {operation.source}")
+        return tree
     content = _source_content(plan.repository, operation.source)
     if hashlib.sha256(content).hexdigest() != operation.resource.digest:
         raise ValueError(f"copy source changed since planning: {operation.source}")
@@ -790,7 +956,11 @@ def _apply_plan_locked(plan: InstallPlan, uninstall: bool = False) -> None:
 
 def apply_plan(plan: InstallPlan) -> None:
     with _state_lock(plan.state_file):
-        _apply_plan_locked(plan)
+        if plan.documents:
+            from .transactions import apply_lifecycle
+            apply_lifecycle(plan, False)
+        else:
+            _apply_plan_locked(plan)
 
 
 def plan_uninstall(
@@ -800,16 +970,29 @@ def plan_uninstall(
     target = _target(workspace, target_id)
     roots = _request_roots(workspace, target, destination, project_root)
     file = state_path(state_root, workspace.catalog.marketplace.id, str(workspace.profile.id), target_id)
+    _recover_lifecycle(file, roots)
     previous = _validated_state(workspace, target_id, file, roots)
+    documents, _, sources = _plan_documents(workspace, target_id, roots, previous, (), False, ())
+    if documents:
+        documents, ledger = shared_config.plan_ownership(roots[ComponentKind.HOOKS].parent,
+            file, documents, previous.slots if previous else {}, {})
+        documents += (ledger,)
     operations = []
     if previous:
         for key, entry in sorted(previous.entries.items()):
             operation = _removal(key, entry, "remove managed entry")
             if operation:
                 operations.append(operation)
-    return _make_plan(workspace, target_id, file, roots, previous, operations, {})
+    plan = _make_plan(workspace, target_id, file, roots, previous, operations, {})
+    if documents:
+        plan = replace(plan, next_state=replace(plan.next_state, schema_version=4), documents=documents)
+    return plan
 
 
 def apply_uninstall(plan: InstallPlan) -> None:
     with _state_lock(plan.state_file):
-        _apply_plan_locked(plan, uninstall=True)
+        if plan.documents:
+            from .transactions import apply_lifecycle
+            apply_lifecycle(plan, True)
+        else:
+            _apply_plan_locked(plan, uninstall=True)
