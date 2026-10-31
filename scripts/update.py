@@ -1,29 +1,19 @@
 #!/usr/bin/env python3
-"""Advance tracked upstream submodules and refresh generated files."""
+"""Compatibility wrapper for updating the cursor-plugins source."""
 
 from __future__ import annotations
 
-import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-
-def run(*command: str) -> None:
-    subprocess.run(command, cwd=ROOT, check=True)
+from agent_workbench.cli import main as workbench_main
 
 
 def main() -> int:
-    run("git", "submodule", "update", "--init", "--recursive", "--remote")
-    run("python3", "scripts/render_marketplaces.py")
-    run("python3", "scripts/validate.py")
-    subprocess.run(
-        ["git", "submodule", "status", "--recursive"],
-        cwd=ROOT,
-        check=True,
-    )
-    print("Review and commit changed submodule pointers and generated manifests.")
-    return 0
+    return workbench_main(["--root", str(ROOT), "update", "--source", "cursor-plugins", *sys.argv[1:]])
 
 
 if __name__ == "__main__":

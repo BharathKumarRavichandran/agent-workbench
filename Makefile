@@ -1,15 +1,24 @@
 PYTHON ?= python3
 
-.PHONY: render validate update install-dry-run
+.PHONY: render validate test check update plan-hermes install-dry-run
 
 render:
-	$(PYTHON) scripts/render_marketplaces.py
+	$(PYTHON) -m agent_workbench render
 
 validate:
-	$(PYTHON) scripts/validate.py
+	$(PYTHON) -m agent_workbench validate
+
+test:
+	$(PYTHON) -m unittest discover -s tests -v
+
+check: test validate
+	$(PYTHON) -m py_compile agent_workbench/*.py agent_workbench/adapters/*.py scripts/*.py
 
 update:
-	$(PYTHON) scripts/update.py
+	$(PYTHON) -m agent_workbench update --source cursor-plugins
+
+plan-hermes:
+	$(PYTHON) -m agent_workbench --profile pstack plan --target hermes
 
 install-dry-run:
 	$(PYTHON) scripts/install_skills.py --target agents --dry-run

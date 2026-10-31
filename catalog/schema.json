@@ -1,42 +1,67 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.invalid/agent-plugins/catalog.schema.json",
-  "title": "Agent plugin catalog",
+  "$id": "https://example.invalid/agent-workbench/catalog.schema.json",
+  "title": "Agent workbench catalog",
   "type": "object",
-  "required": ["schemaVersion", "marketplace", "plugins"],
+  "required": ["schemaVersion", "marketplace", "sources", "plugins"],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 2 },
     "marketplace": {
       "type": "object",
-      "required": ["name", "owner", "description"],
+      "required": ["id", "name", "owner", "description"],
       "properties": {
+        "id": { "$ref": "#/$defs/id" },
         "name": { "type": "string", "minLength": 1 },
         "owner": {
           "type": "object",
           "required": ["name"],
           "properties": { "name": { "type": "string", "minLength": 1 } },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         "description": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": false
     },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "path"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "kind": { "enum": ["local", "curated-copy", "git-submodule"] },
+          "path": { "$ref": "#/$defs/path" },
+          "upstream": { "type": "string", "format": "uri" },
+          "branch": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
     "plugins": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "origin", "upstream", "packages"],
+        "required": ["id", "source", "artifacts"],
         "properties": {
-          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-          "origin": { "enum": ["local", "copied", "submodule"] },
-          "upstream": { "type": "string", "format": "uri" },
-          "packages": {
+          "id": { "$ref": "#/$defs/id" },
+          "source": { "$ref": "#/$defs/id" },
+          "artifacts": {
             "type": "object",
-            "required": ["cursor", "claude", "skills"],
+            "minProperties": 1,
+            "additionalProperties": {
+              "type": "object",
+              "required": ["path"],
+              "properties": { "path": { "$ref": "#/$defs/path" } },
+              "additionalProperties": false
+            }
+          },
+          "provenance": {
+            "type": "object",
+            "required": ["upstream"],
             "properties": {
-              "cursor": { "type": "string" },
-              "claude": { "type": "string" },
-              "skills": { "type": "string" }
+              "upstream": { "type": "string", "format": "uri" },
+              "notice": { "$ref": "#/$defs/path" }
             },
             "additionalProperties": false
           }
@@ -44,6 +69,10 @@
         "additionalProperties": false
       }
     }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "path": { "type": "string", "minLength": 1, "not": { "pattern": "(^/|(^|/)\\.\\.(/|$))" } }
   },
   "additionalProperties": false
 }

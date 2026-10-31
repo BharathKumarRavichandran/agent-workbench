@@ -11,12 +11,17 @@ permissions:
 jobs:
   catalog:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: python3 scripts/validate.py
-      - run: python3 scripts/install_skills.py --target agents --dry-run
+          python-version: ${{ matrix.python }}
+      - run: python3 -m unittest discover -s tests -v
+      - run: python3 -m agent_workbench validate
+      - run: python3 -m agent_workbench render --check
+      - run: python3 scripts/install_skills.py --target agents --dry-run --dest "$RUNNER_TEMP/skills"

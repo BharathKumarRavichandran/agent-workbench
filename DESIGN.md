@@ -1,159 +1,125 @@
-# Design: Personal Multi-Agent Plugin Marketplace
+# Agent Workbench design
 
-## Goals
+## Purpose
 
-1. Keep one auditable repository for personal and work-safe agent capabilities.
-2. Serve native plugin marketplaces where an agent supports them.
-3. Serve plain `SKILL.md` directories where an agent only supports filesystem discovery.
-4. Track large upstream collections without copying or rewriting them.
-5. Allow selected skills to be copied locally when independent curation is more useful than upstream coupling.
-6. Make updates explicit, reviewable, and reproducible.
+The repository owns the full lifecycle of portable agent extensions: sourcing, describing, adapting, validating, installing, updating, and removing them. Native marketplaces are outputs of the workbench rather than its internal model.
 
-## Non-goals
+## Design decision
 
-- A universal runtime API across every agent.
-- Automatic execution of untrusted upstream hooks or MCP servers.
-- Silent tracking of upstream `main` in production environments.
-- Storing credentials, employer-only content, or machine-specific configuration.
+The implementation uses a typed compiled catalog with narrow adapters. This takes the strong boundaries from the typed-adapter candidate and the pure plan-before-apply behavior from the capability-graph candidate. It does not introduce a general graph resolver or configuration language because two marketplaces and one shared skill capability do not justify that complexity yet.
 
-## Core model
+## Domain model
 
-The repository separates four concerns:
+The catalog separates four concepts:
 
-```text
-catalog -> package sources -> agent adapters -> installations
-```
+1. A source owns bytes and update behavior.
+2. A plugin is a logical extension.
+3. An artifact says what the plugin exports.
+4. A profile selects plugins and allowed installation targets.
 
-### 1. Catalog
-
-`catalog/plugins.json` is the small source of truth. It records:
-
-- stable plugin id;
-- ownership/update model;
-- upstream provenance;
-- package root for Cursor;
-- package root for Claude-compatible consumers;
-- generic skills root.
-
-It does not duplicate skill bodies or plugin versions. Those remain in each package's own manifest.
-
-### 2. Package sources
-
-There are three ownership modes:
-
-| Mode | Location | Use when |
-|---|---|---|
-| `local` | `plugins/<id>` | You author and release the plugin. |
-| `copied` | `plugins/<id>` | You intentionally curate a small upstream artifact and retain attribution. |
-| `submodule` | `vendor/<repo>` | You want an auditable upstream commit and recursive checkout. |
-
-`pstack` is a directory inside the `cursor/plugins` monorepo, not an independent Git repository. Git cannot make only that directory a submodule. Therefore the correct boundary is:
+Installation ownership is machine-local state, not catalog data.
 
 ```text
-vendor/cursor-plugins                 # the actual submodule
-vendor/cursor-plugins/pstack          # Cursor package root
-vendor/cursor-plugins/harness/pstack/claude-code
-                                       # Claude package root
+Source
+  └── Plugin
+       ├── cursor-plugin artifact
+       ├── claude-plugin artifact
+       └── agent-skills artifact
 ```
 
-This preserves upstream history and requires no fork. The cost is checking out the upstream monorepo rather than only the pstack directory.
+Artifacts use registered string identifiers. This keeps the catalog open to future `agents`, `rules`, `hooks`, `commands`, and MCP artifacts without adding an agent field to every plugin.
 
-`karpathy-guidelines` uses the copied mode because it is one small skill and the requirement is to avoid a second submodule. Its upstream URL and MIT declaration are retained in `NOTICE.md`.
+## Boundaries
 
-### 3. Agent adapters
+| Module | Responsibility |
+|---|---|
+| `codec.py` | Reject malformed or unknown external JSON and produce domain values. |
+| `model.py` | Define immutable catalog, source, artifact, plugin, profile, and resolution values. |
+| `profiles.py` | Resolve selectors and source-relative artifacts. |
+| `adapters/*` | Own native format or destination knowledge. |
+| `rendering.py` | Detect output collisions and atomically write deterministic files. |
+| `installation.py` | Reconcile desired entries with filesystem state and produce operations. |
+| `state.py` | Read and atomically write path-ownership records. |
+| `sources.py` | Advance a selected upstream and validate the result. |
+| `validation.py` | Aggregate catalog, artifact, skill, adapter, provenance, and drift checks. |
+| `cli.py` | Parse commands and present results. It owns no domain policy. |
 
-Adapters are intentionally thin.
+Adapters do not mutate the filesystem. Install targets describe desired entries. The shared reconciler decides whether each entry is created, kept, adopted, replaced, removed, or rejected. Built-ins come from `build_registry()`; embedding code can inject an `AdapterRegistry` into `Workspace.load()` without changing catalog or validation code. Automatic package discovery remains intentionally deferred.
 
-#### Cursor
+## Extension contracts
 
-The generated `.cursor-plugin/marketplace.json` points each catalog entry to its Cursor package root. Package-owned `.cursor-plugin/plugin.json` files remain authoritative.
+### Marketplace renderer
 
-#### Claude Code
+A renderer declares one required artifact, validates its native package, and returns generated files. Rendering infrastructure handles ordering, collisions, check mode, and atomic writes.
 
-The generated `.claude-plugin/marketplace.json` points each entry to its Claude package root. pstack uses the Claude harness shipped by the upstream repository rather than pretending the Cursor package is identical.
+### Install target
 
-#### Grok
+An install target declares one required artifact, resolves its default destination, and expands selected plugins into desired entries. Codex, Claude, Grok, Hermes, and the shared Agent Skills directory are configurations of the same skill-directory target.
 
-Grok consumes Claude-compatible plugin marketplaces and also discovers skills from `.agents/skills` and `.grok/skills`. It therefore needs no forked manifest format. Use the Claude marketplace for complete plugins or `install_skills.py --target grok` for skill-only installation.
+### Source updater
 
-#### Codex
-
-Codex discovers skills from its skills directory but does not need this repository to invent a second plugin format. `install_skills.py --target codex` links each standard skill into `$CODEX_HOME/skills` (default `~/.codex/skills`).
-
-#### Hermes and other agents
-
-Hermes receives links under `$HERMES_HOME/skills`. Agents that implement the shared Agent Skills convention can use `--target agents`, which installs into `~/.agents/skills`.
-
-### 4. Installations
-
-The repository remains canonical. User-level skill directories receive relative symlinks, not copies. This has three properties:
-
-- one update changes every linked local agent;
-- removing the checkout makes breakage obvious instead of leaving stale copies;
-- the installer can identify links it owns and refuse destructive overwrites.
-
-Cloud agents should install through the Git marketplace URL because local symlinks do not exist in their containers.
-
-## Update semantics
-
-There are two different operations that are easy to confuse:
-
-1. `git pull --recurse-submodules` checks out the submodule commit pinned by this repository.
-2. `git submodule update --remote --recursive` advances the submodule to the newest commit on its configured branch.
-
-`make update` performs the second operation, regenerates manifests, and validates the result. The changed submodule pointer must then be reviewed and committed. This gives work and personal environments the same reproducible version while retaining a one-command upgrade path.
-
-## Trust and security boundary
-
-Treat every plugin as executable supply-chain input, even when it currently contains only Markdown.
-
-- Pin every submodule through the superproject commit.
-- Review `git diff --submodule=log` before accepting updates.
-- Validate license and provenance for copied content.
-- Never commit secrets, OAuth tokens, private MCP URLs, or employer instructions.
-- Keep company-only plugins in a separate private overlay repository rather than a branch of the personal marketplace.
-- Prefer skills-only installation when a full plugin contains hooks, scripts, MCP configuration, or tools that are unnecessary for the target agent.
-
-## Public core and private overlays
-
-Recommended deployment:
-
-```text
-agent-plugins                 public or personal core
-agent-plugins-work-overlay    private company-specific marketplace
-```
-
-The work overlay may include this repository as a submodule and add internal plugins. Do not make the core repository depend on the work overlay. This keeps personal clones usable and prevents accidental publication of internal material.
-
-## Versioning
-
-- The superproject commit is the release identifier for the full marketplace.
-- Local plugins own their semantic versions in `plugin.json`.
-- Submodule plugins keep their upstream versions.
-- Tag stable marketplace snapshots, for example `marketplace-2026.10` or `v0.1.0`.
-- Update one upstream at a time when possible so reviews show a narrow submodule diff.
+A source kind owns update semantics. Git submodules can advance to a configured branch. Local and curated-copy sources reject automatic updates until a specific updater is implemented.
 
 ## Validation contract
 
-A valid catalog must satisfy all of the following:
+Validation rejects:
 
-- plugin ids are unique;
-- every Cursor and Claude package root has its native plugin manifest;
-- every generic skill directory contains child directories with `SKILL.md`;
-- each skill has frontmatter containing `name` and `description`;
-- skill names are globally unique across the selected catalog;
-- generated marketplace files exactly match the catalog.
+- unknown JSON fields and schema versions;
+- invalid identifiers;
+- absolute paths and `..` traversal;
+- duplicate source and plugin IDs;
+- missing sources, artifacts, manifests, provenance notices, or skill metadata;
+- native manifest names that disagree with plugin IDs;
+- duplicate exported skill names;
+- unknown artifact kinds;
+- generated output collisions and drift.
 
-`scripts/validate.py` enforces this initial contract. Add agent-native validators later as the repository grows.
+JSON Schema files provide editor support. The strict decoder and semantic validation are authoritative.
 
-## Next extensions
+## Installation contract
 
-Add these only when needed:
+Planning is side-effect free. Applying a plan is allowed only when no conflict exists.
 
-1. CI running `python3 scripts/validate.py` on pull requests.
-2. A lock/report file recording submodule commit, plugin version, and skill count.
-3. Per-environment profiles such as `profiles/minimal.json` and `profiles/work.json`.
-4. Signature or allow-list policy for plugins containing executable hooks.
-5. Automated upstream update pull requests with human review.
+| Filesystem state | Recorded ownership | Result |
+|---|---|---|
+| destination absent | either | `create` |
+| exact expected link | owned | `keep` |
+| exact expected link | unowned | conflict, or `adopt` with explicit flag |
+| stale symlink | owned | `replace-owned` |
+| regular file or foreign link | any | conflict |
+| no longer selected expected link | owned | `remove-owned` |
 
-The initial design stays small: one catalog, two generated marketplaces, one submodule, one copied skill, and one safe linker.
+State is evidence of ownership, not proof that the filesystem still matches. Every plan inspects the live path. Apply acquires a target-state lock and compares the complete state snapshot captured during planning, so concurrent or stale plans cannot erase newer ownership. Destination creation and mutations are performed relative to pinned directory descriptors; parent and root swaps therefore fail instead of redirecting writes. Uninstall removes only an owned link that still resolves to its expected source.
+
+## Upstream boundary
+
+`pstack` is a directory in the `cursor/plugins` monorepo, so the complete repository is the Git submodule at `vendor/cursor-plugins`. Artifact paths select the pstack directories required by each adapter. `catalog/lock.json` records the reviewed submodule revision.
+
+Karpathy guidelines remain a curated copy because the artifact is one small skill. Its notice and upstream URL are part of validation.
+
+## Profiles and overlays
+
+Profiles select existing plugins. They do not rewrite provenance or package layout. A private work repository should depend on this public core and add private sources, plugins, and profiles. The public core must never depend on the work overlay.
+
+## Compatibility
+
+The old scripts remain as wrappers while the stable command is:
+
+```bash
+python3 -m agent_workbench <command>
+```
+
+The wrappers contain no duplicated catalog, rendering, validation, or installation logic.
+
+## Deferred features
+
+These should be added only when a real target needs them:
+
+- copy installation for ephemeral cloud containers;
+- trusted executable hooks and MCP components;
+- external adapter discovery;
+- profile inheritance;
+- a capability graph with transformations;
+- signatures for third-party packages.
+
+The current artifact and adapter boundaries allow each addition without changing existing plugin records.

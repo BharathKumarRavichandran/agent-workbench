@@ -1,94 +1,138 @@
-# Agent Plugins
+# Agent Workbench
 
-A personal, multi-agent marketplace for reusable plugins and skills.
+A portable source, adapter, validation, and installation repository for AI-agent plugins and skills.
 
-The repository keeps one catalog and emits native Cursor and Claude-compatible marketplace manifests. Claude-compatible marketplaces are also consumable by Grok, while filesystem skill links cover Codex, Hermes, Grok, Claude, and agents that use the common `~/.agents/skills` location.
+The workbench keeps upstream sources pinned, describes each plugin through agent-neutral artifacts, renders native marketplaces, resolves profiles, plans installations before mutation, and records which paths it owns.
 
-## Included
+## Included packages
 
-| Plugin | Ownership | Update model |
+| Plugin | Source | Update model |
 |---|---|---|
-| `pstack` | Cursor/Lauren Tan | `vendor/cursor-plugins` git submodule |
-| `karpathy-guidelines` | Forrest Chang / multica-ai | copied skill with attribution |
+| `pstack` | Cursor/Lauren Tan | pinned `cursor/plugins` submodule |
+| `karpathy-guidelines` | Forrest Chang / multica-ai | curated copy with attribution |
 
-## Clone
+## Architecture
 
-```bash
-git clone --recurse-submodules <your-repository-url>
-cd agent-plugins
-python3 scripts/validate.py
+```text
+catalog JSON
+    ↓ strict decoder
+immutable domain model
+    ├── marketplace renderers
+    ├── skill-directory targets
+    ├── profile resolution
+    ├── layered validation
+    └── install planner
+             ↓
+      explicit operations
+             ↓
+       safe executor + state
 ```
 
-A normal recursive clone checks out the **pinned** upstream commit. To deliberately advance pstack to the latest `main` commit:
+The central catalog describes sources and artifacts such as `cursor-plugin`, `claude-plugin`, and `agent-skills`. Agent adapters consume those artifacts. Adding another skill-directory agent does not require changing every plugin.
+
+## Clone and verify
 
 ```bash
-make update
-git diff --submodule=log
-# Review, then commit the new submodule pointer and generated files.
+git clone --recurse-submodules <repository-url> agent-workbench
+cd agent-workbench
+make check
 ```
 
-This review step is intentional: upstream changes should not silently reach work or personal agents without a committed, auditable pin.
+The runtime uses only the Python standard library and supports Python 3.9 or newer.
 
-## Install
+## Commands
 
-### Native marketplaces
+```bash
+# Validate the catalog, manifests, skills, lock report, and generated files.
+python3 -m agent_workbench validate
 
-Publish this repository to GitHub, then add it as a marketplace in Cursor, Claude Code, or Grok. The native manifests are:
+# Render native marketplaces and catalog/lock.json.
+python3 -m agent_workbench render
+python3 -m agent_workbench render --check
+
+# Preview an installation without changing the machine.
+python3 -m agent_workbench --profile pstack plan --target hermes
+
+# Apply it. Existing exact links require explicit adoption once.
+python3 -m agent_workbench --profile pstack install --target hermes --adopt
+
+# Inspect current desired-versus-actual state.
+python3 -m agent_workbench --profile pstack status --target hermes
+
+# Remove only paths recorded as owned by this workbench.
+python3 -m agent_workbench --profile pstack uninstall --target hermes
+
+# Advance the reviewed upstream source, then render and validate.
+python3 -m agent_workbench update --source cursor-plugins
+```
+
+Use `--destination` and `--state-dir` for isolated, project-local, or CI installations.
+
+## Profiles
+
+- `default`: all plugins;
+- `pstack`: pstack only;
+- `minimal`: Karpathy guidelines only.
+
+Profiles select plugins and allowed targets. They cannot change source provenance or artifact paths.
+
+## Safety behavior
+
+The installer builds a complete plan before writing anything.
+
+- Regular files and foreign symlinks are conflicts.
+- Matching unmanaged links require `--adopt`.
+- Repeated installation converges to `keep` operations.
+- State writes are atomic and guarded by an operation lock; stale plans are rejected against the full ownership snapshot.
+- Destination roots are created and mutated through pinned directory descriptors, preventing parent/root symlink swaps from redirecting writes.
+- Uninstall removes only state-owned links that still point to the expected source.
+- Moved checkouts produce `replace-owned` operations rather than silent deletion.
+
+Machine-local ownership state is stored under:
+
+```text
+${XDG_STATE_HOME:-~/.local/state}/agent-workbench/<marketplace>/<profile>/<target>.json
+```
+
+## Generated outputs
 
 - `.cursor-plugin/marketplace.json`
 - `.claude-plugin/marketplace.json`
+- `catalog/lock.json`
 
-Grok supports Claude-compatible plugin marketplaces, so it uses the Claude manifest.
-
-### Filesystem skills
-
-Preview links before installing:
-
-```bash
-python3 scripts/install_skills.py --target codex --dry-run
-python3 scripts/install_skills.py --target grok --dry-run
-python3 scripts/install_skills.py --target hermes --dry-run
-python3 scripts/install_skills.py --target agents --dry-run
-```
-
-Install one plugin or all plugins:
-
-```bash
-python3 scripts/install_skills.py --target codex --plugin karpathy-guidelines
-python3 scripts/install_skills.py --target codex --plugin pstack
-python3 scripts/install_skills.py --target agents
-```
-
-The installer creates relative symlinks and refuses to overwrite existing files or foreign links.
+The lock report records source revisions, plugin versions, artifact roots, and skill counts. All generated files are deterministic and checked in CI.
 
 ## Repository layout
 
 ```text
-agent-plugins/
-├── catalog/
-│   ├── plugins.json              # canonical inventory and adapter paths
-│   └── schema.json
-├── plugins/
-│   └── karpathy-guidelines/      # owned/copied package
-├── vendor/
-│   └── cursor-plugins/           # upstream submodule; pstack lives here
-├── .cursor-plugin/
-│   └── marketplace.json          # generated
-├── .claude-plugin/
-│   └── marketplace.json          # generated; also used by Grok
-└── scripts/
-    ├── render_marketplaces.py
-    ├── install_skills.py
-    ├── update.py
-    └── validate.py
+agent-workbench/
+├── agent_workbench/           # typed runtime and CLI
+│   ├── adapters/              # native renderers and install targets
+│   ├── codec.py               # strict JSON boundary
+│   ├── model.py               # immutable domain values
+│   ├── installation.py        # plan, reconcile, apply, uninstall
+│   ├── state.py               # atomic ownership state
+│   └── validation.py
+├── catalog/                   # canonical catalog, schema, lock report
+├── profiles/                  # package and target selections
+├── plugins/                   # locally owned or curated packages
+├── vendor/                    # pinned upstream sources
+├── tests/                     # isolated behavior tests
+└── scripts/                   # compatibility wrappers
 ```
 
-## Add another plugin
+## Adding a plugin
 
-1. Put an owned or copied plugin under `plugins/<id>`, or add its repository under `vendor/` as a submodule.
-2. Ensure it has Cursor and Claude package roots plus a directory of standard `*/SKILL.md` skills.
-3. Add one entry to `catalog/plugins.json`.
-4. Run `make render validate`.
-5. Review attribution, license, and generated manifests before committing.
+1. Add or reuse a source in `catalog/plugins.json`.
+2. Add the plugin with one or more artifact roots.
+3. Preserve provenance and a notice for curated copies.
+4. Add it to the appropriate profiles.
+5. Run `make render check`.
 
-See [DESIGN.md](DESIGN.md) for the architecture and extension rules.
+## Adding an agent
+
+If the agent consumes standard skill directories, register another `SkillDirectoryTarget` with its destination. No plugin entries change.
+
+If it needs a native marketplace format, add one narrow renderer implementing the marketplace adapter contract, register it once, and add golden behavior tests.
+
+See [DESIGN.md](DESIGN.md) for contracts and design decisions. Development and commit-message rules are in [CONTRIBUTING.md](CONTRIBUTING.md).

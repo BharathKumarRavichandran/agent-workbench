@@ -1,0 +1,16 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": 1,
+  "id": "default",
+  "plugins": {
+    "include": ["*"],
+    "exclude": []
+  },
+  "targets": [
+    { "id": "agents" },
+    { "id": "claude" },
+    { "id": "codex" },
+    { "id": "grok" },
+    { "id": "hermes" }
+  ]
+}
