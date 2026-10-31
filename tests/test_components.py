@@ -61,6 +61,7 @@ class ProfileComponentTests(unittest.TestCase):
             (2, 'components', [None]), (2, 'components', None),
             (2, 'projectRoot', '../outside'), (2, 'projectRoot', '/tmp/../outside'),
             (2, 'projectRoot', ''), (2, 'projectRoot', '/tmp/\x00bad'),
+            (2, 'projectRoot', '~definitely-no-such-user-xyz/project'),
             (2, 'trust', True), (1, 'components', ['skills']),
             (1, 'projectRoot', '/tmp/project'),
         )
@@ -117,9 +118,40 @@ class ProjectionTests(unittest.TestCase):
             self.assertFalse((base / 'state').exists() and list((base / 'state').rglob('*.json')))
 
     def test_unsupported_empty_artifact_selection_is_not_silently_skipped(self):
-        paths, conflicts = project_paths(TargetId('codex'), (C.AGENTS,), (), {C.SKILLS: Path('/skills')})
+        paths, conflicts = project_paths(
+            TargetId('codex'), CAPABILITIES[TargetId('codex')],
+            (C.AGENTS,), (), {C.SKILLS: Path('/skills')},
+        )
         self.assertEqual((), paths)
         self.assertEqual('COMPONENT_UNSUPPORTED', conflicts[0].code)
+
+    def test_registered_skill_directory_target_defaults_to_skills_capability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            fixture = Fixture(base / 'repo')
+            profile_path = fixture.root / 'profiles/default.json'
+            profile = json.loads(profile_path.read_text())
+            profile['targets'] = [{'id': 'new-agent'}]
+            profile_path.write_text(json.dumps(profile))
+            from agent_workbench.adapters.registry import AdapterRegistry, build_registry
+            from agent_workbench.adapters.skills import DestinationSpec, SkillDirectoryTarget
+
+            built_in = build_registry()
+            target = SkillDirectoryTarget(
+                TargetId('new-agent'),
+                DestinationSpec(None, str(base / 'new-agent'), ('skills',)),
+            )
+            registry = AdapterRegistry(
+                renderers=built_in.renderers,
+                install_targets={target.id: target},
+                artifact_inspectors=built_in.artifact_inspectors,
+            )
+            workspace = Workspace.load(fixture.root, registry=registry)
+
+            plan = plan_install(workspace, 'new-agent', base / 'state')
+
+            self.assertFalse(plan.has_conflicts)
+            self.assertEqual(['skill:sample-skill'], [operation.key for operation in plan.operations])
 
     def test_unsupported_malformed_artifact_still_returns_stable_conflict(self):
         with tempfile.TemporaryDirectory() as directory:

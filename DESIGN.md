@@ -58,7 +58,7 @@ A renderer declares one required artifact, validates its native package, and ret
 
 ### Install target
 
-An install target resolves authorized destination roots. Inspectors expose semantic `ComponentExport` values with a closed `ComponentKind` and an explicit representation. Pure projections select exact supported representations through `CAPABILITIES` and return paths or stable conflicts. They perform no mutation or format conversion.
+An install target resolves authorized destination roots and carries its supported component representations. Inspectors expose semantic `ComponentExport` values with a closed `ComponentKind` and an explicit representation. Pure projections consume the registered target's capabilities and return paths or stable conflicts. They perform no mutation or format conversion.
 
 `PathResource` is a closed union of `DirectorySymlink` and `FileCopy`. Future shared-document operations belong in a separate union. A copied file carries a SHA-256 digest. One reconciler executes both resource kinds, including uninstall. Cursor, Claude, Codex, Grok, Hermes, and the shared Agent Skills directory use the same path executor.
 

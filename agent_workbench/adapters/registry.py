@@ -12,6 +12,7 @@ from .claude import ClaudeMarketplaceRenderer
 from .components import OpaqueArtifactInspector, built_in_component_inspectors
 from .cursor import CursorMarketplaceRenderer
 from .lock import LockReportRenderer
+from .projections import BUILTIN_CAPABILITIES
 from .skills import DestinationSpec, SkillDirectoryTarget
 
 
@@ -25,12 +26,12 @@ class AdapterRegistry:
 def build_registry() -> AdapterRegistry:
     home = str(Path.home())
     targets = (
-        SkillDirectoryTarget(TargetId("cursor"), DestinationSpec(None, f"{home}/.cursor", ("skills",))),
-        SkillDirectoryTarget(TargetId("agents"), DestinationSpec(None, f"{home}/.agents", ("skills",))),
-        SkillDirectoryTarget(TargetId("claude"), DestinationSpec(None, f"{home}/.claude", ("skills",))),
-        SkillDirectoryTarget(TargetId("codex"), DestinationSpec("CODEX_HOME", f"{home}/.codex", ("skills",))),
-        SkillDirectoryTarget(TargetId("grok"), DestinationSpec(None, f"{home}/.grok", ("skills",))),
-        SkillDirectoryTarget(TargetId("hermes"), DestinationSpec("HERMES_HOME", f"{home}/.hermes", ("skills",))),
+        SkillDirectoryTarget(TargetId("cursor"), DestinationSpec(None, f"{home}/.cursor", ("skills",)), capabilities=BUILTIN_CAPABILITIES[TargetId("cursor")]),
+        SkillDirectoryTarget(TargetId("agents"), DestinationSpec(None, f"{home}/.agents", ("skills",)), capabilities=BUILTIN_CAPABILITIES[TargetId("agents")]),
+        SkillDirectoryTarget(TargetId("claude"), DestinationSpec(None, f"{home}/.claude", ("skills",)), capabilities=BUILTIN_CAPABILITIES[TargetId("claude")]),
+        SkillDirectoryTarget(TargetId("codex"), DestinationSpec("CODEX_HOME", f"{home}/.codex", ("skills",)), capabilities=BUILTIN_CAPABILITIES[TargetId("codex")]),
+        SkillDirectoryTarget(TargetId("grok"), DestinationSpec(None, f"{home}/.grok", ("skills",)), capabilities=BUILTIN_CAPABILITIES[TargetId("grok")]),
+        SkillDirectoryTarget(TargetId("hermes"), DestinationSpec("HERMES_HOME", f"{home}/.hermes", ("skills",)), capabilities=BUILTIN_CAPABILITIES[TargetId("hermes")]),
     )
     inspectors = (
         OpaqueArtifactInspector(ArtifactKind("cursor-plugin")),

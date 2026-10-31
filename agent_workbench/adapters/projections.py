@@ -9,7 +9,7 @@ from typing import Mapping
 from ..model import ComponentExport, ComponentKind, Representation, TargetId
 
 
-CAPABILITIES: Mapping[TargetId, Mapping[ComponentKind, Representation]] = {
+BUILTIN_CAPABILITIES: Mapping[TargetId, Mapping[ComponentKind, Representation]] = {
     TargetId(target): {
         ComponentKind.SKILLS: Representation.SKILL_DIRECTORY,
         **({ComponentKind.AGENTS: Representation.MARKDOWN_AGENT,
@@ -19,6 +19,10 @@ CAPABILITIES: Mapping[TargetId, Mapping[ComponentKind, Representation]] = {
     }
     for target in ("agents", "cursor", "claude", "codex", "hermes", "grok")
 }
+
+# Compatibility alias for callers that present the built-in matrix. Runtime
+# projection uses the capabilities carried by the registered install target.
+CAPABILITIES = BUILTIN_CAPABILITIES
 
 
 @dataclass(frozen=True)
@@ -37,11 +41,12 @@ class ProjectionConflict:
 
 def project_paths(
     target: TargetId,
+    capabilities: Mapping[ComponentKind, Representation],
     components: tuple[ComponentKind, ...],
     exports: tuple[ComponentExport, ...],
     roots: Mapping[ComponentKind, Path],
 ) -> tuple[tuple[ProjectedPath, ...], tuple[ProjectionConflict, ...]]:
-    supported = CAPABILITIES.get(target, {})
+    supported = capabilities
     conflicts = tuple(ProjectionConflict(component, "COMPONENT_UNSUPPORTED",
         f"{target} does not support current {component.value} format")
         for component in components if component not in supported)

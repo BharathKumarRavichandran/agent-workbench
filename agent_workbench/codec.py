@@ -207,8 +207,13 @@ def decode_profile(path: Path) -> Profile:
             if len(set(components)) != len(components):
                 raise ValueError(f"{location}.components must be unique")
         project_root = _string(item["projectRoot"], f"{location}.projectRoot") if "projectRoot" in item else None
-        if project_root is not None and ("\x00" in project_root or not Path(project_root).expanduser().is_absolute() or ".." in Path(project_root).parts):
-            raise ValueError(f"{location}.projectRoot must be an absolute contained path")
+        if project_root is not None:
+            try:
+                expanded_project_root = Path(project_root).expanduser()
+            except RuntimeError as error:
+                raise ValueError(f"{location}.projectRoot has an unknown user") from error
+            if "\x00" in project_root or not expanded_project_root.is_absolute() or ".." in Path(project_root).parts:
+                raise ValueError(f"{location}.projectRoot must be an absolute contained path")
         targets.append(
             ProfileTarget(
                 id=TargetId(_identifier(item["id"], f"{location}.id")),

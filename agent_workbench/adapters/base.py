@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Mapping, Protocol
 
 from ..diagnostics import Issue
-from ..model import ArtifactInventory, ArtifactKind, Catalog, ResolvedPlugin, ResolvedProfile, TargetId, ComponentKind, DirectorySymlink, PathResource
+from ..model import ArtifactInventory, ArtifactKind, Catalog, ResolvedPlugin, ResolvedProfile, TargetId, ComponentKind, DirectorySymlink, PathResource, Representation
 
 
 @dataclass(frozen=True)
@@ -54,5 +54,8 @@ class InstallTarget(Protocol):
     def required_artifact(self) -> ArtifactKind: ...
 
     def default_destination(self) -> Path: ...
+
+    @property
+    def capabilities(self) -> Mapping[ComponentKind, Representation]: ...
 
     def destination_roots(self, skills: Path, project_root: Path | None) -> dict[ComponentKind, Path]: ...

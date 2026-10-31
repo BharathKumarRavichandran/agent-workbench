@@ -572,7 +572,7 @@ def plan_install(
     selected = next(item for item in workspace.profile.targets if item.id == target.id)
     requested = components if components is not None else selected.components
     roots = _request_roots(workspace, target, destination, project_root)
-    _, unsupported = project_paths(target.id, requested, (), roots)
+    _, unsupported = project_paths(target.id, target.capabilities, requested, (), roots)
     rejected = {conflict.component for conflict in unsupported}
     exports = []
     for plugin in workspace.resolved.plugins:
@@ -583,7 +583,7 @@ def plan_install(
             if artifact in plugin.artifact_paths:
                 inspector = workspace.registry.artifact_inspectors[artifact]
                 exports.extend(semantic_exports(inspector.inspect(plugin)))
-    projected, conflicts = project_paths(target.id, requested, tuple(exports), roots)
+    projected, conflicts = project_paths(target.id, target.capabilities, requested, tuple(exports), roots)
     desired = tuple(DesiredEntry(
         item.key, str(item.export.plugin_id), item.export.source, item.destination,
         item.export.component,
