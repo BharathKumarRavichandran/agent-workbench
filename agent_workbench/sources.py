@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .model import Source, SourceKind
-from .rendering import generated_files, render
+from .rendering import delete_generated_file, generated_files, render, write_generated_file
 from .validation import validate
 from .workspace import Workspace
 
@@ -66,14 +66,12 @@ def _generated_snapshot(workspace: Workspace) -> dict[Path, bytes | None]:
     }
 
 
-def _restore_generated(snapshot: dict[Path, bytes | None]) -> None:
+def _restore_generated(repository: Path, snapshot: dict[Path, bytes | None]) -> None:
     for path, content in snapshot.items():
         if content is None:
-            if path.exists() or path.is_symlink():
-                path.unlink()
+            delete_generated_file(repository, path)
             continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+        write_generated_file(repository, path, content)
 
 
 def update_source(workspace: Workspace, source_id: str) -> UpdateResult:
@@ -137,7 +135,7 @@ def update_source(workspace: Workspace, source_id: str) -> UpdateResult:
             cwd=workspace.root,
             check=False,
         )
-        _restore_generated(snapshot)
+        _restore_generated(workspace.root, snapshot)
         raise
 
     after = _revision(workspace, path)

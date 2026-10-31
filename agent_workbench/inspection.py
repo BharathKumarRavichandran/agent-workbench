@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 
@@ -31,11 +32,43 @@ def _safe_skill_name(value: str, path: Path) -> str:
     return value
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _regular_contained_file(root: Path, path: Path) -> Path:
+    if root.is_symlink():
+        raise ValueError(f"artifact root may not be a symlink: {root}")
+    canonical_root = root.resolve()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"manifest escapes artifact root: {path}") from error
+    current = root
+    for component in relative.parts:
+        current = current / component
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"manifest path may not contain symlinks: {current}")
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError(f"manifest must be a regular file: {path}")
+    try:
+        path.resolve().relative_to(canonical_root)
+    except ValueError as error:
+        raise ValueError(f"manifest escapes artifact root: {path}") from error
+    return path
+
+
 def load_manifest(package: Path, agent: str) -> dict[str, object]:
-    path = package / f".{agent}-plugin" / "plugin.json"
-    if not path.is_file():
-        path = package / "plugin.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
+    native = package / f".{agent}-plugin" / "plugin.json"
+    path = native if native.exists() or native.is_symlink() else package / "plugin.json"
+    path = _regular_contained_file(package, path)
+    data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
     if not isinstance(data, dict):
         raise ValueError(f"manifest must be an object: {path}")
     for field in ("name", "description"):
@@ -52,7 +85,16 @@ def _require_contained(root: Path, path: Path) -> None:
         raise ValueError(f"skill content escapes its declared root: {path}") from error
 
 
-def _validate_skill_tree(root: Path, skill: Path) -> None:
+def validate_skill_tree(root: Path, skill: Path) -> None:
+    if skill.is_symlink():
+        raise ValueError(f"skill source may not be a symlink: {skill}")
+    if not skill.is_dir():
+        raise ValueError(f"skill source is not a directory: {skill}")
+    _require_contained(root, skill)
+    skill_file = skill / "SKILL.md"
+    if skill_file.is_symlink() or not skill_file.is_file():
+        raise ValueError(f"skill source requires a regular SKILL.md: {skill_file}")
+    _require_contained(root, skill_file)
     for current, directories, files in os.walk(skill, followlinks=False):
         current_path = Path(current)
         _require_contained(root, current_path)
@@ -86,7 +128,7 @@ def discover_skills(root: Path) -> tuple[SkillInfo, ...]:
         resolved_skill = skill_file.resolve()
         if canonical_root not in resolved_skill.parents:
             raise ValueError(f"SKILL.md escapes skills root: {skill_file}")
-        _validate_skill_tree(canonical_root, directory)
+        validate_skill_tree(canonical_root, directory)
         text = skill_file.read_text(encoding="utf-8")
         if not text.startswith("---\n"):
             raise ValueError(f"skill frontmatter must start at byte zero: {skill_file}")

@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from .adapters.base import GeneratedFile
 from .workspace import Workspace
@@ -42,17 +44,19 @@ def generated_files(workspace: Workspace) -> tuple[GeneratedFile, ...]:
     return tuple(files)
 
 
-def _write_generated(repository: Path, output: Path, content: bytes) -> None:
+@contextmanager
+def _output_parent(repository: Path, output: Path, create: bool) -> Iterator[tuple[int, str]]:
     root = repository.resolve()
     relative = output.absolute().relative_to(root)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(root, flags)
-    temporary = f".{relative.name}.{secrets.token_hex(8)}"
     try:
         for component in relative.parts[:-1]:
             try:
                 child = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
             except FileNotFoundError:
+                if not create:
+                    raise
                 os.mkdir(component, mode=0o755, dir_fd=descriptor)
                 child = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
             if not stat.S_ISDIR(child.st_mode):
@@ -60,6 +64,14 @@ def _write_generated(repository: Path, output: Path, content: bytes) -> None:
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
+        yield descriptor, relative.name
+    finally:
+        os.close(descriptor)
+
+
+def write_generated_file(repository: Path, output: Path, content: bytes) -> None:
+    temporary = f".{output.name}.{secrets.token_hex(8)}"
+    with _output_parent(repository, output, create=True) as (descriptor, name):
         temporary_descriptor = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -72,12 +84,12 @@ def _write_generated(repository: Path, output: Path, content: bytes) -> None:
                 handle.flush()
                 os.fsync(handle.fileno())
             try:
-                existing = os.stat(relative.name, dir_fd=descriptor, follow_symlinks=False)
+                existing = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
             except FileNotFoundError:
                 existing = None
             if existing is not None and not stat.S_ISREG(existing.st_mode):
                 raise ValueError(f"generated output may only replace a regular file: {output}")
-            os.replace(temporary, relative.name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+            os.replace(temporary, name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
             temporary = ""
         finally:
             if temporary:
@@ -85,8 +97,24 @@ def _write_generated(repository: Path, output: Path, content: bytes) -> None:
                     os.unlink(temporary, dir_fd=descriptor)
                 except FileNotFoundError:
                     pass
-    finally:
-        os.close(descriptor)
+
+
+def delete_generated_file(repository: Path, output: Path) -> None:
+    try:
+        with _output_parent(repository, output, create=False) as (descriptor, name):
+            try:
+                existing = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if not stat.S_ISREG(existing.st_mode):
+                raise ValueError(f"generated output deletion requires a regular file: {output}")
+            os.unlink(name, dir_fd=descriptor)
+    except FileNotFoundError:
+        return
+
+
+def _write_generated(repository: Path, output: Path, content: bytes) -> None:
+    write_generated_file(repository, output, content)
 
 
 def render(workspace: Workspace, check: bool = False) -> tuple[Path, ...]:

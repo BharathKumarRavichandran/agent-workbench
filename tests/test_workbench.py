@@ -152,6 +152,33 @@ class CodecTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_native_manifest_must_not_be_external_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            fixture = Fixture(base / "repo")
+            manifest = fixture.root / "plugins" / "sample" / ".cursor-plugin" / "plugin.json"
+            external = base / "external.json"
+            external.write_text(manifest.read_text(encoding="utf-8"), encoding="utf-8")
+            manifest.unlink()
+            manifest.symlink_to(external)
+
+            report = validate(Workspace.load(fixture.root), check_generated=False)
+
+            self.assertFalse(report.valid)
+            self.assertIn("CURSOR_MANIFEST_INVALID", {issue.code for issue in report.issues})
+
+    def test_native_manifest_rejects_duplicate_json_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(Path(directory))
+            manifest = fixture.root / "plugins" / "sample" / ".cursor-plugin" / "plugin.json"
+            content = manifest.read_text(encoding="utf-8")
+            manifest.write_text(content.replace('"name": "sample"', '"name": "sample", "name": "sample"', 1))
+
+            report = validate(Workspace.load(fixture.root), check_generated=False)
+
+            self.assertFalse(report.valid)
+            self.assertIn("CURSOR_MANIFEST_INVALID", {issue.code for issue in report.issues})
+
     def test_render_rejects_symlinked_output_parent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -278,6 +305,24 @@ class RenderingTests(unittest.TestCase):
 
 
 class InstallationTests(unittest.TestCase):
+    def test_install_revalidates_skill_source_after_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            fixture = Fixture(base / "repo")
+            destination = base / "skills"
+            plan = plan_install(Workspace.load(fixture.root), "agents", base / "state", destination)
+            source = fixture.root / "plugins" / "sample" / "skills" / "sample-skill"
+            original = base / "original-skill"
+            source.rename(original)
+            external = base / "external-skill"
+            external.mkdir()
+            (external / "SKILL.md").write_text(SKILL, encoding="utf-8")
+            source.symlink_to(external, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "skill source"):
+                apply_plan(plan)
+            self.assertFalse((destination / "sample-skill").exists())
+            self.assertFalse((destination / "sample-skill").is_symlink())
     def test_profile_destination_is_used_for_uninstall(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -882,6 +927,46 @@ class CliTests(unittest.TestCase):
 
 
 class SourceTests(unittest.TestCase):
+    def test_generated_rollback_rejects_symlinked_parent_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            fixture = Fixture(base / "repo")
+            parent = fixture.root / ".cursor-plugin"
+            parent.mkdir()
+            output = parent / "marketplace.json"
+            original_parent = fixture.root / ".cursor-plugin-original"
+            parent.rename(original_parent)
+            outside = base / "outside"
+            outside.mkdir()
+            parent.symlink_to(outside, target_is_directory=True)
+            from agent_workbench.sources import _restore_generated
+
+            with self.assertRaises((ValueError, OSError)):
+                _restore_generated(fixture.root, {output: b"original"})
+
+            self.assertFalse((outside / "marketplace.json").exists())
+
+    def test_generated_rollback_rejects_symlinked_parent_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            fixture = Fixture(base / "repo")
+            parent = fixture.root / ".cursor-plugin"
+            parent.mkdir()
+            output = parent / "marketplace.json"
+            original_parent = fixture.root / ".cursor-plugin-original"
+            parent.rename(original_parent)
+            outside = base / "outside"
+            outside.mkdir()
+            victim = outside / "marketplace.json"
+            victim.write_text("foreign", encoding="utf-8")
+            parent.symlink_to(outside, target_is_directory=True)
+            from agent_workbench.sources import _restore_generated
+
+            with self.assertRaises((ValueError, OSError)):
+                _restore_generated(fixture.root, {output: None})
+
+            self.assertEqual("foreign", victim.read_text(encoding="utf-8"))
+
     def test_update_rejects_option_like_branch_before_git_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(Path(directory))

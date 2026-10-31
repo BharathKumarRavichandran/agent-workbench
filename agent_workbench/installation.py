@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
 from .adapters.base import InstallTarget
+from .inspection import validate_skill_tree
 from .model import TargetId
 from .state import InstallState, StateEntry, load_state, remove_state, state_path, write_state
 from .workspace import Workspace
@@ -53,6 +54,7 @@ class InstallOperation:
 @dataclass(frozen=True)
 class InstallPlan:
     target: TargetId
+    repository: Path
     destination: Path
     operations: tuple[InstallOperation, ...]
     next_state: InstallState
@@ -506,6 +508,7 @@ def plan_install(
     destination_anchor, destination_anchor_identity = _destination_anchor(destination_path)
     return InstallPlan(
         target=TargetId(target_id),
+        repository=workspace.root,
         destination=destination_path,
         operations=tuple(operations),
         next_state=state,
@@ -551,6 +554,12 @@ def _remove_created_link(root: _DestinationRoot, operation: InstallOperation) ->
     root.discard(moved)
 
 
+def _validate_install_source(plan: InstallPlan, operation: InstallOperation) -> None:
+    if operation.source is None:
+        raise ValueError(f"install operation has no skill source: {operation.destination}")
+    validate_skill_tree(plan.repository, operation.source)
+
+
 def _apply_plan_locked(plan: InstallPlan) -> None:
     if plan.has_conflicts:
         raise ValueError("installation plan has conflicts")
@@ -559,6 +568,7 @@ def _apply_plan_locked(plan: InstallPlan) -> None:
         for operation in plan.operations:
             root.verify()
             if operation.kind in {OperationKind.KEEP, OperationKind.ADOPT}:
+                _validate_install_source(plan, operation)
                 assert operation.source is not None
                 if not root.same_link(operation, operation.source):
                     raise _changed(operation)
@@ -581,6 +591,7 @@ def _apply_plan_locked(plan: InstallPlan) -> None:
                 root.discard(moved)
                 continue
             if operation.kind is OperationKind.CREATE:
+                _validate_install_source(plan, operation)
                 root.create_link(operation)
                 try:
                     root.verify()
@@ -595,6 +606,7 @@ def _apply_plan_locked(plan: InstallPlan) -> None:
                     raise
                 continue
             if operation.kind is OperationKind.REPLACE_OWNED:
+                _validate_install_source(plan, operation)
                 assert operation.source is not None
                 old = root.quarantine(operation)
                 try:
@@ -647,6 +659,7 @@ def plan_uninstall(
     if previous is None:
         return InstallPlan(
             target=TargetId(target_id),
+            repository=workspace.root,
             destination=installation_root,
             operations=(),
             next_state=_empty_state(workspace, target_id, installation_root),
@@ -677,6 +690,7 @@ def plan_uninstall(
             operations.append(InstallOperation(OperationKind.CONFLICT, key, removal_destination, source, "managed path was modified"))
     return InstallPlan(
         target=TargetId(target_id),
+        repository=workspace.root,
         destination=installation_root,
         operations=tuple(operations),
         next_state=_empty_state(workspace, target_id, installation_root),
