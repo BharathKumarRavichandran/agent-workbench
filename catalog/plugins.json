@@ -31,7 +31,8 @@
       "artifacts": {
         "cursor-plugin": { "path": "pstack" },
         "claude-plugin": { "path": "harness/pstack/claude-code" },
-        "agent-skills": { "path": "pstack/skills" }
+        "agent-skills": { "path": "pstack/skills" },
+        "agents": { "path": "pstack/agents" }
       },
       "provenance": {
         "upstream": "https://github.com/cursor/plugins/tree/main/pstack"

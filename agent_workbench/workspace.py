@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
-from .adapters import AdapterRegistry, build_registry
+from .adapters.registry import AdapterRegistry, build_registry
 from .codec import decode_catalog, decode_profile
 from .model import Catalog, Profile, ResolvedProfile
 from .profiles import resolve_profile

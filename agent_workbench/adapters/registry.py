@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
-from ..model import TargetId
-from .base import InstallTarget, MarketplaceRenderer
+from ..model import ArtifactKind, TargetId
+from .base import ArtifactInspector, InstallTarget, MarketplaceRenderer
 from .claude import ClaudeMarketplaceRenderer
+from .components import OpaqueArtifactInspector, built_in_component_inspectors
 from .cursor import CursorMarketplaceRenderer
 from .lock import LockReportRenderer
 from .skills import DestinationSpec, SkillDirectoryTarget
@@ -18,6 +19,7 @@ from .skills import DestinationSpec, SkillDirectoryTarget
 class AdapterRegistry:
     renderers: tuple[MarketplaceRenderer, ...]
     install_targets: Mapping[TargetId, InstallTarget]
+    artifact_inspectors: Mapping[ArtifactKind, ArtifactInspector] = field(default_factory=dict)
 
 
 def build_registry() -> AdapterRegistry:
@@ -29,7 +31,14 @@ def build_registry() -> AdapterRegistry:
         SkillDirectoryTarget(TargetId("grok"), DestinationSpec(None, f"{home}/.grok", ("skills",))),
         SkillDirectoryTarget(TargetId("hermes"), DestinationSpec("HERMES_HOME", f"{home}/.hermes", ("skills",))),
     )
+    inspectors = (
+        OpaqueArtifactInspector(ArtifactKind("cursor-plugin")),
+        OpaqueArtifactInspector(ArtifactKind("claude-plugin")),
+        *built_in_component_inspectors(),
+    )
+    inspector_map = {inspector.kind: inspector for inspector in inspectors}
     return AdapterRegistry(
-        renderers=(CursorMarketplaceRenderer(), ClaudeMarketplaceRenderer(), LockReportRenderer()),
+        artifact_inspectors=inspector_map,
+        renderers=(CursorMarketplaceRenderer(), ClaudeMarketplaceRenderer(), LockReportRenderer(inspector_map)),
         install_targets={target.id: target for target in targets},
     )

@@ -7,9 +7,8 @@ import json
 import sys
 from pathlib import Path
 
-from .inspection import discover_skills
+from .artifacts import component_counts, inspect_catalog
 from .installation import apply_plan, apply_uninstall, plan_install, plan_uninstall
-from .model import ArtifactKind
 from .rendering import render
 from .sources import update_source
 from .state import default_state_root
@@ -74,13 +73,10 @@ def run(args: argparse.Namespace) -> int:
             for issue in report.issues:
                 print(f"{issue.severity.value}: {issue.code}: {issue.location}: {issue.message}")
         else:
-            skill_count = sum(
-                len(discover_skills(path))
-                for plugin in workspace.resolved.plugins
-                for path in [plugin.artifact_paths.get(ArtifactKind("agent-skills"))]
-                if path is not None
-            )
-            print(f"validated {len(workspace.resolved.plugins)} plugins and {skill_count} skills")
+            inspection = inspect_catalog(workspace.root, workspace.catalog, workspace.registry.artifact_inspectors)
+            counts = component_counts(workspace.resolved.plugins, inspection.inventories)
+            summary = ", ".join(f"{kind}={count}" for kind, count in counts.items()) or "no components"
+            print(f"validated {len(workspace.resolved.plugins)} plugins: {summary}")
         return 0 if report.valid else 1
 
     if args.command == "render":

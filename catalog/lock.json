@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "marketplace": "bharath-agent-plugins",
   "sources": [
     {
@@ -25,8 +25,13 @@
       "source": "cursor-plugins",
       "version": "0.15.36",
       "skills": 58,
+      "components": {
+        "agent-skills": 58,
+        "agents": 2
+      },
       "artifacts": {
         "agent-skills": "vendor/cursor-plugins/pstack/skills",
+        "agents": "vendor/cursor-plugins/pstack/agents",
         "claude-plugin": "vendor/cursor-plugins/harness/pstack/claude-code",
         "cursor-plugin": "vendor/cursor-plugins/pstack"
       }
@@ -36,6 +41,9 @@
       "source": "local-plugins",
       "version": "1.0.0",
       "skills": 1,
+      "components": {
+        "agent-skills": 1
+      },
       "artifacts": {
         "agent-skills": "plugins/karpathy-guidelines/skills",
         "claude-plugin": "plugins/karpathy-guidelines",

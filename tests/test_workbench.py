@@ -41,6 +41,10 @@ class Fixture:
         (package / ".cursor-plugin").mkdir(parents=True)
         (package / ".claude-plugin").mkdir(parents=True)
         (package / "skills" / "sample-skill").mkdir(parents=True)
+        (package / "agents").mkdir()
+        (package / "rules").mkdir()
+        (package / "hooks").mkdir()
+        (package / "commands").mkdir()
         manifest = {
             "name": "sample",
             "version": "1.0.0",
@@ -49,6 +53,27 @@ class Fixture:
         for agent in ("cursor", "claude"):
             (package / f".{agent}-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
         (package / "skills" / "sample-skill" / "SKILL.md").write_text(SKILL, encoding="utf-8")
+        (package / "agents" / "sample-agent.md").write_text(
+            "---\nname: sample-agent\ndescription: A sample agent.\n---\n\n# Sample agent\n",
+            encoding="utf-8",
+        )
+        (package / "rules" / "sample-rule.mdc").write_text(
+            "---\ndescription: A sample rule.\nalwaysApply: true\n---\n\n# Sample rule\n",
+            encoding="utf-8",
+        )
+        (package / "hooks" / "hooks.json").write_text(
+            json.dumps({"version": 1, "hooks": {"stop": [{"command": "./stop.sh"}]}}),
+            encoding="utf-8",
+        )
+        (package / "hooks" / "stop.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (package / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"sample-server": {"type": "http", "url": "https://example.invalid"}}}),
+            encoding="utf-8",
+        )
+        (package / "commands" / "sample-command.md").write_text(
+            "---\ndescription: A sample command.\n---\n\n# Sample command\n",
+            encoding="utf-8",
+        )
         (root / "catalog").mkdir()
         (root / "profiles").mkdir()
         catalog = {
@@ -68,6 +93,11 @@ class Fixture:
                         "cursor-plugin": {"path": "sample"},
                         "claude-plugin": {"path": "sample"},
                         "agent-skills": {"path": "sample/skills"},
+                        "agents": {"path": "sample/agents"},
+                        "rules": {"path": "sample/rules"},
+                        "hooks": {"path": "sample/hooks"},
+                        "mcp": {"path": "sample/mcp.json"},
+                        "commands": {"path": "sample/commands"},
                     },
                 }
             ],
@@ -152,6 +182,73 @@ class CodecTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_component_artifacts_are_validated_and_reported_in_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(Path(directory))
+            workspace = Workspace.load(fixture.root)
+
+            self.assertTrue(validate(workspace, check_generated=False).valid)
+            render(workspace)
+            lock = json.loads((fixture.root / "catalog" / "lock.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(2, lock["schemaVersion"])
+            self.assertEqual(
+                {
+                    "agent-skills": 1,
+                    "agents": 1,
+                    "commands": 1,
+                    "hooks": 1,
+                    "mcp": 1,
+                    "rules": 1,
+                },
+                lock["plugins"][0]["components"],
+            )
+
+    def test_component_artifacts_are_inert_for_skill_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            fixture = Fixture(base / "repo")
+
+            plan = plan_install(Workspace.load(fixture.root), "agents", base / "state", base / "installed")
+
+            self.assertEqual(["skill:sample-skill"], [operation.key for operation in plan.operations])
+
+    def test_invalid_component_tree_is_rejected_without_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(Path(directory))
+            hooks = fixture.root / "plugins" / "sample" / "hooks" / "hooks.json"
+            hooks.write_text('{"hooks":{"stop":[{"command":"touch should-not-exist"}],"stop":[]}}', encoding="utf-8")
+
+            report = validate(Workspace.load(fixture.root), check_generated=False)
+
+            self.assertIn("ARTIFACT_INVALID", {issue.code for issue in report.issues})
+            self.assertFalse((fixture.root / "should-not-exist").exists())
+
+    def test_component_artifacts_reject_symlinked_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            fixture = Fixture(base / "repo")
+            external = base / "external-agent.md"
+            external.write_text(
+                "---\nname: linked-agent\ndescription: External.\n---\n",
+                encoding="utf-8",
+            )
+            (fixture.root / "plugins" / "sample" / "agents" / "linked-agent.md").symlink_to(external)
+
+            report = validate(Workspace.load(fixture.root), check_generated=False)
+
+            self.assertIn("ARTIFACT_INVALID", {issue.code for issue in report.issues})
+
+    def test_component_artifacts_reject_malformed_frontmatter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(Path(directory))
+            agent = fixture.root / "plugins" / "sample" / "agents" / "sample-agent.md"
+            agent.write_text("# Missing frontmatter\n", encoding="utf-8")
+
+            report = validate(Workspace.load(fixture.root), check_generated=False)
+
+            self.assertIn("ARTIFACT_INVALID", {issue.code for issue in report.issues})
+
     def test_native_manifest_must_not_be_external_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -855,6 +952,16 @@ class CliTests(unittest.TestCase):
             workspace = Workspace.load(fixture.root, registry=custom)
 
             self.assertIs(custom, workspace.registry)
+
+    def test_custom_registry_requires_explicit_artifact_inspectors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(Path(directory))
+            from agent_workbench.adapters.registry import AdapterRegistry
+
+            custom = AdapterRegistry(renderers=(), install_targets={})
+            report = validate(Workspace.load(fixture.root, registry=custom), check_generated=False)
+
+            self.assertIn("ARTIFACT_KIND_UNKNOWN", {issue.code for issue in report.issues})
 
     def test_workspace_rejects_profile_path_escape_and_id_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -5,21 +5,29 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from typing import Mapping
 
+from ..artifacts import inspect_catalog
 from ..diagnostics import Issue
-from ..inspection import discover_skills, load_manifest
+from ..inspection import load_manifest
 from ..model import ArtifactKind, Catalog, ResolvedPlugin, ResolvedProfile, SourceKind
-from .base import GeneratedFile
+from .base import ArtifactInspector, GeneratedFile
 
 
 class LockReportRenderer:
     id = "catalog-lock"
     required_artifact = ArtifactKind("agent-skills")
 
+    def __init__(self, inspectors: Mapping[ArtifactKind, ArtifactInspector]) -> None:
+        self.inspectors = inspectors
+
     def validate(self, repository: Path, plugin: ResolvedPlugin) -> tuple[Issue, ...]:
         return ()
 
     def render(self, repository: Path, catalog: Catalog, profile: ResolvedProfile) -> tuple[GeneratedFile, ...]:
+        inspection = inspect_catalog(repository, catalog, self.inspectors)
+        if inspection.issues:
+            raise ValueError("catalog artifact inspection failed")
         sources = []
         for source in catalog.sources:
             revision = None
@@ -48,20 +56,24 @@ class LockReportRenderer:
                     version = load_manifest(package, agent).get("version")
                     if version:
                         break
-            skills_root = resolved.artifact_paths.get(ArtifactKind("agent-skills"))
-            skills = discover_skills(skills_root) if skills_root is not None else ()
+            components = {
+                str(kind): len(inventory.components)
+                for (plugin_id, kind), inventory in inspection.inventories.items()
+                if plugin_id == resolved.plugin.id and inventory.components
+            }
             plugins.append(
                 {
                     "id": str(resolved.plugin.id),
                     "source": str(resolved.source.id),
                     "version": version,
-                    "skills": len(skills),
+                    "skills": components.get("agent-skills", 0),
+                    "components": dict(sorted(components.items())),
                     "artifacts": {str(kind): path.relative_to(repository).as_posix() for kind, path in sorted(resolved.artifact_paths.items())},
                 }
             )
 
         document = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "marketplace": catalog.marketplace.id,
             "sources": sources,
             "plugins": plugins,

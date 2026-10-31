@@ -24,10 +24,11 @@ Source
   └── Plugin
        ├── cursor-plugin artifact
        ├── claude-plugin artifact
-       └── agent-skills artifact
+       ├── agent-skills artifact
+       └── agents / rules / hooks / mcp / commands artifacts
 ```
 
-Artifacts use registered string identifiers. This keeps the catalog open to future `agents`, `rules`, `hooks`, `commands`, and MCP artifacts without adding an agent field to every plugin.
+Artifacts use registered string identifiers. Built-in inspectors recognize `agent-skills`, `agents`, `rules`, `hooks`, `mcp`, and `commands`, while the catalog remains open to future adapter-defined kinds without adding an agent field to every plugin.
 
 ## Boundaries
 
@@ -36,6 +37,8 @@ Artifacts use registered string identifiers. This keeps the catalog open to futu
 | `codec.py` | Reject malformed or unknown external JSON and produce domain values. |
 | `model.py` | Define immutable catalog, source, artifact, plugin, profile, and resolution values. |
 | `profiles.py` | Resolve selectors and source-relative artifacts. |
+| `artifacts.py` | Resolve every catalog artifact and dispatch its registered inspector. |
+| `adapters/components.py` | Validate and inventory portable component layouts without activating them. |
 | `adapters/*` | Own native format or destination knowledge. |
 | `rendering.py` | Detect output collisions and atomically write deterministic files. |
 | `installation.py` | Reconcile desired entries with filesystem state and produce operations. |
@@ -68,11 +71,13 @@ Validation rejects:
 - invalid identifiers;
 - absolute paths and `..` traversal;
 - duplicate source and plugin IDs;
-- missing sources, artifacts, manifests, provenance notices, or skill metadata;
+- missing sources, artifacts, manifests, provenance notices, or required component metadata;
 - native manifest names that disagree with plugin IDs;
 - duplicate exported skill names;
 - unknown artifact kinds;
 - generated output collisions and drift.
+
+Artifact recognition is explicit in the adapter registry rather than inferred from renderer or install-target dependencies. Component inspection is inert: hook commands are not executed, MCP servers are not started, and configuration bodies are not copied into the lock report. Only `agent-skills` cross the installation boundary in the current design.
 
 JSON Schema files provide editor support. The strict decoder and semantic validation are authoritative.
 
@@ -116,7 +121,7 @@ The wrappers contain no duplicated catalog, rendering, validation, or installati
 These should be added only when a real target needs them:
 
 - copy installation for ephemeral cloud containers;
-- trusted executable hooks and MCP components;
+- trusted installation and activation of executable hooks and MCP components;
 - external adapter discovery;
 - profile inheritance;
 - a capability graph with transformations;

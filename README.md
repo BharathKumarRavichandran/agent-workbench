@@ -28,7 +28,7 @@ immutable domain model
        safe executor + state
 ```
 
-The central catalog describes sources and artifacts such as `cursor-plugin`, `claude-plugin`, and `agent-skills`. Agent adapters consume those artifacts. Adding another skill-directory agent does not require changing every plugin.
+The central catalog describes sources and artifacts such as `cursor-plugin`, `claude-plugin`, `agent-skills`, `agents`, `rules`, `hooks`, `mcp`, and `commands`. Registered inspectors validate and inventory each artifact independently from rendering and installation. Adding another skill-directory agent does not require changing every plugin.
 
 ## Clone and verify
 
@@ -43,7 +43,7 @@ The runtime uses only the Python standard library and supports Python 3.9 or new
 ## Commands
 
 ```bash
-# Validate the catalog, manifests, skills, lock report, and generated files.
+# Validate the catalog, manifests, component artifacts, lock report, and generated files.
 python3 -m agent_workbench validate
 
 # Render native marketplaces and catalog/lock.json.
@@ -100,7 +100,7 @@ ${XDG_STATE_HOME:-~/.local/state}/agent-workbench/<marketplace>/<profile>/<targe
 - `.claude-plugin/marketplace.json`
 - `catalog/lock.json`
 
-The lock report records source revisions, plugin versions, artifact roots, and skill counts. All generated files are deterministic and checked in CI.
+The lock report records source revisions, plugin versions, artifact roots, and per-component counts. Hooks and MCP definitions are inspected as inert data: validation never executes hooks or starts servers. All generated files are deterministic and checked in CI.
 
 ## Repository layout
 
@@ -128,6 +128,8 @@ agent-workbench/
 3. Preserve provenance and a notice for curated copies.
 4. Add it to the appropriate profiles.
 5. Run `make render check`.
+
+Component artifacts are validated and reported, but only `agent-skills` are currently installed into target directories. A `hooks` artifact points to the complete bundle directory containing `hooks.json` and its companion scripts; an `mcp` artifact points directly to its JSON file. Executable hooks and MCP configuration require a later explicit trust and activation design.
 
 ## Adding an agent
 

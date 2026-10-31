@@ -111,3 +111,17 @@ class ResolvedPlugin:
 class ResolvedProfile:
     profile: Profile
     plugins: tuple[ResolvedPlugin, ...]
+
+
+@dataclass(frozen=True)
+class ComponentInfo:
+    name: str
+    path: str
+
+
+@dataclass(frozen=True)
+class ArtifactInventory:
+    plugin_id: PluginId
+    kind: ArtifactKind
+    root: Path
+    components: tuple[ComponentInfo, ...]

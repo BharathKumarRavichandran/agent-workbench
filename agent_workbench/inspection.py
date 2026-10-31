@@ -64,6 +64,14 @@ def _regular_contained_file(root: Path, path: Path) -> Path:
     return path
 
 
+def load_json_object(root: Path, path: Path) -> dict[str, object]:
+    safe_path = _regular_contained_file(root, path)
+    data = json.loads(safe_path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(data, dict):
+        raise ValueError(f"JSON document must be an object: {path}")
+    return data
+
+
 def load_manifest(package: Path, agent: str) -> dict[str, object]:
     native = package / f".{agent}-plugin" / "plugin.json"
     path = native if native.exists() or native.is_symlink() else package / "plugin.json"
@@ -76,6 +84,41 @@ def load_manifest(package: Path, agent: str) -> dict[str, object]:
         if not isinstance(value, str) or not value:
             raise ValueError(f"manifest {field} must be a non-empty string: {path}")
     return data
+
+
+def validate_directory_tree(root: Path) -> None:
+    if root.is_symlink():
+        raise ValueError(f"artifact root may not be a symlink: {root}")
+    if not root.is_dir():
+        raise ValueError(f"artifact root is not a directory: {root}")
+    canonical_root = root.resolve()
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        _require_contained(canonical_root, current_path)
+        for name in directories + files:
+            child = current_path / name
+            if child.is_symlink():
+                raise ValueError(f"artifact content may not be a symlink: {child}")
+            _require_contained(canonical_root, child)
+
+
+def load_frontmatter(root: Path, path: Path) -> dict[str, str]:
+    safe_path = _regular_contained_file(root, path)
+    text = safe_path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        raise ValueError(f"frontmatter must start at byte zero: {path}")
+    closing = text.find("\n---\n", 4)
+    if closing == -1:
+        raise ValueError(f"frontmatter is not closed: {path}")
+    values: dict[str, str] = {}
+    for line in text[4:closing].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip().strip("'\"")
+        if key.strip() and value:
+            values[key.strip()] = value
+    return values
 
 
 def _require_contained(root: Path, path: Path) -> None:
