@@ -25,3 +25,18 @@ jobs:
       - run: python3 -m agent_workbench validate
       - run: python3 -m agent_workbench render --check
       - run: python3 scripts/install_skills.py --target agents --dry-run --dest "$RUNNER_TEMP/skills"
+
+  rust-plan-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --manifest-path rust/Cargo.toml -- --check
+      - run: cargo check --manifest-path rust/Cargo.toml
+      - run: cargo test --manifest-path rust/Cargo.toml
+      - run: python3 scripts/check_rust_plan_parity.py

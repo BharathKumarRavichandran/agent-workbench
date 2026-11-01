@@ -167,6 +167,12 @@ All document writes use a temporary regular file, file fsync, atomic replacement
 
 Recovery compares live documents, managed trees, and state against the journal evidence. External changes block automatic recovery and retain the evidence. Journal deletion is never a substitute for repair. The read-only `trust` command reports pending recovery without applying it. Config locking coordinates workbench processes; external editors do not honor that lock, so live revisions are checked again before config publication.
 
+## Rust migration: Candidate B facade
+
+The Rust migration uses Candidate B: a compatibility facade that takes ownership of one complete observable path at a time while Python remains the executable specification for everything else. The facade preserves the existing global-option-before-subcommand CLI shape and emits the existing operation contract, rather than exposing a second Rust-native interface that callers would later need to unlearn. Each accepted path must have a black-box Python/Rust comparison before its scope expands.
+
+The first unit is deliberately bounded to `pstack`/Hermes Agent Skills planning. It decodes catalog v2 and profile v1/v2 strictly, resolves selected `agent-skills`, validates source trees and skill frontmatter, chooses the Hermes destination, and reports only clean, unmanaged filesystem observations. It has no mutation boundary: non-plan subcommands and existing ownership state are rejected before reconciliation. Install/apply, ownership migration, non-skill components, and other profiles or targets remain in Python until later vertical slices carry their own state and side-effect parity tests. This keeps the Rust boundary honest: accepted commands are parity-backed end to end, while unsupported behavior fails explicitly instead of silently falling through to a partial implementation.
+
 ## Deferred features
 
 These should be added only when a real target needs them:
