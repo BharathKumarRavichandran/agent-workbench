@@ -130,7 +130,7 @@ fn clean_matching_adopt_and_foreign_observations_have_exit_parity() {
 }
 
 #[test]
-fn existing_state_and_non_plan_commands_fail_with_exit_two() {
+fn malformed_state_and_unknown_commands_fail_with_exit_two() {
     let fixture = Fixture::new();
     let state_file = fixture
         .state
@@ -139,14 +139,14 @@ fn existing_state_and_non_plan_commands_fail_with_exit_two() {
     fs::write(&state_file, "{}").unwrap();
     let state = fixture.command(false);
     assert_eq!(code(&state), 2);
-    assert!(String::from_utf8_lossy(&state.stderr).contains("existing ownership state"));
+    assert!(String::from_utf8_lossy(&state.stderr).contains("unsupported installation state"));
 
-    let non_plan = Command::new(env!("CARGO_BIN_EXE_agent-workbench-rs"))
-        .args(["--root", fixture.root.to_str().unwrap(), "install"])
+    let unknown = Command::new(env!("CARGO_BIN_EXE_agent-workbench-rs"))
+        .args(["--root", fixture.root.to_str().unwrap(), "trust"])
         .output()
         .unwrap();
-    assert_eq!(code(&non_plan), 2);
-    assert!(String::from_utf8_lossy(&non_plan.stderr).contains("unsupported subcommand"));
+    assert_eq!(code(&unknown), 2);
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unsupported subcommand"));
 }
 
 #[test]
