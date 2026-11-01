@@ -201,6 +201,30 @@ def document_path(roots: Mapping[ComponentKind, Path], component: ComponentKind)
     return base / ('hooks.json' if component is ComponentKind.HOOKS else 'mcp.json')
 
 
+def hook_document_references_bundle(content: bytes | None, bundle: Path) -> bool:
+    """Return whether any still-active hook command names this managed bundle."""
+    if content is None:
+        return False
+    data = parse(content)
+    hooks = data.get('hooks', {})
+    if not isinstance(hooks, dict):
+        raise ValueError('hooks must be an object')
+    path = str(bundle)
+    boundary = re.compile(
+        r'(?<![\w/])' + re.escape(path) + r'(?=$|/|[\s\'";|&<>])'
+    )
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            raise ValueError('hook events must contain arrays')
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError('hook entries must be objects')
+            command = entry.get('command')
+            if isinstance(command, str) and boundary.search(command):
+                return True
+    return False
+
+
 def plan_document(before: DocumentSnapshot, component: ComponentKind,
                   desired: tuple[DesiredSlot, ...], owned: Mapping[str, SlotState],
                   adopt: bool) -> tuple[DocumentPlan, dict[str, SlotState]]:

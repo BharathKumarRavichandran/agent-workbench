@@ -978,9 +978,28 @@ def plan_uninstall(
             file, documents, previous.slots if previous else {}, {})
         documents += (ledger,)
     operations = []
+    hook_document = next(
+        (document for document in documents
+         if document.before.path == shared_config.document_path(roots, ComponentKind.HOOKS)),
+        None,
+    )
     if previous:
         for key, entry in sorted(previous.entries.items()):
             operation = _removal(key, entry, "remove managed entry")
+            if (
+                operation
+                and isinstance(entry.resource, DirectoryCopy)
+                and hook_document is not None
+                and shared_config.hook_document_references_bundle(
+                    hook_document.after, Path(entry.destination)
+                )
+            ):
+                operation = replace(
+                    operation,
+                    kind=OperationKind.CONFLICT,
+                    reason="an active hook still references the managed bundle",
+                    diagnostic="HOOK_BUNDLE_REFERENCED",
+                )
             if operation:
                 operations.append(operation)
     plan = _make_plan(workspace, target_id, file, roots, previous, operations, {})

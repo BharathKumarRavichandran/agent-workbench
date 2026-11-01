@@ -95,6 +95,21 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual({'version': 1, 'other': True, 'hooks': {'stop': [foreign_hook], 'otherEvent': []}}, json.loads(self.hook_config.read_text()))
         self.assertEqual({'other': 42, 'mcpServers': {'foreign': foreign_mcp}}, json.loads(self.mcp_config.read_text()))
 
+    def test_uninstall_blocks_foreign_hook_referencing_managed_bundle(self):
+        apply_plan(self.trusted((C.HOOKS,)))
+        data = json.loads(self.hook_config.read_text())
+        foreign = {'command': str(self.bundle / 'hooks/stop.sh'), 'matcher': 'foreign'}
+        data['hooks']['stop'].append(foreign)
+        self.hook_config.write_text(json.dumps(data))
+
+        plan = self.uninstall()
+
+        self.assertTrue(plan.has_conflicts)
+        conflict = next(item for item in plan.operations if item.key == 'hook:sample')
+        self.assertEqual('HOOK_BUNDLE_REFERENCED', conflict.diagnostic)
+        self.assertTrue(self.bundle.exists())
+        self.assertEqual(foreign, json.loads(self.hook_config.read_text())['hooks']['stop'][-1])
+
     def test_collision_and_exact_adoption(self):
         self.mcp_config.parent.mkdir(parents=True)
         value = json.loads((self.fixture.root / 'plugins/sample/mcp.json').read_text())
