@@ -29,7 +29,7 @@ def main() -> None:
             {'type': 'command', 'command': 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/stop.sh" --hello', 'timeout': 20},
             {'type': 'prompt', 'prompt': 'Preserve exactly', 'model': 'inert'}]}]}}
         (hooks / 'hooks.json').write_text(json.dumps(native))
-        server = {'command': 'never-start-this', 'args': ['${CLAUDE_PLUGIN_ROOT}/server'],
+        server = {'command': 'never-start-this', 'args': ['portable-package'],
                   'env': {'KEEP': '${UNCHANGED}'}, 'custom': True}
         (plugin / 'mcp.json').write_text(json.dumps({'mcpServers': {'sample': server}}))
         (root / 'catalog').mkdir()

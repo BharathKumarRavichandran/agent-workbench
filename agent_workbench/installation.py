@@ -837,11 +837,8 @@ def _plan_documents(workspace: Workspace, target_id: str, roots: dict[ComponentK
                 else:
                     content = _source_content(workspace.root, source)
                     content_digest = hashlib.sha256(content).hexdigest()
-                    incompatible = 'CLAUDE_PLUGIN_ROOT' if target_id == 'cursor' else 'CURSOR_PLUGIN_ROOT'
                     data = shared_config.parse(content)
-                    encoded = shared_config.encode(data).decode()
-                    if ('${' + incompatible + '}') in encoded or ('$' + incompatible) in encoded:
-                        raise ValueError('target-incompatible plugin-root variable in MCP')
+                    shared_config.validate_standalone_mcp(data, source)
                     servers = data.get('mcpServers')
                     if not isinstance(servers, dict) or any(not isinstance(value, dict) for value in servers.values()):
                         raise ValueError('MCP requires an mcpServers object of objects')

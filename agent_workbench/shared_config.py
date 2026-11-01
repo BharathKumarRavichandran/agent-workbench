@@ -39,6 +39,58 @@ def digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
 
+def validate_standalone_mcp(data: dict[str, Any], source: Path) -> None:
+    """Reject plugin-local payload references that standalone config cannot preserve."""
+    servers = data.get('mcpServers')
+    if not isinstance(servers, dict):
+        raise ValueError('MCP document requires an mcpServers object')
+    plugin_variables = re.compile(r'\$(?:\{)?(?:CURSOR|CLAUDE)_PLUGIN_ROOT(?:\})?')
+    source_root = source.parent.resolve()
+
+    def local_payload(value: str) -> bool:
+        if plugin_variables.search(value):
+            return True
+        if value.startswith(('./', '../')):
+            return True
+        candidate = Path(value)
+        if candidate.is_absolute():
+            try:
+                candidate.resolve().relative_to(source_root)
+                return True
+            except ValueError:
+                return False
+        try:
+            return (source_root / candidate).exists()
+        except OSError:
+            return True
+
+    def contains_plugin_variable(value: object) -> bool:
+        if isinstance(value, str):
+            return bool(plugin_variables.search(value))
+        if isinstance(value, list):
+            return any(contains_plugin_variable(item) for item in value)
+        if isinstance(value, dict):
+            return any(contains_plugin_variable(item) for item in value.values())
+        return False
+
+    for server in servers.values():
+        if not isinstance(server, dict):
+            raise ValueError('MCP servers must be objects')
+        if contains_plugin_variable(server):
+            raise ValueError('plugin-root variables are unavailable in standalone MCP configuration')
+        command = server.get('command')
+        if isinstance(command, str):
+            try:
+                tokens = shlex.split(command)
+            except ValueError as error:
+                raise ValueError('MCP command cannot be parsed safely') from error
+            if any(local_payload(token) for token in tokens):
+                raise ValueError('local MCP payload cannot be preserved in standalone configuration')
+        args = server.get('args', [])
+        if isinstance(args, list) and any(isinstance(item, str) and local_payload(item) for item in args):
+            raise ValueError('local MCP payload cannot be preserved in standalone configuration')
+
+
 @dataclass(frozen=True)
 class DocumentSnapshot:
     path: Path
@@ -286,9 +338,19 @@ def hook_document_references_bundle(content: bytes | None, bundle: Path) -> bool
     hooks = data.get('hooks', {})
     if not isinstance(hooks, dict):
         raise ValueError('hooks must be an object')
-    path = str(bundle)
-    boundary = re.compile(
-        r'(?<![\w/])' + re.escape(path) + r'(?=$|/|[\s\'";|&<>])'
+    managed_root = bundle.parent
+    config_root = managed_root.parent
+    references = {str(bundle)}
+    for root in (config_root, config_root.parent):
+        try:
+            relative = bundle.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        references.add(relative)
+        references.add('./' + relative)
+    boundaries = tuple(
+        re.compile(r'(?<![\w/])' + re.escape(path) + r'(?=$|/|[\s\'";|&<>])')
+        for path in sorted(references, key=len, reverse=True)
     )
     for entries in hooks.values():
         if not isinstance(entries, list):
@@ -304,7 +366,7 @@ def hook_document_references_bundle(content: bytes | None, bundle: Path) -> bool
                         candidates.extend(re.sub(r'\\([$`])', r'\1', token) for token in shlex.split(command))
                     except ValueError:
                         pass
-                    if any(boundary.search(value) for value in candidates):
+                    if any(boundary.search(value) for boundary in boundaries for value in candidates):
                         return True
     return False
 

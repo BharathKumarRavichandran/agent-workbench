@@ -165,12 +165,23 @@ class ClaudeActivationTests(unittest.TestCase):
             actual = json.loads(plan.documents[0].after)['hooks']['Stop'][0]['hooks'][0]['command']
             self.assertEqual(str(self.bundle / 'hooks/stop.sh'), shlex.split(actual)[1])
         source = self.fixture.root / 'plugins/sample/mcp.json'
-        for target, variable in (('claude', 'CURSOR_PLUGIN_ROOT'), ('cursor', 'CLAUDE_PLUGIN_ROOT')):
-            source.write_bytes(shared_config.encode({'mcpServers': {'sample': {'command': '${' + variable + '}/server'}}}))
-            with self.assertRaisesRegex(ValueError, 'target-incompatible'):
-                plan_install(self.workspace, target, self.state, components=(C.MCP,), project_root=self.project)
+        (source.parent / 'server.js').write_text('payload')
+        for target, value in (
+            ('claude', '${CURSOR_PLUGIN_ROOT}/server'),
+            ('claude', '${CLAUDE_PLUGIN_ROOT}/server'),
+            ('cursor', '${CLAUDE_PLUGIN_ROOT}/server'),
+            ('cursor', '${CURSOR_PLUGIN_ROOT}/server'),
+            ('claude', './server.js'),
+            ('cursor', 'server.js'),
+        ):
+            source.write_bytes(shared_config.encode({'mcpServers': {
+                'sample': {'command': 'node', 'args': [value]}}}))
+            with self.subTest(target=target, value=value), self.assertRaisesRegex(
+                    ValueError, 'standalone MCP|local MCP'):
+                plan_install(self.workspace, target, self.state, components=(C.MCP,),
+                             project_root=self.project)
             self.assertFalse(self.project.exists())
-        server = {'command': 'node', 'args': ['${CLAUDE_PLUGIN_ROOT}/server'], 'env': {'V': '${OTHER}'}, 'custom': True}
+        server = {'command': 'node', 'args': ['package-name'], 'env': {'V': '${OTHER}'}, 'custom': True}
         source.write_bytes(shared_config.encode({'mcpServers': {'sample': server}}))
         plan = self.trusted((C.MCP,))
         self.assertEqual(server, json.loads(plan.documents[0].after)['mcpServers']['sample'])
@@ -429,4 +440,20 @@ class ClaudeActivationTests(unittest.TestCase):
         data['hooks']['Stop'].append(group)
         self.hook_config.write_bytes(shared_config.encode(data))
         self.assertIn('HOOK_BUNDLE_REFERENCED', {op.diagnostic for op in self.uninstall().all_operations})
+        self.assertTrue(self.bundle.exists())
+
+    def test_foreign_project_relative_bundle_reference_blocks_removal(self):
+        apply_plan(self.trusted((C.HOOKS,)))
+        data = json.loads(self.hook_config.read_text())
+        data['hooks']['Stop'].append({'matcher': 'foreign', 'hooks': [{
+            'type': 'command',
+            'command': 'sh .claude/.agent-workbench-hooks/sample/hooks/stop.sh',
+        }]})
+        self.hook_config.write_bytes(shared_config.encode(data))
+
+        plan = self.uninstall()
+
+        self.assertIn('HOOK_BUNDLE_REFERENCED', {
+            operation.diagnostic for operation in plan.all_operations
+        })
         self.assertTrue(self.bundle.exists())
