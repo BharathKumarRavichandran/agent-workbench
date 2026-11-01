@@ -6,6 +6,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+mod lifecycle;
+mod state;
+
 pub type Result<T> = std::result::Result<T, String>;
 
 fn deserialize_optional_non_null<'de, D, T>(
@@ -137,9 +140,10 @@ pub struct Cli {
     pub state_dir: PathBuf,
     pub adopt: bool,
     pub json: bool,
+    action: lifecycle::Action,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Operation {
     kind: &'static str,
@@ -153,6 +157,8 @@ pub struct Operation {
     diagnostic: Option<String>,
     trust_token: Option<String>,
     trust_required: bool,
+    #[serde(skip)]
+    expected_link: Option<PathBuf>,
 }
 
 pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
@@ -170,11 +176,17 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         }
         token = args.next().ok_or_else(usage)?;
     }
-    if token != "plan" {
-        return Err(format!(
-            "unsupported subcommand for Rust parity unit: {token}"
-        ));
-    }
+    let action = match token.as_str() {
+        "plan" => lifecycle::Action::Plan,
+        "status" => lifecycle::Action::Status,
+        "install" => lifecycle::Action::Install,
+        "uninstall" => lifecycle::Action::Uninstall,
+        _ => {
+            return Err(format!(
+                "unsupported subcommand for Rust parity unit: {token}"
+            ))
+        }
+    };
 
     let mut target = None;
     let mut destination = None;
@@ -193,10 +205,12 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
             "--state-dir" => {
                 state_dir = PathBuf::from(args.next().ok_or("--state-dir requires a value")?)
             }
-            "--component" => components.push(args.next().ok_or("--component requires a value")?),
-            "--adopt" => adopt = true,
+            "--component" if action != lifecycle::Action::Uninstall => {
+                components.push(args.next().ok_or("--component requires a value")?)
+            }
+            "--adopt" if action != lifecycle::Action::Uninstall => adopt = true,
             "--json" => json = true,
-            _ => return Err(format!("unsupported plan option: {option}")),
+            _ => return Err(format!("unsupported {} option: {option}", token)),
         }
     }
     let target = target.ok_or("--target is required")?;
@@ -221,11 +235,12 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         state_dir,
         adopt,
         json,
+        action,
     })
 }
 
 fn usage() -> String {
-    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] plan --target hermes [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] --json".into()
+    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] {plan,status,install,uninstall} --target hermes [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] --json".into()
 }
 
 pub fn help_requested(args: &[String]) -> bool {
@@ -475,136 +490,6 @@ impl<'de> Visitor<'de> for DuplicateVisitor {
         }
         Ok(())
     }
-}
-
-pub fn plan(cli: &Cli) -> Result<Vec<Operation>> {
-    let root = canonicalize_existing(&cli.root, "repository root")?;
-    let catalog = decode_catalog(&root.join("catalog/plugins.json"))?;
-    let profile_path = root.join("profiles").join(format!("{}.json", cli.profile));
-    let profile = decode_profile(&profile_path)?;
-    if profile.id != cli.profile {
-        return Err("profile id must match profile filename".into());
-    }
-    let target = profile
-        .targets
-        .iter()
-        .find(|target| target.id == "hermes")
-        .ok_or_else(|| format!("target hermes is not enabled by profile {}", profile.id))?;
-    let requested = target
-        .components
-        .clone()
-        .unwrap_or_else(|| vec![ComponentKind::Skills]);
-    if requested != [ComponentKind::Skills] {
-        return Err("Rust parity unit supports only the skills component".into());
-    }
-
-    let state_file = canonicalize_missing(&cli.state_dir)?.join(format!(
-        "agent-workbench/{}/{}/hermes.json",
-        catalog.marketplace.id, profile.id
-    ));
-    match fs::symlink_metadata(&state_file) {
-        Ok(_) => {
-            return Err(format!(
-                "existing ownership state is outside the first Rust parity unit: {}",
-                state_file.display()
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("{}: {error}", state_file.display())),
-    }
-
-    let destination =
-        resolve_destination(cli.destination.as_deref(), target.destination.as_deref())?;
-    reject_destination_root_symlink(&destination)?;
-    let source_by_id: BTreeMap<_, _> = catalog
-        .sources
-        .iter()
-        .map(|source| (source.id.as_str(), source))
-        .collect();
-    if source_by_id.len() != catalog.sources.len() {
-        return Err("source ids must be unique".into());
-    }
-    let known_plugins: BTreeSet<_> = catalog
-        .plugins
-        .iter()
-        .map(|plugin| plugin.id.as_str())
-        .collect();
-    let excluded: BTreeSet<_> = profile.plugins.exclude.iter().map(String::as_str).collect();
-    if !excluded.is_subset(&known_plugins) {
-        return Err("profile excludes unknown plugins".into());
-    }
-    let selected: BTreeSet<&str> = if profile.plugins.include == ["*"] {
-        known_plugins.clone()
-    } else {
-        let selected: BTreeSet<_> = profile.plugins.include.iter().map(String::as_str).collect();
-        if !selected.is_subset(&known_plugins) {
-            return Err("profile includes unknown plugins".into());
-        }
-        selected
-    };
-
-    let mut skills = Vec::new();
-    let mut names = BTreeSet::new();
-    for plugin in &catalog.plugins {
-        if !selected.contains(plugin.id.as_str()) || excluded.contains(plugin.id.as_str()) {
-            continue;
-        }
-        let source = source_by_id.get(plugin.source.as_str()).ok_or_else(|| {
-            format!(
-                "plugin {} references unknown source {}",
-                plugin.id, plugin.source
-            )
-        })?;
-        let artifact = plugin
-            .artifacts
-            .get("agent-skills")
-            .ok_or_else(|| format!("plugin {} has no agent-skills artifact", plugin.id))?;
-        let source_root = resolve_repo_path(&root, &source.path)?;
-        let artifact_root = resolve_repo_path(&source_root, &artifact.path)?;
-        for (name, skill_root) in discover_skills(&artifact_root)? {
-            if !names.insert(name.clone()) {
-                return Err(format!("duplicate exported skill name: {name}"));
-            }
-            skills.push((name, skill_root));
-        }
-    }
-    skills.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut operations = Vec::with_capacity(skills.len());
-    for (name, source) in skills {
-        let path = destination.join(&name);
-        let (kind, reason) = match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ("create", "destination is absent")
-            }
-            Err(error) => return Err(format!("{}: {error}", path.display())),
-            Ok(metadata) if metadata.file_type().is_symlink() && same_link(&path, &source)? => {
-                if cli.adopt {
-                    ("adopt", "matching unmanaged resource explicitly adopted")
-                } else {
-                    (
-                        "conflict",
-                        "matching resource is not recorded as owned; use --adopt",
-                    )
-                }
-            }
-            Ok(_) => ("conflict", "destination is a foreign file or link"),
-        };
-        operations.push(Operation {
-            kind,
-            key: format!("skill:{name}"),
-            destination: path.to_string_lossy().into_owned(),
-            source: source.to_string_lossy().into_owned(),
-            reason,
-            component: "skills",
-            resource_kind: "directory-symlink",
-            digest: None,
-            diagnostic: None,
-            trust_token: None,
-            trust_required: false,
-        });
-    }
-    Ok(operations)
 }
 
 fn resolve_destination(explicit: Option<&Path>, profile: Option<&str>) -> Result<PathBuf> {
@@ -925,6 +810,26 @@ pub fn operations_json(operations: &[Operation]) -> Result<String> {
     serde_json::to_string_pretty(operations).map_err(|error| error.to_string())
 }
 
+pub struct CommandOutput {
+    pub stdout: String,
+    pub exit_code: u8,
+}
+
+pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
+    if help_requested(&args) {
+        return Ok(CommandOutput {
+            stdout: usage_text() + "\n",
+            exit_code: 0,
+        });
+    }
+    let cli = parse_cli(args)?;
+    let (operations, conflicts) = lifecycle::run(&cli)?;
+    Ok(CommandOutput {
+        stdout: operations_json(&operations)? + "\n",
+        exit_code: if conflicts { 1 } else { 0 },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,6 +854,7 @@ mod tests {
             diagnostic: None,
             trust_token: None,
             trust_required: false,
+            expected_link: None,
         };
         let value = operations_json(&[operation]).unwrap();
         let expected = [
