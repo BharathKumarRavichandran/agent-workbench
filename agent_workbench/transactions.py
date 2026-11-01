@@ -1,4 +1,4 @@
-"""One Cursor document lock and an authenticated rollback journal across paths and state.
+"""One target resource lock and an authenticated rollback journal across paths and state.
 
 The journal is durable before any activation changes. A retry by its owning
 profile rolls back to the complete prior state. Other profiles fail closed until
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from .installation import InstallPlan, InstallOperation, _DestinationRoot
 
 from . import bundles, shared_config
+from .adapters.activation import ACTIVATION_POLICIES
 from .model import ComponentKind, DirectoryCopy, DirectorySymlink
 
 
@@ -67,16 +68,16 @@ def _authenticate(data: dict[str, object], file: Path) -> None:
     try:
         key = _journal_key(file)
     except (OSError, ValueError) as error:
-        raise ValueError('unauthenticated Cursor recovery journal; journal retained') from error
+        raise ValueError('unauthenticated recovery journal; journal retained') from error
     expected = hmac.new(key, _canonical(data), hashlib.sha256).hexdigest()
     if not isinstance(signature, str) or not re.fullmatch('[0-9a-f]{64}', signature) or not hmac.compare_digest(signature, expected):
-        raise ValueError('unauthenticated Cursor recovery journal; journal retained')
+        raise ValueError('unauthenticated recovery journal; journal retained')
 
 
 def _journal_record(saved: bytes, file: Path) -> dict[str, object]:
     data = shared_config.parse(saved)
     if data.get('version') != 1 or data.get('stateFile') != str(file):
-        raise ValueError('pending Cursor recovery belongs to another profile; run status for its owning profile')
+        raise ValueError('pending recovery belongs to another profile; run status for its owning profile')
     _authenticate(data, file)
     return data
 
@@ -254,17 +255,17 @@ def _discard_path_evidence(root: _DestinationRoot, operation: InstallOperation,
     os.fsync(root.fd)
 
 
-def _journal_path(roots: dict[ComponentKind, Path]) -> Path:
-    return roots[ComponentKind.HOOKS].parent / '.agent-workbench-transaction.json'
+def _journal_path(roots: dict[ComponentKind, Path], target_id: str = "cursor") -> Path:
+    return roots[ComponentKind.HOOKS].parent / ACTIVATION_POLICIES[target_id].journal_name
 
 
 @contextmanager
-def _document_lock(base: Path, create: bool) -> Iterator[None]:
+def _document_lock(base: Path, create: bool, target_id: str = "cursor") -> Iterator[None]:
     from .installation import _DestinationRoot, DestinationSnapshot, _destination_anchor, _destination_identity
     try:
         anchor, identity = _destination_anchor(base)
     except OSError:
-        raise ValueError('unsafe Cursor config directory')
+        raise ValueError('unsafe target config directory')
     if not create and not base.exists():
         # There can be no document or journal yet. Apply will create and lock it.
         yield
@@ -272,7 +273,7 @@ def _document_lock(base: Path, create: bool) -> Iterator[None]:
     snapshot = DestinationSnapshot(base, _destination_identity(base), anchor, identity)
     with _DestinationRoot(snapshot, create=create) as root:
         import fcntl
-        fd = os.open('.agent-workbench.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=root.fd)
+        fd = os.open(ACTIVATION_POLICIES[target_id].lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=root.fd)
         try:
             import stat
             if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -280,7 +281,7 @@ def _document_lock(base: Path, create: bool) -> Iterator[None]:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
-                raise FileExistsError(f'Cursor document is locked by another operation: {base}') from error
+                raise FileExistsError(f'target document is locked by another operation: {base}') from error
             root.verify()
             yield
             root.verify()
@@ -288,8 +289,8 @@ def _document_lock(base: Path, create: bool) -> Iterator[None]:
             os.close(fd)
 
 
-def recover(file: Path, roots: dict[ComponentKind, Path]) -> None:
-    journal = _journal_path(roots)
+def recover(file: Path, roots: dict[ComponentKind, Path], target_id: str = "cursor") -> None:
+    journal = _journal_path(roots, target_id)
     saved = shared_config.snapshot(journal).content
     if saved is None:
         return
@@ -297,8 +298,8 @@ def recover(file: Path, roots: dict[ComponentKind, Path]) -> None:
     # Read and authenticate again under both locks before any restoration.
     _journal_record(saved, file)
     from .installation import _state_lock
-    with _state_lock(file), _document_lock(journal.parent, False):
-        _recover_locked(file, roots)
+    with _state_lock(file), _document_lock(journal.parent, False, target_id):
+        _recover_locked(file, roots, target_id)
 
 
 def _document_quarantines(item: dict[str, object]) -> tuple[str, ...]:
@@ -382,10 +383,57 @@ def _prepare_document_recovery(item: dict[str, object], current: shared_config.D
     return current
 
 
-def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
-    from .installation import _DestinationRoot, DestinationSnapshot, InstallOperation, OperationKind, _destination_anchor, _destination_identity
-    journal = _journal_path(roots)
+class _RecoveryParents:
+    """Hold and revalidate every authenticated document/resource parent."""
+    def __init__(self) -> None:
+        self.fds = {}
+        self.identities = {}
+
+    def open(self, path: Path, expected: tuple[int, int] | None) -> None:
+        fd = bundles.open_directory(path)
+        info = os.fstat(fd)
+        identity = (info.st_dev, info.st_ino)
+        if expected is not None and identity != expected:
+            os.close(fd)
+            raise ValueError('recovery parent identity changed; journal retained')
+        if path in self.fds:
+            os.close(fd)
+            if self.identities[path] != identity:
+                raise ValueError('parent identity changed; journal retained')
+            return
+        self.fds[path] = fd
+        self.identities[path] = identity
+
+    def verify(self) -> None:
+        for path, identity in self.identities.items():
+            fd = bundles.open_directory(path)
+            try:
+                info = os.fstat(fd)
+                if (info.st_dev, info.st_ino) != identity:
+                    raise ValueError('recovery parent identity changed; journal retained')
+            finally:
+                os.close(fd)
+
+    def get(self, path: Path) -> int:
+        self.verify()
+        return self.fds[path]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        for fd in self.fds.values():
+            os.close(fd)
+
+
+def _recover_locked(file: Path, roots: dict[ComponentKind, Path], target_id: str = "cursor") -> None:
+    from .installation import _DestinationRoot, DestinationSnapshot, InstallOperation, OperationKind
+    journal = _journal_path(roots, target_id)
     fd = bundles.open_directory(journal.parent)
+    parents = _RecoveryParents()
     try:
         saved = shared_config.snapshot(journal, fd).content
         if saved is None:
@@ -404,16 +452,35 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
             os.close(state_fd)
         if state_snapshot.content not in (state_before, state_after) and not (state_snapshot.content is None and state_evidence):
             raise ValueError('recovery blocked by externally modified ownership state; journal retained')
-        allowed_documents = {str(shared_config.document_path(roots, component)) for component in (ComponentKind.HOOKS, ComponentKind.MCP)}
-        allowed_documents.add(str(journal.parent / '.agent-workbench-owners.json'))
+        allowed_documents = {str(shared_config.document_path(roots, component, target_id)) for component in (ComponentKind.HOOKS, ComponentKind.MCP) if component in roots}
+        allowed_documents.add(str(journal.parent / ACTIVATION_POLICIES[target_id].ledger_name))
         documents = data['documents']
+        authorized_parents = {Path(path).parent for path in allowed_documents} | set(roots.values()) | {file.parent}
+        evidence = data.get('parents')
+        if evidence is None and target_id != 'cursor':
+            raise ValueError('missing authenticated parent identities; journal retained')
+        for path, identity in (evidence or {}).items():
+            if Path(path) not in authorized_parents:
+                raise ValueError('journal parent is outside adapter-authorized roots')
+            parents.open(Path(path), tuple(identity))
+        required = ({Path(item['path']).parent for item in documents}
+                    | {Path(item['path']).parent for item in data['paths']} | {file.parent, journal.parent})
+        if evidence is not None and not required <= set(parents.fds):
+            raise ValueError('missing authenticated parent identities; journal retained')
+        for path in required:
+            if path not in parents.fds:
+                parents.open(path, None)  # Legacy authenticated Cursor journals.
+        journal_info = os.fstat(fd)
+        if (journal_info.st_dev, journal_info.st_ino) != parents.identities[journal.parent]:
+            raise ValueError('recovery journal parent changed; journal retained')
         document_snapshots = {}
         for item in documents:
             path = Path(item['path'])
             if str(path) not in allowed_documents:
                 raise ValueError('journal document is outside adapter-authorized paths')
-            quarantined = _check_document_quarantines(item, fd)
-            captured = shared_config.snapshot(path, fd)
+            parent_fd = parents.get(path.parent)
+            quarantined = _check_document_quarantines(item, parent_fd)
+            captured = shared_config.snapshot(path, parent_fd)
             document_snapshots[str(path)] = captured
             current = captured.content
             if current not in [_unpack(item[key]) for key in ('before', 'removed', 'after')] and not (current is None and quarantined):
@@ -427,8 +494,8 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
                     raise ValueError('journal path is outside adapter-authorized roots')
                 if component is ComponentKind.MCP or (component is ComponentKind.HOOKS and item['resource'] != 'directory-copy'):
                     raise ValueError('journal resource disagrees with component')
-                anchor, identity = _destination_anchor(path.parent)
-                root = stack.enter_context(_DestinationRoot(DestinationSnapshot(path.parent, _destination_identity(path.parent), anchor, identity), True))
+                identity = parents.identities[path.parent]
+                root = stack.enter_context(_DestinationRoot(DestinationSnapshot(path.parent, identity, path.parent, identity), False))
                 from .model import FileCopy
                 resource = (DirectoryCopy('') if item['resource'] == 'directory-copy' else
                             DirectorySymlink() if item['resource'] == 'directory-symlink' else FileCopy(''))
@@ -452,17 +519,19 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
             # Deactivate changing slots before undoing bundle mutations. Restore
             # old slots only after every prior bundle is back in place.
             for item in documents:
+                fd_document = parents.get(Path(item['path']).parent)
                 current = document_snapshots[item['path']]
                 # Restore an interrupted document durably before discarding
                 # its capture evidence. Keep hooks deactivated during rollback.
-                current = _prepare_document_recovery(item, current, fd)
+                current = _prepare_document_recovery(item, current, fd_document)
                 document_snapshots[item['path']] = current
                 if current.content != _unpack(item['removed']):
                     document_snapshots[item['path']] = shared_config.compare_replace_document(
-                        current, _unpack(item['removed']), fd, item['quarantine'] + '-recover-remove')
-                elif shared_config.snapshot(current.path, fd) != current:
+                        current, _unpack(item['removed']), fd_document, item['quarantine'] + '-recover-remove')
+                elif shared_config.snapshot(current.path, fd_document) != current:
                     raise ValueError('recovery blocked by modified document; journal retained')
             for root, operation, item, current, revision in reversed(records):
+                parents.verify()
                 _restore_path(root, operation, _PathRestore(item['before'], current,
                               (item['before'], item['after'], None), revision), item['quarantine'] + '-rollback')
                 quarantine = item['quarantine']
@@ -470,12 +539,13 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
                     raise ValueError('invalid journal quarantine')
                 _discard_path_evidence(root, operation, item)
             for item in documents:
+                fd_document = parents.get(Path(item['path']).parent)
                 current = document_snapshots[item['path']]
                 if current.content != _unpack(item['before']):
-                    shared_config.compare_replace_document(current, _unpack(item['before']), fd,
+                    shared_config.compare_replace_document(current, _unpack(item['before']), fd_document,
                                                            item['quarantine'] + '-recover-before')
             # The state path comes from the current API request, never the journal.
-            state_fd = bundles.open_directory(file.parent)
+            state_fd = os.dup(parents.get(file.parent))
             try:
                 if shared_config.snapshot(file, state_fd) != state_snapshot:
                     raise ValueError('recovery blocked by externally modified ownership state; journal retained')
@@ -485,9 +555,11 @@ def _recover_locked(file: Path, roots: dict[ComponentKind, Path]) -> None:
                         state_item['quarantine'] + '-recover-before')
             finally:
                 os.close(state_fd)
+            parents.verify()
             os.unlink(journal.name, dir_fd=fd)
             os.fsync(fd)
     finally:
+        parents.close()
         os.close(fd)
 
 
@@ -498,17 +570,24 @@ def apply_lifecycle(plan: InstallPlan, uninstall: bool) -> None:
     roots = {component: Path(root) for component, root in plan.next_state.destination_roots.items()}
     if plan.previous_state:
         roots.update({component: Path(root) for component, root in plan.previous_state.destination_roots.items()})
-    roots[ComponentKind.HOOKS] = plan.documents[0].before.path.parent / '.agent-workbench-hooks'
-    journal = _journal_path(roots)
-    with _document_lock(journal.parent, True), ExitStack() as stack:
-        _recover_locked(plan.state_file, roots)
+    target_id = str(plan.target)
+    journal = _journal_path(roots, target_id)
+    with _document_lock(journal.parent, True, target_id), ExitStack() as stack:
+        _recover_locked(plan.state_file, roots, target_id)
         install._current_entries(plan)
-        needed = {operation.destination.parent for operation in plan.operations} | {journal.parent}
+        needed = ({operation.destination.parent for operation in plan.operations}
+                  | {document.before.path.parent for document in plan.documents} | {journal.parent})
+        if target_id == 'claude' and ComponentKind.MCP in roots:
+            needed.add(roots[ComponentKind.MCP])
         opened = {snapshot.destination: stack.enter_context(install._DestinationRoot(snapshot, True))
                   for snapshot in plan.roots if snapshot.destination in needed}
         doc_root = opened[journal.parent]
+        parents = stack.enter_context(_RecoveryParents())
+        for path, root in opened.items():
+            parents.open(path, root.identity)
+        parents.open(plan.state_file.parent, None)
         for document in plan.documents:
-            if shared_config.snapshot(document.before.path, doc_root.fd) != document.before:
+            if shared_config.snapshot(document.before.path, opened[document.before.path.parent].fd) != document.before:
                 raise ValueError('shared document changed since planning')
         for item in plan.executable_sources:
             if item.state.component is ComponentKind.HOOKS:
@@ -549,6 +628,10 @@ def apply_lifecycle(plan: InstallPlan, uninstall: bool) -> None:
             paths.append({'path': str(operation.destination), 'component': operation.component.value,
                           'resource': operation.resource.kind, 'before': before, 'after': after,
                           'quarantine': '.agent-workbench-quarantine-' + os.urandom(8).hex()})
+        parents.verify()
+        for document in plan.documents:
+            if shared_config.snapshot(document.before.path, opened[document.before.path.parent].fd) != document.before:
+                raise ValueError('shared document changed since planning')
         from .trust import record_proof
         signed_entries = {key: replace(item, trust_proof=record_proof(item, plan.state_file, True))
                           if isinstance(item.resource, DirectoryCopy) else item
@@ -557,6 +640,7 @@ def apply_lifecycle(plan: InstallPlan, uninstall: bool) -> None:
                         for key, item in plan.next_state.slots.items()}
         plan = replace(plan, next_state=replace(plan.next_state, entries=signed_entries, slots=signed_slots))
         record = {'version': 1, 'stateFile': str(plan.state_file),
+                  'parents': {str(path): list(identity) for path, identity in parents.identities.items()},
                   'stateBefore': _pack(plan.state_file.read_bytes() if plan.state_file.exists() else None),
                   'stateAfter': _pack(None if uninstall else shared_config.encode(plan.next_state.as_dict())),
                   'documents': [{'path': str(item.before.path), 'before': _pack(item.before.content),
@@ -564,14 +648,22 @@ def apply_lifecycle(plan: InstallPlan, uninstall: bool) -> None:
                                  'quarantine': '.agent-workbench-document-' + os.urandom(8).hex()} for item in plan.documents],
                   'paths': paths}
         record['mac'] = hmac.new(_journal_key(plan.state_file, True), _canonical(record), hashlib.sha256).hexdigest()
+        parents.verify()
         shared_config.replace_document(journal, shared_config.encode(record), doc_root.fd)
         try:
             document_snapshots = {str(document.before.path): document.before for document in plan.documents}
             for document, item in zip(plan.documents, record['documents']):
+                for root in opened.values():
+                    root.verify()
                 if document.removed != document.before.content:
                     document_snapshots[str(document.before.path)] = shared_config.compare_replace_document(
-                        document.before, document.removed, doc_root.fd, item['quarantine'] + '-remove')
+                        document.before, document.removed, opened[document.before.path.parent].fd, item['quarantine'] + '-remove')
             for operation, item in zip(plan.operations, paths):
+                parents.verify()
+                for document in plan.documents:
+                    current = document_snapshots[str(document.before.path)]
+                    if shared_config.snapshot(current.path, opened[current.path.parent].fd) != current:
+                        raise ValueError('shared document changed during transaction')
                 root = opened[operation.destination.parent]
                 root.verify()
                 if operation.kind in {install.OperationKind.KEEP, install.OperationKind.ADOPT}:
@@ -588,15 +680,18 @@ def apply_lifecycle(plan: InstallPlan, uninstall: bool) -> None:
                 if operation.kind is not install.OperationKind.REMOVE_OWNED and not opened[operation.destination.parent].same_resource(operation):
                     raise install._changed(operation)
             for document, item in zip(plan.documents, record['documents']):
-                doc_root.verify()
+                parents.verify()
+                parent = opened[document.before.path.parent]
+                parent.verify()
                 current = document_snapshots[str(document.before.path)]
-                if shared_config.snapshot(current.path, doc_root.fd) != current:
+                if shared_config.snapshot(current.path, parent.fd) != current:
                     raise ValueError('shared document changed during transaction')
                 if document.after != document.removed:
-                    shared_config.compare_replace_document(current, document.after, doc_root.fd, item['quarantine'] + '-activate')
+                    shared_config.compare_replace_document(current, document.after, parent.fd, item['quarantine'] + '-activate')
             for root in opened.values():
                 root.verify()
                 os.fsync(root.fd)
+            parents.verify()
             if uninstall:
                 install.remove_state(plan.state_file)
             else:
@@ -607,5 +702,5 @@ def apply_lifecycle(plan: InstallPlan, uninstall: bool) -> None:
         except Exception:
             # If repair also fails, the durable intent and backups survive. The
             # next status/plan/apply must repair before it can plan new work.
-            _recover_locked(plan.state_file, roots)
+            _recover_locked(plan.state_file, roots, target_id)
             raise

@@ -17,7 +17,9 @@ BUILTIN_CAPABILITIES: Mapping[TargetId, Mapping[ComponentKind, Representation]] 
             ComponentKind.HOOKS: Representation.HOOK_BUNDLE,
             ComponentKind.MCP: Representation.MCP_DOCUMENT} if target == "cursor" else {}),
         **({ComponentKind.AGENTS: Representation.MARKDOWN_AGENT,
-            ComponentKind.COMMANDS: Representation.LEGACY_COMMAND} if target == "claude" else {}),
+            ComponentKind.COMMANDS: Representation.LEGACY_COMMAND,
+            ComponentKind.HOOKS: Representation.CLAUDE_HOOK_BUNDLE,
+            ComponentKind.MCP: Representation.MCP_DOCUMENT} if target == "claude" else {}),
     }
     for target in ("agents", "cursor", "claude", "codex", "hermes", "grok")
 }
@@ -59,13 +61,13 @@ def project_paths(
     prefixes = {ComponentKind.SKILLS: "skill", ComponentKind.AGENTS: "agent",
                 ComponentKind.RULES: "rule", ComponentKind.COMMANDS: "command"}
     for export in exports:
-        if export.component in {ComponentKind.HOOKS, ComponentKind.MCP}:
-            continue
         if export.component not in components or export.component not in supported or export.component not in roots:
             continue
         if export.representation is not supported[export.component]:
             conflicts += (ProjectionConflict(export.component, "REPRESENTATION_UNSUPPORTED",
                           f"{target} does not support {export.representation.value}"),)
+            continue
+        if export.component in {ComponentKind.HOOKS, ComponentKind.MCP}:
             continue
         name = export.name if export.component is ComponentKind.SKILLS else export.source.name
         paths.append(ProjectedPath(f"{prefixes[export.component]}:{name}", export,

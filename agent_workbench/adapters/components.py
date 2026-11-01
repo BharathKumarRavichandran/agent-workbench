@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 
 from ..inspection import discover_skills, load_frontmatter, load_json_object, validate_directory_tree
-from ..model import ArtifactInventory, ArtifactKind, ComponentInfo, ResolvedPlugin
+from ..model import ArtifactInventory, ArtifactKind, ComponentInfo, ResolvedPlugin, Representation
 from .base import ArtifactInspector
 
 
@@ -77,6 +77,48 @@ class DocumentDirectoryInspector:
         return ArtifactInventory(plugin.plugin.id, self.kind, root, tuple(components))
 
 
+def classify_hooks(data: dict, alias: str = "hooks") -> Representation:
+    hooks = data.get('hooks')
+    if not isinstance(hooks, dict):
+        raise ValueError('hooks.json requires a hooks object')
+    shapes = set()
+    for event, entries in hooks.items():
+        if not event or not isinstance(entries, list):
+            raise ValueError('hook events must map to arrays')
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError('hook entries must be objects')
+            if 'hooks' in entry and 'command' not in entry:
+                if not isinstance(entry['hooks'], list) or ('matcher' in entry and not isinstance(entry['matcher'], str)):
+                    raise ValueError('Claude matcher groups require a hooks array and optional string matcher')
+                for handler in entry['hooks']:
+                    if not isinstance(handler, dict) or not isinstance(handler.get('type'), str):
+                        raise ValueError('Claude handlers require type')
+                    if handler['type'] == 'command' and (not isinstance(handler.get('command'), str) or not handler['command']):
+                        raise ValueError('Claude command handler requires command')
+                shapes.add(Representation.CLAUDE_HOOK_BUNDLE)
+            elif 'command' in entry and 'hooks' not in entry:
+                if not isinstance(entry['command'], str) or not entry['command']:
+                    raise ValueError('Cursor hook requires command')
+                shapes.add(Representation.HOOK_BUNDLE)
+            else:
+                raise ValueError('ambiguous hook entry representation')
+    expected = {'cursor-hooks': Representation.HOOK_BUNDLE,
+                'claude-hooks': Representation.CLAUDE_HOOK_BUNDLE}.get(alias)
+    if not shapes:
+        if expected is None and 'version' not in data:
+            raise ValueError('empty hooks require an explicit representation alias or Cursor version')
+        shapes.add(expected or Representation.HOOK_BUNDLE)
+    if len(shapes) != 1 or (expected is not None and expected not in shapes):
+        raise ValueError('mixed or incompatible hook representations')
+    representation = next(iter(shapes))
+    if representation is Representation.CLAUDE_HOOK_BUNDLE and 'version' in data:
+        raise ValueError('Claude hooks do not have a Cursor version field')
+    if representation is Representation.HOOK_BUNDLE and (type(data.get('version', 1)) is not int or data.get('version', 1) != 1):
+        raise ValueError('Cursor hooks require version 1')
+    return representation
+
+
 @dataclass(frozen=True)
 class HooksInspector:
     kind: ArtifactKind = ArtifactKind("hooks")
@@ -88,6 +130,7 @@ class HooksInspector:
         hooks = data.get("hooks")
         if not isinstance(hooks, dict):
             raise ValueError(f"hooks.json requires a hooks object: {root / 'hooks.json'}")
+        representation = classify_hooks(data, str(self.kind))
         components: list[ComponentInfo] = []
         for event, entries in sorted(hooks.items()):
             if not isinstance(event, str) or not isinstance(entries, list):
@@ -96,7 +139,7 @@ class HooksInspector:
                 if not isinstance(entry, dict):
                     raise ValueError(f"hook entries must be objects: {root / 'hooks.json'}")
                 components.append(ComponentInfo(f"{event}:{index}", "hooks.json"))
-        return ArtifactInventory(plugin.plugin.id, self.kind, root, tuple(components))
+        return ArtifactInventory(plugin.plugin.id, self.kind, root, tuple(components), representation)
 
 
 @dataclass(frozen=True)
@@ -125,6 +168,8 @@ def built_in_component_inspectors() -> tuple[ArtifactInspector, ...]:
         DocumentDirectoryInspector(ArtifactKind("agents"), ".md", require_name=True, require_description=True),
         DocumentDirectoryInspector(ArtifactKind("rules"), ".mdc", require_description=True),
         HooksInspector(),
+        HooksInspector(ArtifactKind("cursor-hooks")),
+        HooksInspector(ArtifactKind("claude-hooks")),
         McpInspector(),
         DocumentDirectoryInspector(ArtifactKind("commands"), ".md"),
     )

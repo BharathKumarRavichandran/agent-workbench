@@ -28,7 +28,7 @@ immutable domain model
        safe executor + state
 ```
 
-The central catalog describes sources and artifacts such as `cursor-plugin`, `claude-plugin`, `agent-skills`, `agents`, `rules`, `hooks`, `mcp`, and `commands`. Registered inspectors validate and inventory each artifact independently from rendering and installation. Adding another skill-directory agent does not require changing every plugin.
+The central catalog describes sources and artifacts such as `cursor-plugin`, `claude-plugin`, `agent-skills`, `agents`, `rules`, `hooks`, `cursor-hooks`, `claude-hooks`, `mcp`, and `commands`. Registered inspectors validate and inventory each artifact independently from rendering and installation. Adding another skill-directory agent does not require changing every plugin.
 
 ## Clone and verify
 
@@ -91,7 +91,7 @@ The table describes current artifact formats. The workbench copies supported doc
 
 For Cursor and Claude, `--project-root /path/to/project` selects `.cursor` or `.claude` under that project. Each component uses its own directory: `skills`, `agents`, `rules`, or `commands`. Without a project root, supported components use the target's home directory. Cursor rules require `--project-root` and otherwise produce `PROJECT_ROOT_REQUIRED`. An explicit `--destination` overrides only the skills directory, including when a project root is present.
 
-Cursor supports explicit hook and MCP activation. Other targets report `COMPONENT_UNSUPPORTED` for these Cursor-native formats. Inspection, planning, and installation never execute hooks or start servers.
+Cursor and Claude support explicit activation of their exact hook formats and MCP definitions. There is no format conversion; requesting the other target’s hook representation returns `REPRESENTATION_UNSUPPORTED`. Other targets report `COMPONENT_UNSUPPORTED`. Inspection, planning, and installation never execute hooks or start servers.
 
 To activate Cursor hooks and MCP for a project, first inspect the plan and its trust tokens:
 
@@ -107,13 +107,28 @@ python3 -m agent_workbench install --target cursor --project-root /path/to/proje
 
 Project activation merges `.cursor/hooks.json` and `.cursor/mcp.json`. Without `--project-root` or a profile `projectRoot`, Cursor uses `~/.cursor/hooks.json` and `~/.cursor/mcp.json`. `--destination` still changes only the skills directory. Hook commands run from the project root for project scope and from `~/.cursor` for user scope.
 
+Exact activation paths and formats:
+
+| Target / component | Artifact format | Project document | User document |
+| --- | --- | --- | --- |
+| Cursor hooks | `hooks.Event[]` contains command entries; optional `version: 1` | `.cursor/hooks.json` | `~/.cursor/hooks.json` |
+| Claude hooks | `hooks.Event[]` contains matcher groups with nested `hooks[]` handlers | `.claude/settings.json`, top-level `hooks` | `~/.claude/settings.json`, top-level `hooks` |
+| Cursor MCP | Top-level `mcpServers` map | `.cursor/mcp.json` | `~/.cursor/mcp.json` |
+| Claude MCP | Top-level `mcpServers` map | `.mcp.json` in the project root | Unsupported: `PROJECT_ROOT_REQUIRED` |
+
+Use the same trust/install commands above with `--target claude` for Claude-native artifacts. Claude user MCP does not authorize or write `~/.claude.json`; pass `--project-root`. User hook paths come from the target adapter’s home resolution, independently of `--destination`.
+
+A generic `hooks` artifact is classified by its document shape. Mixed or ambiguous documents fail before activation. Use explicit `cursor-hooks` and `claude-hooks` artifacts when one plugin provides both representations. Empty generic hooks require Cursor’s `version: 1`; empty Claude bundles require `claude-hooks`. Profiles still select `hooks`, never the artifact aliases.
+
+Claude matcher groups, nested handler fields, and non-command handlers are preserved exactly. Only command handlers’ contained `${CLAUDE_PLUGIN_ROOT}/hooks/...`, quoted equivalents, and declared artifact-relative payload references are rewritten to `.claude/.agent-workbench-hooks/<plugin>/hooks/...`. Non-command handlers are inspected inertly and included in content-bound trust. Arbitrary absolute payloads, traversal, missing files, and unresolved local paths fail before activation. MCP server objects and compatible variables remain unchanged; the other target’s plugin-root variable is rejected.
+
 Each hook bundle is copied into `.cursor/.agent-workbench-hooks/<plugin>/hooks/`, with executable modes preserved. Static `./hooks/...`, `${CURSOR_PLUGIN_ROOT}/hooks/...`, and artifact-relative `./...` references become absolute managed paths. Escaping, missing, or unresolved local path references are rejected. Shell text and event entry fields otherwise stay unchanged. Commands never point into the checkout.
 
-MCP ownership covers individual `mcpServers/<name>` objects. Hook ownership covers exact entries in `hooks/<event>` arrays. Foreign entries and keys survive installation and uninstall. Matching unmanaged slots require `--adopt` as well as trust. Different MCP content, duplicate hook entries, and edited owned slots are conflicts. An ownership ledger prevents another profile from adopting an already-owned slot.
+MCP ownership covers individual `mcpServers/<name>` objects. Hook ownership covers exact Cursor entries or whole Claude matcher-group objects in `hooks/<event>` arrays. Foreign entries and keys survive installation and uninstall. Matching unmanaged slots require `--adopt` as well as trust. Different MCP content, duplicate hook entries, and edited owned slots are conflicts. An ownership ledger prevents another profile from adopting an already-owned slot.
 
-Cursor activation uses a shared document lock and a private recovery journal under `.cursor`. The journal may contain config values and bundle backups, has mode `0600`, and is removed after commit. On interruption, run `status` with the same profile, state directory, and scope to restore the prior activation. Other profiles wait for that recovery. If an external edit prevents safe recovery, the command fails and retains the journal and bundle evidence for repair. A pending journal makes `trust` fail without modifying anything.
+Cursor and Claude activation use one shared document lock and a private recovery journal under `.cursor` or `.claude`. The journal may contain config values and bundle backups, has mode `0600`, and is removed after commit. On interruption, run `status` with the same profile, state directory, and scope to restore the prior activation. Other profiles wait for that recovery. If an external edit prevents safe recovery, the command fails and retains the journal and bundle evidence for repair. A pending journal makes `trust` fail without modifying anything.
 
-Run `python3 scripts/check_cursor_activation.py` to repeat the isolated CLI scenario with the vendored ralph-loop hooks and Playwright MCP definition. The script checks installed bytes, modes, state, reinstall, and foreign-content preservation after uninstall.
+Run `python3 scripts/check_claude_activation.py` for the isolated Claude-native CLI lifecycle, or `python3 scripts/check_cursor_activation.py` to repeat the isolated CLI scenario with the vendored ralph-loop hooks and Playwright MCP definition. The script checks installed bytes, modes, state, reinstall, and foreign-content preservation after uninstall.
 
 ## Profiles
 
@@ -154,7 +169,7 @@ The installer builds a complete plan before writing anything.
 - Uninstall removes owned links that still point to the expected source and owned files whose digest still matches.
 - Moved checkouts produce `replace-owned` operations rather than silent deletion.
 
-Path-only installations write strict state schema v3. Cursor activation writes v4 with bundle digests, content-bound grants, and logical slot evidence. States v2 and v3 remain uninstallable and migrate during activation. State-file locations remain unchanged:
+Path-only installations write strict state schema v3. Cursor and Claude activation write v4 with bundle digests, content-bound grants, and logical slot evidence. States v2 and v3 remain uninstallable and migrate during activation. State-file locations remain unchanged:
 
 ```text
 ${XDG_STATE_HOME:-~/.local/state}/agent-workbench/<marketplace>/<profile>/<target>.json
@@ -179,7 +194,7 @@ agent-workbench/
 │   ├── installation.py        # plan, reconcile, apply, uninstall
 │   ├── state.py               # atomic ownership state
 │   ├── bundles.py             # inert trees and managed directory copies
-│   ├── shared_config.py       # Cursor JSON slots and document revisions
+│   ├── shared_config.py       # Exact JSON slots and document revisions
 │   ├── trust.py               # content-bound activation tokens
 │   ├── transactions.py        # shared lock, journal, and recovery
 │   └── validation.py
@@ -199,7 +214,7 @@ agent-workbench/
 4. Add it to the appropriate profiles.
 5. Run `make render check`.
 
-Component artifacts are validated and reported independently of installation. Skills and the supported document formats listed above can be installed into target directories. A `hooks` artifact points to the complete bundle directory containing `hooks.json` and its companion scripts; an `mcp` artifact points directly to its JSON file. Cursor activation requires explicit component selection and content-bound trust. Other targets remain unsupported for hooks and MCP.
+Component artifacts are validated and reported independently of installation. Skills and the supported document formats listed above can be installed into target directories. A `hooks` artifact points to the complete bundle directory containing `hooks.json` and its companion scripts; an `mcp` artifact points directly to its JSON file. Cursor and Claude activation require explicit component selection and content-bound trust. Other targets remain unsupported for hooks and MCP.
 
 ## Adding an agent
 

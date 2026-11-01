@@ -39,10 +39,16 @@ class SkillDirectoryTarget:
         roots = {component: base / component.value
                  for component in self.capabilities
                  if component is not ComponentKind.RULES or project_root is not None}
-        if self.id == "cursor":
+        if self.id in {"cursor", "claude"}:
             if project_root is None:
                 base = Path(self.destination.fallback).expanduser().absolute()
             roots[ComponentKind.HOOKS] = base / ".agent-workbench-hooks"
-            roots[ComponentKind.MCP] = base
+            if self.id == "claude":
+                if project_root is None:
+                    roots.pop(ComponentKind.MCP, None)
+                else:
+                    roots[ComponentKind.MCP] = project_root
+            else:
+                roots[ComponentKind.MCP] = base
         roots[ComponentKind.SKILLS] = skills
         return roots

@@ -1,4 +1,4 @@
-"""Logical Cursor slots, complete document revisions, and inert hook compilation."""
+"""Logical target slots, complete document revisions, and inert hook compilation."""
 from __future__ import annotations
 
 import copy
@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
 from .bundles import Tree, open_directory
 from .model import ComponentKind
+from .adapters.activation import ACTIVATION_POLICIES
+from .adapters.components import classify_hooks
 from .state import SlotState, _reject_duplicate_keys
 
 
@@ -160,26 +162,33 @@ def compare_replace_document(expected: DocumentSnapshot, content: bytes | None,
     return result
 
 
-def compile_hooks(tree: Tree, destination: Path) -> dict[str, list[dict[str, Any]]]:
+def compile_hooks(tree: Tree, destination: Path, target_id: str = "cursor") -> dict[str, list[dict[str, Any]]]:
     files = {item.path: item.content for item in tree.files}
     data = parse(files['hooks/hooks.json'])
-    if type(data.get('version', 1)) is not int or data.get('version', 1) != 1 or not isinstance(data.get('hooks'), dict):
-        raise ValueError('hooks require version 1 and a hooks object')
-    # Replace only local references. Shell operators and the rest of the command
-    # are retained verbatim. Interpreting or executing shell text is forbidden.
-    local = re.compile(r'\$\{CURSOR_PLUGIN_ROOT\}(?:/[^\s\'";|&<>]*)?|(?<![\w/])(?:\.\.?/|hooks/)[^\s\'";|&<>]*')
+    policy = ACTIVATION_POLICIES[target_id]
+    if classify_hooks(data, target_id + '-hooks') is not policy.hook_representation:
+        raise ValueError('incompatible hook representation')
+    variable = '${' + policy.plugin_variable + '}'
+    incompatible = '${' + ('CLAUDE_PLUGIN_ROOT' if target_id == 'cursor' else 'CURSOR_PLUGIN_ROOT') + '}'
+    declared = [name[len('hooks/'):] for name in files if name != 'hooks/hooks.json']
+    local = re.compile(re.escape(variable) + r"(?:/[^\s'\";|&<>]*)?|(?<![\w/])(?:\.\.?/|hooks/)[^\s'\";|&<>]*"
+                       + (r"|(?<![\w/])(?:" + '|'.join(re.escape(name) for name in sorted(declared, key=len, reverse=True)) + r")(?=$|[\s'\";|&<>])" if declared else ''))
 
     def command(text: str) -> str:
         if not isinstance(text, str) or not text:
             raise ValueError('hook command must be a non-empty string')
+        if incompatible in text:
+            raise ValueError('target-incompatible plugin-root variable')
         def rewrite(match: re.Match[str]) -> str:
             value = match.group()
-            if value.startswith('${CURSOR_PLUGIN_ROOT}'):
-                relative = value[len('${CURSOR_PLUGIN_ROOT}/'):]
+            if value.startswith(variable):
+                relative = value[len(variable + '/'):]
             elif value.startswith('./hooks/') or value.startswith('hooks/'):
                 relative = value.removeprefix('./')
             else:
                 relative = 'hooks/' + value
+            if '..' in Path(relative).parts:
+                raise ValueError('hook local file reference escapes copied bundle')
             relative = posixpath.normpath(relative)
             if relative.startswith('../') or relative not in files:
                 raise ValueError('hook local file reference escapes or is absent from copied bundle')
@@ -204,20 +213,26 @@ def compile_hooks(tree: Tree, destination: Path) -> dict[str, list[dict[str, Any
         # Absolute script paths cannot become managed references. System shell
         # executables are allowed; arbitrary absolute payload references are not.
         for token in shlex.split(text):
-            if '/' in token and '://' not in token and not token.startswith(('./', '../', 'hooks/', '${CURSOR_PLUGIN_ROOT}', '/')):
+            if target_id == 'claude' and re.search(r'\.(?:sh|py|js|mjs|cjs|rb|pl|ps1)$', token) and '/' not in token and token not in declared:
+                raise ValueError('hook unresolved local file reference escapes copied bundle')
+            if '/' in token and token not in declared and '://' not in token and not token.startswith(('./', '../', 'hooks/', variable, '/')):
                 raise ValueError('hook unresolved local file reference escapes copied bundle')
             if token.startswith('/') and token not in {'/bin/sh', '/bin/bash', '/bin/zsh', '/usr/bin/env', '/usr/bin/python3'}:
                 raise ValueError('hook absolute local reference escapes copied bundle')
-        return local.sub(rewrite, text)
+        rewritten = local.sub(rewrite, text)
+        if variable in rewritten:
+            raise ValueError('unresolved local plugin-root reference')
+        return rewritten
 
     result = copy.deepcopy(data['hooks'])
     for event, entries in result.items():
         if not event or not isinstance(entries, list):
             raise ValueError('hook events must map to arrays')
         for entry in entries:
-            if not isinstance(entry, dict) or 'command' not in entry:
-                raise ValueError('hook entry requires command')
-            entry['command'] = command(entry['command'])
+            handlers = entry['hooks'] if target_id == 'claude' else [entry]
+            for handler in handlers:
+                if target_id != 'claude' or handler['type'] == 'command':
+                    handler['command'] = command(handler['command'])
     return result
 
 
@@ -259,9 +274,8 @@ class DocumentPlan:
     operations: tuple[SlotOperation, ...]
 
 
-def document_path(roots: Mapping[ComponentKind, Path], component: ComponentKind) -> Path:
-    base = roots[ComponentKind.HOOKS].parent
-    return base / ('hooks.json' if component is ComponentKind.HOOKS else 'mcp.json')
+def document_path(roots: Mapping[ComponentKind, Path], component: ComponentKind, target_id: str = "cursor") -> Path:
+    return ACTIVATION_POLICIES[target_id].document_path(roots, component)
 
 
 def hook_document_references_bundle(content: bytes | None, bundle: Path) -> bool:
@@ -282,15 +296,22 @@ def hook_document_references_bundle(content: bytes | None, bundle: Path) -> bool
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ValueError('hook entries must be objects')
-            command = entry.get('command')
-            if isinstance(command, str) and boundary.search(command):
-                return True
+            for handler in [entry] + (entry.get('hooks', []) if isinstance(entry.get('hooks', []), list) else []):
+                command = handler.get('command') if isinstance(handler, dict) else None
+                if isinstance(command, str):
+                    candidates = [command]
+                    try:
+                        candidates.extend(re.sub(r'\\([$`])', r'\1', token) for token in shlex.split(command))
+                    except ValueError:
+                        pass
+                    if any(boundary.search(value) for value in candidates):
+                        return True
     return False
 
 
 def plan_document(before: DocumentSnapshot, component: ComponentKind,
                   desired: tuple[DesiredSlot, ...], owned: Mapping[str, SlotState],
-                  adopt: bool) -> tuple[DocumentPlan, dict[str, SlotState]]:
+                  adopt: bool, target_id: str = "cursor") -> tuple[DocumentPlan, dict[str, SlotState]]:
     from .installation import OperationKind as Op
     original = parse(before.content) if before.content is not None else {}
     if not desired and not owned:
@@ -299,13 +320,15 @@ def plan_document(before: DocumentSnapshot, component: ComponentKind,
     field = 'hooks' if component is ComponentKind.HOOKS else 'mcpServers'
     if field in data and not isinstance(data[field], dict):
         raise ValueError(f'{field} must be an object: {before.path}')
-    if component is ComponentKind.HOOKS and 'version' in data and (type(data['version']) is not int or data['version'] != 1):
+    if target_id == 'cursor' and component is ComponentKind.HOOKS and 'version' in data and (type(data['version']) is not int or data['version'] != 1):
         raise ValueError('shared hooks document requires version 1')
     slots = data.setdefault(field, {})
     if component is ComponentKind.HOOKS and any(not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries) for entries in slots.values()):
         raise ValueError('hook events must contain object arrays')
     if component is ComponentKind.MCP and any(not isinstance(item, dict) for item in slots.values()):
         raise ValueError('MCP servers must be objects')
+    if component is ComponentKind.HOOKS and target_id == 'claude':
+        classify_hooks({'hooks': slots}, 'claude-hooks')
     baseline = copy.deepcopy(data)
     operations = []
     next_slots = {}
@@ -369,20 +392,20 @@ def plan_document(before: DocumentSnapshot, component: ComponentKind,
                 slots[item.slot] = desired_slot.value
             else:
                 slots.setdefault(event, []).append(desired_slot.value)
-    if desired and component is ComponentKind.HOOKS:
+    if desired and component is ComponentKind.HOOKS and ACTIVATION_POLICIES[target_id].hook_version:
         data.setdefault('version', 1)
     after = encode(data) if data != original else before.content
     return DocumentPlan(before, removed, after, tuple(operations)), next_slots
 
 
-def ownership_snapshot(base: Path) -> DocumentSnapshot:
-    before = snapshot(base / '.agent-workbench-owners.json')
+def ownership_snapshot(base: Path, target_id: str = "cursor") -> DocumentSnapshot:
+    before = snapshot(base / ACTIVATION_POLICIES[target_id].ledger_name)
     original = parse(before.content) if before.content is not None else {'version': 1, 'slots': {}}
     if set(original) != {'version', 'slots'} or original['version'] != 1 or not isinstance(original['slots'], dict):
-        raise ValueError('invalid Cursor ownership ledger')
+        raise ValueError('invalid target ownership ledger')
     for key, value in original['slots'].items():
         if not re.fullmatch('[0-9a-f]{64}', key) or not isinstance(value, dict) or set(value) != {'owner', 'digest'} or not isinstance(value['owner'], str) or not re.fullmatch('[0-9a-f]{64}', value['digest']):
-            raise ValueError('invalid Cursor ownership record')
+            raise ValueError('invalid target ownership record')
     return before
 
 

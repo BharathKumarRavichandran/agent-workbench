@@ -28,7 +28,7 @@ Source
        └── agents / rules / hooks / mcp / commands artifacts
 ```
 
-Artifacts use registered string identifiers. Built-in inspectors recognize `agent-skills`, `agents`, `rules`, `hooks`, `mcp`, and `commands`, while the catalog remains open to future adapter-defined kinds without adding an agent field to every plugin.
+Artifacts use registered string identifiers. Built-in inspectors recognize `agent-skills`, `agents`, `rules`, `hooks`, `cursor-hooks`, `claude-hooks`, `mcp`, and `commands`, while the catalog remains open to future adapter-defined kinds without adding an agent field to every plugin.
 
 ## Boundaries
 
@@ -84,7 +84,7 @@ Validation rejects:
 - unknown artifact kinds;
 - generated output collisions and drift.
 
-Artifact recognition is explicit in the adapter registry rather than inferred from renderer or install-target dependencies. Component inspection is inert: hook commands are not executed, MCP servers are not started, and configuration bodies are not copied into the lock report. Skills and supported agents, rules, and commands cross the path installation boundary. Explicit Cursor hook and MCP selections cross separate bundle and shared-document boundaries after a content-bound grant. Every inspection path remains inert.
+Artifact recognition is explicit in the adapter registry rather than inferred from renderer or install-target dependencies. Component inspection is inert: hook commands are not executed, MCP servers are not started, and configuration bodies are not copied into the lock report. Skills and supported agents, rules, and commands cross the path installation boundary. Explicit Cursor and Claude hook and MCP selections cross separate bundle and shared-document boundaries after a content-bound grant. Every inspection path remains inert.
 
 JSON Schema files provide editor support. The strict decoder and semantic validation are authoritative.
 
@@ -105,7 +105,7 @@ State is evidence of ownership, not proof that the filesystem still matches. Eve
 
 Copied sources are read through directory descriptors without following symlinks. Apply revalidates their planned digests before destination creation and again before use. Copies are written to temporary regular files and atomically published without overwriting an existing path. Replacements first quarantine the owned file, then compare its recorded digest. Failed ownership checks restore the quarantined path. Failed state writes roll back the current mutation while preserving ownership of completed operations.
 
-Uninstall checks ownership evidence for every recorded component, independent of current profile component flags. Skills must still resolve to their expected sources. Copies must still match their recorded digests. Strict state v3 stores tagged resources and per-component roots at the existing state-file location. Each entry pins its source repository so an interrupted checkout migration preserves ownership of links that still use the old checkout. State v2 decodes as skills-only ownership and remains uninstallable. Path-only installation writes v3. Cursor hook and MCP activation writes strict v4. Existing v2 and v3 ownership migrates without changing state-file locations.
+Uninstall checks ownership evidence for every recorded component, independent of current profile component flags. Skills must still resolve to their expected sources. Copies must still match their recorded digests. Strict state v3 stores tagged resources and per-component roots at the existing state-file location. Each entry pins its source repository so an interrupted checkout migration preserves ownership of links that still use the old checkout. State v2 decodes as skills-only ownership and remains uninstallable. Path-only installation writes v3. Cursor and Claude hook and MCP activation write strict v4. Existing v2 and v3 ownership migrates without changing state-file locations.
 
 ## Upstream boundary
 
@@ -117,7 +117,7 @@ Karpathy guidelines remain a curated copy because the artifact is one small skil
 
 Profiles select existing plugins. They do not rewrite provenance or package layout. Profile v1 targets normalize to skills only. Strict profile v2 adds explicit component selections and optional absolute project roots. A missing selection still means skills. CLI component flags replace the profile selection.
 
-Cursor supports skills, Markdown agents, and project `.mdc` rules. Claude supports skills, compatible Markdown agents, and legacy Markdown commands. The other built-ins support skills for the current formats. Unsupported requests return `COMPONENT_UNSUPPORTED` before mutation. Cursor rules without a project root return `PROJECT_ROOT_REQUIRED`. No conversion to unsupported native formats occurs. A private work repository should depend on this public core and add private sources, plugins, and profiles. The public core must never depend on the work overlay.
+Cursor supports skills, Markdown agents, and project `.mdc` rules. Claude supports skills, compatible Markdown agents, legacy Markdown commands, native nested hooks, and project MCP. Cursor also supports native flat hooks and MCP. The other built-ins support skills for the current formats. Unsupported requests return `COMPONENT_UNSUPPORTED` before mutation. Cursor rules without a project root return `PROJECT_ROOT_REQUIRED`. No conversion to unsupported native formats occurs. A private work repository should depend on this public core and add private sources, plugins, and profiles. The public core must never depend on the work overlay.
 
 ## Compatibility
 
@@ -129,17 +129,32 @@ python3 -m agent_workbench <command>
 
 The wrappers contain no duplicated catalog, rendering, validation, or installation logic.
 
-## Cursor activation transactions
+## Exact activation transactions
+
+`adapters/activation.py` owns each target’s document names, plugin-root variable, hook representation, version policy, lock, journal, and ledger names. The compiler, slot planner, bundle executor, trust proofs, and recovery machinery are shared. No Claude-specific transaction stack or state schema is introduced.
+
+| Exact representation | Cursor | Claude |
+| --- | --- | --- |
+| Flat command hooks (`hook-bundle`) | `.cursor/hooks.json` | `REPRESENTATION_UNSUPPORTED` |
+| Nested matcher/handler hooks (`claude-hook-bundle`) | `REPRESENTATION_UNSUPPORTED` | `.claude/settings.json`, top-level `hooks` |
+| `mcpServers` server objects | `.cursor/mcp.json` | Project root `.mcp.json` |
+| User MCP | `~/.cursor/mcp.json` | `PROJECT_ROOT_REQUIRED`; no `~/.claude.json` access |
+
+User hooks use the adapter-resolved `~/.cursor/hooks.json` or `~/.claude/settings.json`. Tests resolve home into temporary directories. Generic `hooks` artifacts are classified by shape; mixed/ambiguous documents are invalid. Explicit `cursor-hooks`/`claude-hooks` aliases allow both representations in one plugin, while profile selections remain `hooks`. Empty generic documents require Cursor’s version field; an empty Claude artifact uses its explicit alias. Existing catalog and lock rendering stay deterministic.
+
+Claude groups require a nested `hooks` array and optional string `matcher`. Command handlers require `type: command` and `command`; non-command handler objects are preserved inertly under the same content-bound grant. Only contained local payload references are rewritten. Unsupported local paths fail before activation. MCP server objects are preserved without variable conversion, and target-incompatible plugin-root variables fail before mutation.
+
+Claude’s project MCP document has a different parent from its hooks/settings, ledger, journal, and bundles. Each document is read, compared, quarantined, and published relative to its own authorized parent descriptor. The resource boundary lock remains under `.claude`; no root-level MCP file is opened relative to that descriptor. Every held parent/root identity participates in authenticated recovery evidence. Bundle removal is blocked while any remaining foreign hook command references it, including during component deselection.
 
 `DirectoryCopy` is a closed path-resource variant for a complete hook artifact. Its synthetic plugin root contains `hooks/hooks.json` and every companion file. The digest covers relative paths, bytes, and modes, including empty directories. Symlinks, special files, and special permission bits are rejected. Descriptor-relative reads and writes pin directories, and atomic no-replace rename publishes a complete tree. This operation requires macOS `renameatx_np` or Linux `renameat2`.
 
 `shared_config.py` handles JSON documents separately from path resources. A complete byte and file-identity snapshot detects stale plans, including a rewrite with identical JSON. Duplicate keys, symlinks, and special files fail at the boundary. The pure slot planner preserves foreign keys and array order. Slots use canonical content digests; no executable definitions appear in state or plan output.
 
-Hooks own exact entries within event arrays, so a duplicate is ambiguous. MCP owns named server objects, so different unmanaged content is a collision. Matching unmanaged content requires adoption. An externally modified owned slot blocks installation and uninstall. The private `.agent-workbench-owners.json` ledger prevents profiles, even with different state directories, from adopting the same logical slot. Its complete revision participates in the plan.
+Hooks own exact Cursor entries or whole Claude matcher-group objects within event arrays, so a duplicate is ambiguous. MCP owns named server objects, so different unmanaged content is a collision. Matching unmanaged content requires adoption. An externally modified owned slot blocks installation and uninstall. The private `.agent-workbench-owners.json` ledger prevents profiles, even with different state directories, from adopting the same logical slot. Its complete revision participates in the plan.
 
 `trust.py` hashes plugin identity, component, target config path, artifact location, source provenance, and content into an `aw-trust-v1:` token. Both hooks and MCP require a CLI grant. A recorded grant can be reused only for unchanged content and scope. Changing any bundle file or mode invalidates hook trust; changing any MCP source byte invalidates MCP trust. Profile v1 stays skills-only, and profile v2 adds no implicit activation.
 
-`transactions.py` takes the profile state lock followed by `.cursor/.agent-workbench.lock`. That second lock covers both config documents and their ownership ledger across all profiles. Apply compares state, document revisions, and sources before preparing its durable `0600` journal. The journal records prior state, complete document revisions, and path backups. Journal destinations must match roots authorized by the current adapter request.
+`transactions.py` takes the profile state lock followed by the target policy’s `.cursor/.agent-workbench.lock` or `.claude/.agent-workbench.lock`. That second lock covers both config documents and their ownership ledger across all profiles. Apply compares state, document revisions, and sources before preparing its durable `0600` journal. The authenticated journal records prior state, complete document bytes, parent device/inode identities, and path backups. Apply rechecks complete document revisions after source validation and immediately before document mutation. Recovery pins and verifies each authorized parent independently, using authenticated identities rather than trusting a new parent at the same path. Legacy authenticated Cursor journals remain recoverable. Journal destinations must match roots authorized by the current adapter request.
 
 The mutation sequence is:
 
@@ -156,7 +171,8 @@ Recovery compares live documents, managed trees, and state against the journal e
 
 These should be added only when a real target needs them:
 
-- hook and MCP adapters for formats beyond Cursor;
+- hook and MCP adapters for targets beyond Cursor and Claude;
+- user-scoped Claude MCP (`~/.claude.json`);
 - external adapter discovery;
 - profile inheritance;
 - a capability graph with transformations;

@@ -87,7 +87,8 @@ COMPONENT_ARTIFACTS = {
 
 def semantic_exports(inventory: ArtifactInventory) -> tuple[ComponentExport, ...]:
     for component, (artifact, representation) in COMPONENT_ARTIFACTS.items():
-        if artifact == inventory.kind:
+        if artifact == inventory.kind or (component is ComponentKind.HOOKS and inventory.kind in {"cursor-hooks", "claude-hooks"}):
+            representation = inventory.representation or representation
             return tuple(ComponentExport(
                 inventory.plugin_id, component, item.name,
                 inventory.root if component is ComponentKind.MCP else inventory.root / item.path,

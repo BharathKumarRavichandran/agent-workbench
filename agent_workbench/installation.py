@@ -20,11 +20,13 @@ except ImportError:  # pragma: no cover - Windows fallback
 from .adapters.base import InstallTarget, DesiredEntry
 from .adapters.projections import project_paths
 from .artifacts import COMPONENT_ARTIFACTS, semantic_exports
+from .model import ArtifactInventory, ComponentExport, ResolvedPlugin
 from .inspection import validate_skill_tree
 from .model import TargetId, ComponentKind, DirectorySymlink, FileCopy, DirectoryCopy, PathResource
 from .state import InstallState, StateEntry, load_state, remove_state, state_path, write_state
 from .workspace import Workspace
 from . import bundles, shared_config
+from .adapters.activation import ACTIVATION_POLICIES
 from .trust import grant_token, authenticated, reuse_proof
 from .state import SlotState
 
@@ -196,8 +198,13 @@ class _DestinationRoot:
             if (metadata.st_dev, metadata.st_ino) != self.identity:
                 raise FileExistsError(f"destination root changed since planning: {self.path}")
         try:
-            current = _destination_identity(self.path)
-        except ValueError as error:
+            fd = bundles.open_directory(self.path)
+            try:
+                info = os.fstat(fd)
+                current = (info.st_dev, info.st_ino)
+            finally:
+                os.close(fd)
+        except (OSError, ValueError) as error:
             raise FileExistsError(f"destination root changed since planning: {self.path}") from error
         if current != self.identity:
             raise FileExistsError(f"destination root changed since planning: {self.path}")
@@ -531,7 +538,7 @@ def _validated_state(
         if component not in roots or Path(recorded) != roots[component]:
             raise ValueError("recorded destination root differs from adapter-authorized root; pass the same --project-root")
     for slot in previous.slots.values():
-        if target_id != "cursor" or Path(slot.document) != shared_config.document_path(roots, slot.component):
+        if target_id not in ACTIVATION_POLICIES or Path(slot.document) != shared_config.document_path(roots, slot.component, target_id):
             raise ValueError("recorded document differs from adapter-authorized path")
     return previous
 
@@ -572,6 +579,8 @@ def _make_plan(workspace: Workspace, target_id: str, file: Path,
     needed.add(roots[ComponentKind.SKILLS])
     if ComponentKind.HOOKS in roots:
         needed.add(roots[ComponentKind.HOOKS].parent)
+    if target_id in ACTIVATION_POLICIES and ComponentKind.MCP in roots:
+        needed.add(roots[ComponentKind.MCP])
     for root in sorted((set(roots.values()) | ({roots[ComponentKind.HOOKS].parent} if ComponentKind.HOOKS in roots else set())) & needed):
         # Refuse redirected adapter directories, including existing parents.
         anchor, identity = _destination_anchor(root)
@@ -619,6 +628,45 @@ def _removal(key: str, entry: StateEntry, reason: str) -> InstallOperation | Non
     )
 
 
+def _protect_bundle_removal(operation: InstallOperation | None, entry: StateEntry,
+                            documents: tuple[shared_config.DocumentPlan, ...],
+                            roots: dict[ComponentKind, Path], target_id: str) -> InstallOperation | None:
+    if not isinstance(entry.resource, DirectoryCopy):
+        return operation
+    hook_document = next(
+        (document for document in documents
+         if document.before.path == shared_config.document_path(roots, ComponentKind.HOOKS, target_id)),
+        None,
+    )
+    if (
+        operation
+        and hook_document is not None
+        and shared_config.hook_document_references_bundle(
+            hook_document.after, Path(entry.destination)
+        )
+    ):
+        operation = replace(
+            operation,
+            kind=OperationKind.CONFLICT,
+            reason="an active hook still references the managed bundle",
+            diagnostic="HOOK_BUNDLE_REFERENCED",
+        )
+    return operation
+
+
+def _hook_inventories(workspace: Workspace, plugin: ResolvedPlugin) -> tuple[ArtifactInventory, ...]:
+    return tuple(workspace.registry.artifact_inspectors[kind].inspect(plugin)
+                 for kind in ('hooks', 'cursor-hooks', 'claude-hooks') if kind in plugin.artifact_paths)
+
+
+def _hook_source(workspace: Workspace, plugin: ResolvedPlugin, target_id: str) -> Path | None:
+    exact = [item.root for item in _hook_inventories(workspace, plugin)
+             if item.representation is ACTIVATION_POLICIES[target_id].hook_representation]
+    if len(exact) > 1:
+        raise ValueError('multiple hook artifacts declare the same representation')
+    return exact[0] if exact else None
+
+
 def plan_install(
     workspace: Workspace, target_id: str, state_root: Path,
     destination: Path | None = None, adopt: bool = False,
@@ -632,7 +680,7 @@ def plan_install(
     requested = components if components is not None else selected.components
     roots = _request_roots(workspace, target, destination, project_root)
     file = state_path(state_root, workspace.catalog.marketplace.id, str(workspace.profile.id), target_id)
-    _recover_lifecycle(file, roots, repair)
+    _recover_lifecycle(file, roots, repair, target_id)
     _, unsupported = project_paths(target.id, target.capabilities, requested, (), roots)
     rejected = {conflict.component for conflict in unsupported}
     exports = []
@@ -640,10 +688,18 @@ def plan_install(
         for component in requested:
             if component in rejected:
                 continue
-            artifact, _ = COMPONENT_ARTIFACTS[component]
-            if artifact in plugin.artifact_paths:
-                inspector = workspace.registry.artifact_inspectors[artifact]
-                exports.extend(semantic_exports(inspector.inspect(plugin)))
+            if component is ComponentKind.HOOKS:
+                inventories = _hook_inventories(workspace, plugin)
+                exact = [item for item in inventories if item.representation is target.capabilities.get(component)]
+                for inventory in exact or inventories:
+                    # Empty bundles still carry an exact representation.
+                    exports.extend(semantic_exports(inventory) or (ComponentExport(
+                        plugin.plugin.id, component, '', inventory.root, inventory.representation),))
+            else:
+                artifact, _ = COMPONENT_ARTIFACTS[component]
+                if artifact in plugin.artifact_paths:
+                    inspector = workspace.registry.artifact_inspectors[artifact]
+                    exports.extend(semantic_exports(inspector.inspect(plugin)))
     projected, conflicts = project_paths(target.id, target.capabilities, requested, tuple(exports), roots)
     desired = tuple(DesiredEntry(
         item.key, str(item.export.plugin_id), item.export.source, item.destination,
@@ -651,9 +707,9 @@ def plan_install(
         DirectorySymlink() if item.export.component is ComponentKind.SKILLS else
         FileCopy(hashlib.sha256(_source_content(workspace.root, item.export.source)).hexdigest()),
     ) for item in projected)
-    if target_id == "cursor" and ComponentKind.HOOKS in requested and ComponentKind.HOOKS not in rejected:
+    if target_id in ACTIVATION_POLICIES and ComponentKind.HOOKS in requested and ComponentKind.HOOKS not in rejected:
         for plugin in workspace.resolved.plugins:
-            source = plugin.artifact_paths.get(COMPONENT_ARTIFACTS[ComponentKind.HOOKS][0])
+            source = _hook_source(workspace, plugin, target_id)
             if source is not None:
                 tree = bundles.source_tree(source)
                 desired += (DesiredEntry(f"hook:{plugin.plugin.id}", str(plugin.plugin.id), source,
@@ -665,7 +721,7 @@ def plan_install(
     for entry in desired:
         _require_contained(roots[entry.component], entry.destination)
     previous = _validated_state(workspace, target_id, file, roots)
-    ledger_before = shared_config.ownership_snapshot(roots[ComponentKind.HOOKS].parent) if target_id == 'cursor' else None
+    ledger_before = shared_config.ownership_snapshot(roots[ComponentKind.HOOKS].parent, target_id) if target_id in ACTIVATION_POLICIES else None
     document_plans, slots, executable_sources = _plan_documents(workspace, target_id, roots, previous, tuple(item for item in requested if item not in rejected), adopt, trust, file, ledger_before)
     if document_plans:
         document_plans, ledger = shared_config.plan_ownership(file, document_plans, previous.slots if previous else {}, slots, ledger_before)
@@ -706,7 +762,7 @@ def plan_install(
         if isinstance(entry.resource, DirectoryCopy):
             plugin = next(plugin for plugin in workspace.resolved.plugins if str(plugin.plugin.id) == entry.plugin_id)
             token = grant_token(plugin, ComponentKind.HOOKS, target_id,
-                                shared_config.document_path(roots, ComponentKind.HOOKS), entry.resource.digest, workspace.root)
+                                shared_config.document_path(roots, ComponentKind.HOOKS, target_id), entry.resource.digest, workspace.root, entry.source)
             required = token not in trust and not (prior is not None and prior.trust == token and authenticated(prior, file))
             if required:
                 kind, reason = OperationKind.CONFLICT, "content-bound grant required; pass --trust " + token
@@ -728,11 +784,13 @@ def plan_install(
         if key not in desired_by_key:
             assert previous is not None
             operation = _removal(key, prior, "managed entry is no longer selected")
+            operation = _protect_bundle_removal(operation, prior, document_plans, roots, target_id)
             if operation:
                 operations.append(operation)
     plan = _make_plan(workspace, target_id, file, roots, previous, operations, next_entries)
     if document_plans or any(isinstance(entry.resource, DirectoryCopy) for entry in next_entries.values()):
-        plan = replace(plan, next_state=replace(plan.next_state, schema_version=4, slots=slots),
+        plan = replace(plan, next_state=replace(plan.next_state, schema_version=4, slots=slots, destination_roots={component: str(root) for component, root in roots.items()
+                           if component in {ComponentKind.HOOKS, ComponentKind.MCP} or component in plan.next_state.destination_roots}),
                        documents=document_plans, executable_sources=executable_sources)
     return plan
 
@@ -740,7 +798,7 @@ def plan_install(
 def _plan_documents(workspace: Workspace, target_id: str, roots: dict[ComponentKind, Path],
                     previous: InstallState | None, requested: tuple[ComponentKind, ...],
                     adopt: bool, trust: tuple[str, ...], file: Path, ledger_before: shared_config.DocumentSnapshot | None) -> tuple[tuple[shared_config.DocumentPlan, ...], dict[str, SlotState], tuple[shared_config.DesiredSlot, ...]]:
-    if target_id != "cursor":
+    if target_id not in ACTIVATION_POLICIES:
         return (), {}, ()
     documents = []
     states: dict[str, SlotState] = {}
@@ -749,37 +807,46 @@ def _plan_documents(workspace: Workspace, target_id: str, roots: dict[ComponentK
     conflicts = shared_config.ownership_conflicts(ledger_before, file, old_slots)
     if conflicts:
         for component in (ComponentKind.HOOKS, ComponentKind.MCP):
-            before = shared_config.snapshot(shared_config.document_path(roots, component))
+            if component not in roots:
+                continue
+            before = shared_config.snapshot(shared_config.document_path(roots, component, target_id))
             operations = tuple(item for item in conflicts if item.component is component)
             documents.append(shared_config.DocumentPlan(before, before.content, before.content, operations))
         return tuple(documents), {}, ()
     for component in (ComponentKind.HOOKS, ComponentKind.MCP):
         owned = {key: value for key, value in old_slots.items() if value.component is component}
         has_bundle = component is ComponentKind.HOOKS and previous and any(entry.component is component for entry in previous.entries.values())
+        if component not in roots:
+            continue
         if component not in requested and not owned and not has_bundle:
             continue
-        path = shared_config.document_path(roots, component)
+        path = shared_config.document_path(roots, component, target_id)
         desired = []
         if component in requested:
             for plugin in workspace.resolved.plugins:
-                source = plugin.artifact_paths.get(COMPONENT_ARTIFACTS[component][0])
+                source = (_hook_source(workspace, plugin, target_id) if component is ComponentKind.HOOKS
+                          else plugin.artifact_paths.get(COMPONENT_ARTIFACTS[component][0]))
                 if source is None:
                     continue
                 if component is ComponentKind.HOOKS:
                     tree = bundles.source_tree(source)
                     content_digest = tree.digest
-                    hooks = shared_config.compile_hooks(tree, roots[component] / str(plugin.plugin.id))
+                    hooks = shared_config.compile_hooks(tree, roots[component] / str(plugin.plugin.id), target_id)
                     values = [(f"{event}:{shared_config.digest(entry)}", entry)
                               for event, entries in hooks.items() for entry in entries]
                 else:
                     content = _source_content(workspace.root, source)
                     content_digest = hashlib.sha256(content).hexdigest()
+                    incompatible = 'CLAUDE_PLUGIN_ROOT' if target_id == 'cursor' else 'CURSOR_PLUGIN_ROOT'
                     data = shared_config.parse(content)
+                    encoded = shared_config.encode(data).decode()
+                    if ('${' + incompatible + '}') in encoded or ('$' + incompatible) in encoded:
+                        raise ValueError('target-incompatible plugin-root variable in MCP')
                     servers = data.get('mcpServers')
                     if not isinstance(servers, dict) or any(not isinstance(value, dict) for value in servers.values()):
                         raise ValueError('MCP requires an mcpServers object of objects')
                     values = list(servers.items())
-                token = grant_token(plugin, component, target_id, path, content_digest, workspace.root)
+                token = grant_token(plugin, component, target_id, path, content_digest, workspace.root, source)
                 recorded = any(item.plugin == plugin.plugin.id and item.trust == token and authenticated(item, file) for item in owned.values())
                 if component is ComponentKind.HOOKS and previous:
                     bundle = previous.entries.get(f"hook:{plugin.plugin.id}")
@@ -795,22 +862,22 @@ def _plan_documents(workspace: Workspace, target_id: str, roots: dict[ComponentK
                 if values:
                     sources.extend(desired[-len(values):])
         document, next_slots = shared_config.plan_document(shared_config.snapshot(path), component,
-                                                          tuple(desired), owned, adopt)
+                                                          tuple(desired), owned, adopt, target_id)
         documents.append(document)
         states.update(next_slots)
     return tuple(documents), states, tuple(sources)
 
 
-def _recover_lifecycle(file: Path, roots: dict[ComponentKind, Path], repair: bool = True) -> None:
+def _recover_lifecycle(file: Path, roots: dict[ComponentKind, Path], repair: bool = True, target_id: str = "cursor") -> None:
     if ComponentKind.HOOKS in roots:
         from .transactions import recover
         try:
             if not repair:
-                journal = roots[ComponentKind.HOOKS].parent / '.agent-workbench-transaction.json'
+                journal = roots[ComponentKind.HOOKS].parent / ACTIVATION_POLICIES[target_id].journal_name
                 if shared_config.snapshot(journal).content is not None:
                     raise ValueError('pending recovery; run status for the owning profile before requesting trust')
                 return
-            recover(file, roots)
+            recover(file, roots, target_id)
         except OSError as error:
             if any(parent.is_symlink() for parent in (roots[ComponentKind.HOOKS].parent,) + tuple(roots[ComponentKind.HOOKS].parent.parents)):
                 raise ValueError("destination root may not contain a symlink") from error
@@ -979,41 +1046,24 @@ def plan_uninstall(
     target = _target(workspace, target_id)
     roots = _request_roots(workspace, target, destination, project_root)
     file = state_path(state_root, workspace.catalog.marketplace.id, str(workspace.profile.id), target_id)
-    _recover_lifecycle(file, roots)
+    _recover_lifecycle(file, roots, target_id=target_id)
     previous = _validated_state(workspace, target_id, file, roots)
-    ledger_before = shared_config.ownership_snapshot(roots[ComponentKind.HOOKS].parent) if target_id == 'cursor' else None
+    ledger_before = shared_config.ownership_snapshot(roots[ComponentKind.HOOKS].parent, target_id) if target_id in ACTIVATION_POLICIES else None
     documents, _, sources = _plan_documents(workspace, target_id, roots, previous, (), False, (), file, ledger_before)
     if documents:
         documents, ledger = shared_config.plan_ownership(file, documents, previous.slots if previous else {}, {}, ledger_before)
         documents += (ledger,)
     operations = []
-    hook_document = next(
-        (document for document in documents
-         if document.before.path == shared_config.document_path(roots, ComponentKind.HOOKS)),
-        None,
-    )
     if previous:
         for key, entry in sorted(previous.entries.items()):
             operation = _removal(key, entry, "remove managed entry")
-            if (
-                operation
-                and isinstance(entry.resource, DirectoryCopy)
-                and hook_document is not None
-                and shared_config.hook_document_references_bundle(
-                    hook_document.after, Path(entry.destination)
-                )
-            ):
-                operation = replace(
-                    operation,
-                    kind=OperationKind.CONFLICT,
-                    reason="an active hook still references the managed bundle",
-                    diagnostic="HOOK_BUNDLE_REFERENCED",
-                )
+            operation = _protect_bundle_removal(operation, entry, documents, roots, target_id)
             if operation:
                 operations.append(operation)
     plan = _make_plan(workspace, target_id, file, roots, previous, operations, {})
     if documents:
-        plan = replace(plan, next_state=replace(plan.next_state, schema_version=4), documents=documents)
+        plan = replace(plan, next_state=replace(plan.next_state, schema_version=4, destination_roots={component: str(root) for component, root in roots.items()
+                           if component in {ComponentKind.HOOKS, ComponentKind.MCP} or component in plan.next_state.destination_roots}), documents=documents)
     return plan
 
 

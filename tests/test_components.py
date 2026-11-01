@@ -93,7 +93,7 @@ class ProfileComponentTests(unittest.TestCase):
 class ProjectionTests(unittest.TestCase):
     def test_exact_capability_matrix_and_inert_rejection(self):
         expected = {'agents': {C.SKILLS}, 'cursor': {C.SKILLS, C.AGENTS, C.RULES, C.HOOKS, C.MCP},
-                    'claude': {C.SKILLS, C.AGENTS, C.COMMANDS},
+                    'claude': {C.SKILLS, C.AGENTS, C.COMMANDS, C.HOOKS, C.MCP},
                     'codex': {C.SKILLS}, 'hermes': {C.SKILLS}, 'grok': {C.SKILLS}}
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory).resolve()
@@ -106,9 +106,13 @@ class ProjectionTests(unittest.TestCase):
                     with self.subTest(target=target, component=component):
                         plan = plan_install(workspace, target, base / 'state', components=(component,),
                                             project_root=base / 'project')
-                        if target == 'cursor' and component in {C.HOOKS, C.MCP}:
+                        if (target == 'cursor' and component in {C.HOOKS, C.MCP}) or (target == 'claude' and component is C.MCP):
                             self.assertTrue(plan.has_conflicts)
                             self.assertTrue(any(item.diagnostic == 'TRUST_REQUIRED' for item in plan.all_operations))
+                            continue
+                        if target == 'claude' and component is C.HOOKS:
+                            self.assertTrue(plan.has_conflicts)
+                            self.assertTrue(any(item.diagnostic == 'REPRESENTATION_UNSUPPORTED' for item in plan.all_operations))
                             continue
                         self.assertEqual(component not in supported, plan.has_conflicts)
                         if plan.has_conflicts:

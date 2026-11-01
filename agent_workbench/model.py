@@ -29,6 +29,7 @@ class Representation(str, Enum):
     CURSOR_RULE = "cursor-mdc"
     LEGACY_COMMAND = "legacy-markdown-command"
     HOOK_BUNDLE = "hook-bundle"
+    CLAUDE_HOOK_BUNDLE = "claude-hook-bundle"
     MCP_DOCUMENT = "mcp-document"
 
 
@@ -174,3 +175,4 @@ class ArtifactInventory:
     kind: ArtifactKind
     root: Path
     components: tuple[ComponentInfo, ...]
+    representation: Representation | None = None
