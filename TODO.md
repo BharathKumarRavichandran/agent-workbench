@@ -41,7 +41,7 @@ Convert the workbench to a standalone Rust CLI without extending product behavio
 
 ### C. Copied path components and multi-root state
 
-- [ ] Model copied files/directories and digests as closed Rust resource types rather than stringly operation variants.
+- [x] Model copied files/directories and digests as closed Rust resource types rather than stringly operation variants.
 - [ ] Port state v3 `destinationRoots` validation and authorization for multiple component roots.
 - [ ] Port copied-resource create, keep, exact-copy adoption, replace-owned, remove-owned, conflict, rollback, and uninstall.
 - [ ] Port Cursor agents, rules, and commands with project-root requirements and Python/Rust differential tests.

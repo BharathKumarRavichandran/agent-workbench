@@ -1,3 +1,4 @@
+use super::resource::PathResource;
 use super::*;
 use crate::state::{self, Entry, State};
 use rustix::fd::OwnedFd;
@@ -267,6 +268,10 @@ fn desired_entries(
                         .replace('\\', "/"),
                     destination: destination.join(name),
                     source_repository: repository.to_path_buf(),
+                    component: ComponentKind::Skills,
+                    resource: PathResource::DirectorySymlink,
+                    trust: None,
+                    trust_proof: None,
                 },
             );
         }
@@ -289,8 +294,7 @@ fn operation(
         source: source.to_string_lossy().into_owned(),
         reason,
         component: "skills",
-        resource_kind: "directory-symlink",
-        digest: None,
+        resource: PathResource::DirectorySymlink,
         diagnostic: None,
         trust_token: None,
         trust_required: false,

@@ -1,4 +1,5 @@
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::ser::{Serialize, SerializeMap};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -7,6 +8,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 mod lifecycle;
+mod resource;
 mod state;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -132,6 +134,19 @@ pub enum ComponentKind {
     Mcp,
 }
 
+impl ComponentKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Skills => "skills",
+            Self::Agents => "agents",
+            Self::Rules => "rules",
+            Self::Commands => "commands",
+            Self::Hooks => "hooks",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillsTarget {
     Agents,
@@ -199,8 +214,7 @@ pub struct Cli {
     action: lifecycle::Action,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug)]
 pub struct Operation {
     kind: &'static str,
     key: String,
@@ -208,13 +222,35 @@ pub struct Operation {
     source: String,
     reason: &'static str,
     component: &'static str,
-    resource_kind: &'static str,
-    digest: Option<String>,
+    resource: resource::PathResource,
     diagnostic: Option<String>,
     trust_token: Option<String>,
     trust_required: bool,
-    #[serde(skip)]
     expected_link: Option<PathBuf>,
+}
+
+impl Serialize for Operation {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(11))?;
+        map.serialize_entry("kind", self.kind)?;
+        map.serialize_entry("key", &self.key)?;
+        map.serialize_entry("destination", &self.destination)?;
+        map.serialize_entry("source", &self.source)?;
+        map.serialize_entry("reason", self.reason)?;
+        map.serialize_entry("component", self.component)?;
+        map.serialize_entry("resourceKind", self.resource.kind())?;
+        map.serialize_entry(
+            "digest",
+            &self.resource.digest().map(resource::ContentDigest::as_str),
+        )?;
+        map.serialize_entry("diagnostic", &self.diagnostic)?;
+        map.serialize_entry("trustToken", &self.trust_token)?;
+        map.serialize_entry("trustRequired", &self.trust_required)?;
+        map.end()
+    }
 }
 
 pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
@@ -917,6 +953,123 @@ mod tests {
     }
 
     #[test]
+    fn copied_resource_json_matches_python_oracle() {
+        let digest = resource::ContentDigest::parse(&"ab".repeat(32)).unwrap();
+        let proof = format!("aw-proof-v1:{}", "cd".repeat(32));
+        let trust = format!("aw-trust-v1:{}", "ef".repeat(32));
+        let actual = serde_json::json!({
+            "symlink-operation": serde_json::to_string_pretty(&operation_fixture(
+                "skills",
+                resource::PathResource::DirectorySymlink,
+                "/src/skill",
+            )).unwrap(),
+            "file-operation": serde_json::to_string_pretty(&operation_fixture(
+                "agents",
+                resource::PathResource::FileCopy(digest.clone()),
+                "/src/agent.md",
+            )).unwrap(),
+            "directory-operation": serde_json::to_string_pretty(&operation_fixture(
+                "hooks",
+                resource::PathResource::DirectoryCopy(digest.clone()),
+                "/src/hooks",
+            )).unwrap(),
+            "symlink-entry": state::entry_json(&entry_fixture(
+                "skill:sample",
+                ComponentKind::Skills,
+                resource::PathResource::DirectorySymlink,
+                None,
+                None,
+            )).unwrap(),
+            "file-entry": state::entry_json(&entry_fixture(
+                "agent:sample.md",
+                ComponentKind::Agents,
+                resource::PathResource::FileCopy(digest.clone()),
+                None,
+                None,
+            )).unwrap(),
+            "directory-entry": state::entry_json(&entry_fixture(
+                "hook:sample",
+                ComponentKind::Hooks,
+                resource::PathResource::DirectoryCopy(digest.clone()),
+                Some(trust.clone()),
+                None,
+            )).unwrap(),
+            "directory-entry-proof": state::entry_json(&entry_fixture(
+                "hook:sample",
+                ComponentKind::Hooks,
+                resource::PathResource::DirectoryCopy(digest.clone()),
+                Some(trust),
+                Some(proof),
+            )).unwrap(),
+            "directory-entry-null-trust": state::entry_json(&entry_fixture(
+                "hook:sample",
+                ComponentKind::Hooks,
+                resource::PathResource::DirectoryCopy(digest),
+                None,
+                None,
+            )).unwrap(),
+        });
+        let expected = python_resource_contract();
+        assert_eq!(expected, actual, "{expected:#?}\n{actual:#?}");
+    }
+
+    fn operation_fixture(
+        component: &'static str,
+        resource: resource::PathResource,
+        source: &str,
+    ) -> Operation {
+        Operation {
+            kind: "create",
+            key: "sample".into(),
+            destination: "/dest/sample".into(),
+            source: source.into(),
+            reason: "destination is absent",
+            component,
+            resource,
+            diagnostic: None,
+            trust_token: None,
+            trust_required: false,
+            expected_link: None,
+        }
+    }
+
+    fn entry_fixture(
+        key: &str,
+        component: ComponentKind,
+        resource: resource::PathResource,
+        trust: Option<String>,
+        trust_proof: Option<String>,
+    ) -> state::Entry {
+        state::Entry {
+            key: key.into(),
+            plugin: "pstack".into(),
+            source: "plugins/sample".into(),
+            destination: PathBuf::from("/dest/sample"),
+            source_repository: PathBuf::from("/repo"),
+            component,
+            resource,
+            trust,
+            trust_proof,
+        }
+    }
+
+    fn python_resource_contract() -> serde_json::Value {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let output = std::process::Command::new("python3")
+            .current_dir(root)
+            .arg("-c")
+            .arg(include_str!("resource_contract.py"))
+            .output()
+            .expect("python resource oracle");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("python resource oracle json")
+    }
+
+    #[test]
     fn output_field_order_is_the_python_contract() {
         let operation = Operation {
             kind: "create",
@@ -925,8 +1078,7 @@ mod tests {
             source: "/s/x".into(),
             reason: "destination is absent",
             component: "skills",
-            resource_kind: "directory-symlink",
-            digest: None,
+            resource: resource::PathResource::DirectorySymlink,
             diagnostic: None,
             trust_token: None,
             trust_required: false,
