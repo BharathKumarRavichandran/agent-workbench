@@ -208,6 +208,7 @@ pub struct Cli {
     pub target: SkillsTarget,
     pub components: Option<Vec<ComponentKind>>,
     pub destination: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub adopt: bool,
     pub json: bool,
@@ -220,7 +221,7 @@ pub struct Operation {
     key: String,
     destination: String,
     source: String,
-    reason: &'static str,
+    reason: String,
     component: &'static str,
     resource: resource::PathResource,
     diagnostic: Option<String>,
@@ -239,10 +240,14 @@ impl Serialize for Operation {
         map.serialize_entry("kind", self.kind)?;
         map.serialize_entry("key", &self.key)?;
         map.serialize_entry("destination", &self.destination)?;
-        map.serialize_entry("source", &self.source)?;
-        map.serialize_entry("reason", self.reason)?;
+        let projected_conflict = self.key.starts_with("component:");
+        map.serialize_entry("source", &(!projected_conflict).then_some(&self.source))?;
+        map.serialize_entry("reason", &self.reason)?;
         map.serialize_entry("component", self.component)?;
-        map.serialize_entry("resourceKind", self.resource.kind())?;
+        map.serialize_entry(
+            "resourceKind",
+            &(!projected_conflict).then_some(self.resource.kind()),
+        )?;
         map.serialize_entry(
             "digest",
             &self.resource.digest().map(resource::ContentDigest::as_str),
@@ -283,6 +288,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 
     let mut target = None;
     let mut destination = None;
+    let mut project_root = None;
     let mut state_dir = default_state_dir()?;
     let mut adopt = false;
     let mut json = false;
@@ -293,6 +299,11 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
             "--destination" => {
                 destination = Some(expand_home(
                     &args.next().ok_or("--destination requires a value")?,
+                )?)
+            }
+            "--project-root" => {
+                project_root = Some(expand_home(
+                    &args.next().ok_or("--project-root requires a value")?,
                 )?)
             }
             "--state-dir" => {
@@ -345,6 +356,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         target,
         components,
         destination,
+        project_root,
         state_dir,
         adopt,
         json,
@@ -1040,7 +1052,7 @@ mod tests {
             key: "sample".into(),
             destination: "/dest/sample".into(),
             source: source.into(),
-            reason: "destination is absent",
+            reason: "destination is absent".into(),
             component,
             resource,
             diagnostic: None,
@@ -1094,7 +1106,7 @@ mod tests {
             key: "skill:x".into(),
             destination: "/d/x".into(),
             source: "/s/x".into(),
-            reason: "destination is absent",
+            reason: "destination is absent".into(),
             component: "skills",
             resource: resource::PathResource::DirectorySymlink,
             diagnostic: None,

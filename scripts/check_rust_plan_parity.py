@@ -137,6 +137,7 @@ class Side:
         )
         process_environment: dict[str, str | None] = {
             "HOME": str(self.base / "home"),
+            "PYTHONDONTWRITEBYTECODE": "1",
             "CODEX_HOME": str(self.base / "codex-home"),
             "HERMES_HOME": str(self.base / "hermes-home"),
         }
@@ -674,6 +675,61 @@ def copied_agent_lifecycle(base: Path) -> None:
     )
 
 
+def add_document(side: Side, kind: str, name: str, body: str) -> Path:
+    path = side.root / "plugins/pstack" / kind / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    catalog_path = side.root / "catalog/plugins.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog["plugins"][0]["artifacts"][kind] = {"path": f"pstack/{kind}"}
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    return path
+
+
+def cursor_project_paths(base: Path) -> None:
+    python, rust = pair(base, "project-paths", "cursor")
+    for side in (python, rust):
+        add_document(side, "agents", "sample.md", "---\nname: sample\ndescription: Sample.\n---\nagent\n")
+        add_document(side, "rules", "sample.mdc", "---\ndescription: Sample.\n---\nrule\n")
+        add_document(side, "commands", "sample.md", "---\ndescription: Sample.\n---\ncommand\n")
+    for component, diagnostic in (("rules", "PROJECT_ROOT_REQUIRED"), ("commands", "COMPONENT_UNSUPPORTED")):
+        for action in ("plan", "install", "status"):
+            py = python.command(action, "--component", component)
+            rs = rust.command(action, "--component", component)
+            assert py.returncode == 1 and json.loads(py.stdout)[0]["diagnostic"] == diagnostic
+            compare(f"cursor {component} {action} rejection", python, rust, py, rs)
+        for side in (python, rust):
+            assert not side.state.exists() and not side.destination.exists()
+            assert not (side.base / "home").exists()
+    for action in ("plan", "install", "status", "uninstall"):
+        results = []
+        for side in (python, rust):
+            extra = ["--project-root", str(side.base / "project")]
+            if action != "uninstall":
+                extra += ["--component", "skills", "--component", "agents", "--component", "rules"]
+            results.append(side.command(action, *extra))
+        assert results[0].returncode == 0, results[0].stderr
+        compare(f"cursor project {action}", python, rust, *results)
+        if action in ("install", "status"):
+            compare_state(f"cursor project {action}", python, rust)
+            for side in (python, rust):
+                assert (side.destination / "example").is_symlink()
+                for kind, filename in (("agents", "sample.md"), ("rules", "sample.mdc")):
+                    installed = side.base / "project/.cursor" / kind / filename
+                    assert installed.read_bytes() == (side.root / "plugins/pstack" / kind / filename).read_bytes()
+    # Profile projectRoot is honored; a disagreeing CLI value overrides it.
+    for side in (python, rust):
+        profile_path = side.root / "profiles/pstack.json"
+        profile = json.loads(profile_path.read_text())
+        profile["schemaVersion"] = 2
+        profile["targets"] = [{"id": "cursor", "components": ["agents", "rules"], "projectRoot": str(side.base / "profile-project")}]
+        profile_path.write_text(json.dumps(profile))
+    for override in (False, True):
+        results = [side.command("plan", *(["--project-root", str(side.base / "cli-project")] if override else [])) for side in (python, rust)]
+        assert results[0].returncode == 0
+        compare(f"cursor profile project override={override}", python, rust, *results)
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -691,6 +747,7 @@ def main() -> int:
                 v2_compatibility(base, target)
                 state_rejection(base, target)
             destination_root_authorization(base)
+            cursor_project_paths(base)
             copied_agent_lifecycle(base)
             component_override(base)
             destination_precedence(base)

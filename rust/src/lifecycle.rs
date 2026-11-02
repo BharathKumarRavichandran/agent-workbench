@@ -94,7 +94,14 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         catalog.marketplace.id, profile.id
     ));
     let previous = state::load(&state_file)?;
-    let authorized = authorized_roots(cli.target, &destination)?;
+    let project_root = cli
+        .project_root
+        .clone()
+        .or_else(|| target.project_root.as_deref().map(PathBuf::from));
+    let project_root = project_root
+        .map(|path| expand_home_path(path).and_then(|path| canonicalize_missing(&path)))
+        .transpose()?;
+    let authorized = authorized_roots(cli.target, &destination, project_root.as_deref())?;
     if let Some(previous) = &previous {
         if previous.marketplace != catalog.marketplace.id
             || previous.profile != profile.id
@@ -111,6 +118,75 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         authorize_recorded_roots(previous, &authorized)?;
     }
 
+    let mut projection_conflicts = Vec::new();
+    if cli.action != Action::Uninstall {
+        for component in &requested {
+            let supported = match cli.target {
+                SkillsTarget::Cursor => matches!(
+                    component,
+                    ComponentKind::Skills
+                        | ComponentKind::Agents
+                        | ComponentKind::Rules
+                        | ComponentKind::Hooks
+                        | ComponentKind::Mcp
+                ),
+                SkillsTarget::Claude => matches!(
+                    component,
+                    ComponentKind::Skills
+                        | ComponentKind::Agents
+                        | ComponentKind::Commands
+                        | ComponentKind::Hooks
+                        | ComponentKind::Mcp
+                ),
+                _ => *component == ComponentKind::Skills,
+            };
+            let rejection = if !supported {
+                Some((
+                    "COMPONENT_UNSUPPORTED",
+                    format!(
+                        "{target_id} does not support current {} format",
+                        component.as_str()
+                    ),
+                ))
+            } else if !authorized.contains_key(component) {
+                Some((
+                    "PROJECT_ROOT_REQUIRED",
+                    format!("{target_id} {} requires --project-root", component.as_str()),
+                ))
+            } else {
+                None
+            };
+            if let Some((code, reason)) = rejection {
+                projection_conflicts.push(Operation {
+                    kind: "conflict",
+                    key: format!("component:{}", component.as_str()),
+                    destination: authorized
+                        .get(component)
+                        .unwrap_or(&destination)
+                        .to_string_lossy()
+                        .into_owned(),
+                    source: String::new(),
+                    reason,
+                    component: component.as_str(),
+                    resource: PathResource::DirectorySymlink,
+                    diagnostic: Some(code.into()),
+                    trust_token: None,
+                    trust_required: false,
+                    expected_link: None,
+                    expected_digest: None,
+                });
+            }
+        }
+    }
+    let accepted: Vec<_> = requested
+        .iter()
+        .copied()
+        .filter(|component| {
+            !projection_conflicts
+                .iter()
+                .any(|op| op.component == component.as_str())
+        })
+        .collect();
     let desired = if cli.action == Action::Uninstall {
         BTreeMap::new()
     } else {
@@ -119,7 +195,7 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
             &catalog,
             &profile,
             &destination,
-            &requested,
+            &accepted,
             &authorized,
         )?
     };
@@ -128,9 +204,22 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         .map(|value| &value.entries)
         .cloned()
         .unwrap_or_default();
-    let mut operations = Vec::new();
+    let mut operations = projection_conflicts;
     let mut next_entries = BTreeMap::new();
-    for (key, entry) in &desired {
+    let mut ordered_desired: Vec<_> = desired.iter().collect();
+    ordered_desired.sort_by_key(|(key, entry)| {
+        (
+            catalog
+                .plugins
+                .iter()
+                .position(|plugin| plugin.id == entry.plugin),
+            accepted
+                .iter()
+                .position(|component| *component == entry.component),
+            *key,
+        )
+    });
+    for (key, entry) in ordered_desired {
         let source = entry.source_repository.join(&entry.source);
         let prior = owned.get(key);
         let same_owner = prior.is_some_and(|prior| {
@@ -377,7 +466,7 @@ fn operation(
         key: entry.key.clone(),
         destination: entry.destination.to_string_lossy().into_owned(),
         source: source.to_string_lossy().into_owned(),
-        reason,
+        reason: reason.into(),
         component: entry.component.as_str(),
         resource: entry.resource.clone(),
         diagnostic: None,
@@ -403,6 +492,7 @@ fn authorize_recorded_roots(
 fn authorized_roots(
     target: SkillsTarget,
     destination: &Path,
+    project_root: Option<&Path>,
 ) -> Result<BTreeMap<ComponentKind, PathBuf>> {
     let mut roots = BTreeMap::from([(ComponentKind::Skills, destination.to_path_buf())]);
     if !matches!(target, SkillsTarget::Cursor | SkillsTarget::Claude) {
@@ -413,13 +503,19 @@ fn authorized_roots(
         SkillsTarget::Claude => ".claude",
         _ => unreachable!(),
     };
-    let home_base = home_dir()?.join(base_name);
+    let home_base = match project_root {
+        Some(project) => project.join(base_name),
+        None => home_dir()?.join(base_name),
+    };
     let capability_base = home_base.join("skills");
     let capability_parent = capability_base
         .parent()
         .ok_or("target home has no parent")?
         .to_path_buf();
     roots.insert(ComponentKind::Agents, capability_parent.join("agents"));
+    if target == SkillsTarget::Cursor && project_root.is_some() {
+        roots.insert(ComponentKind::Rules, capability_parent.join("rules"));
+    }
     if target == SkillsTarget::Claude {
         roots.insert(ComponentKind::Commands, capability_parent.join("commands"));
     }
@@ -1210,6 +1306,7 @@ mod race_tests {
                 target: SkillsTarget::Hermes,
                 components: None,
                 destination: Some(self.destination.clone()),
+                project_root: None,
                 state_dir: self.state_root.clone(),
                 adopt: false,
                 json: true,
