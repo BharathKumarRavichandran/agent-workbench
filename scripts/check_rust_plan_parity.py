@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box Python/Rust parity matrix for the Hermes skills lifecycle."""
+"""Black-box Python/Rust parity matrix for skills-only target lifecycles."""
 
 from __future__ import annotations
 
@@ -16,8 +16,25 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 RUST = REPOSITORY / "rust" / "target" / "debug" / "agent-workbench-rs"
 
 
-def run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=REPOSITORY, text=True, capture_output=True, check=False)
+def run(
+    command: list[str], env: dict[str, str | None] | None = None
+) -> subprocess.CompletedProcess[str]:
+    process_env = None
+    if env is not None:
+        process_env = os.environ.copy()
+        for key, value in env.items():
+            if value is None:
+                process_env.pop(key, None)
+            else:
+                process_env[key] = value
+    return subprocess.run(
+        command,
+        cwd=REPOSITORY,
+        env=process_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def fixture(base: Path, name: str = "checkout") -> Path:
@@ -57,7 +74,7 @@ def fixture(base: Path, name: str = "checkout") -> Path:
                 "schemaVersion": 1,
                 "id": "pstack",
                 "plugins": {"include": ["pstack"], "exclude": []},
-                "targets": [{"id": "hermes"}],
+                "targets": [{"id": "agents"}, {"id": "hermes"}],
             }
         ),
         encoding="utf-8",
@@ -66,9 +83,10 @@ def fixture(base: Path, name: str = "checkout") -> Path:
 
 
 class Side:
-    def __init__(self, implementation: str, base: Path) -> None:
+    def __init__(self, implementation: str, base: Path, target: str) -> None:
         self.implementation = implementation
         self.base = base.resolve()
+        self.target = target
         self.root = fixture(self.base)
         self.destination = self.base / "destination"
         self.state = self.base / "state"
@@ -79,9 +97,17 @@ class Side:
 
     @property
     def state_file(self) -> Path:
-        return self.state / "agent-workbench/market/pstack/hermes.json"
+        return self.state / f"agent-workbench/market/pstack/{self.target}.json"
 
-    def command(self, action: str, *extra: str, root: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def command(
+        self,
+        action: str,
+        *extra: str,
+        root: Path | None = None,
+        explicit_destination: bool = True,
+        destination_value: str | None = None,
+        environment: dict[str, str | None] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         common = [
             "--root",
             str(root or self.root),
@@ -89,20 +115,30 @@ class Side:
             "pstack",
             action,
             "--target",
-            "hermes",
-            "--destination",
-            str(self.destination),
-            "--state-dir",
-            str(self.state),
-            "--json",
-            *extra,
+            self.target,
         ]
+        if explicit_destination:
+            common.extend(
+                [
+                    "--destination",
+                    destination_value
+                    if destination_value is not None
+                    else str(self.destination),
+                ]
+            )
+        common.extend(["--state-dir", str(self.state), "--json", *extra])
         command = (
             [sys.executable, "-m", "agent_workbench", *common]
             if self.implementation == "python"
             else [str(RUST), *common]
         )
-        return run(command)
+        process_environment: dict[str, str | None] = {
+            "HOME": str(self.base / "home"),
+            "HERMES_HOME": str(self.base / "hermes-home"),
+        }
+        if environment is not None:
+            process_environment.update(environment)
+        return run(command, env=process_environment)
 
     def normalize(self, text: str) -> str:
         return text.replace(str(self.base), "<BASE>")
@@ -113,6 +149,31 @@ def compare(label: str, python: Side, rust: Side, py: subprocess.CompletedProces
     actual = (rs.returncode, rust.normalize(rs.stdout), rust.normalize(rs.stderr))
     if expected != actual:
         raise AssertionError(f"{label} mismatch\nPython: {expected!r}\nRust:   {actual!r}")
+
+
+def compare_error_class(
+    label: str,
+    python: Side,
+    rust: Side,
+    py: subprocess.CompletedProcess[str],
+    rs: subprocess.CompletedProcess[str],
+    expected_code: int,
+) -> None:
+    expected = (
+        py.returncode,
+        python.normalize(py.stdout),
+        py.stderr.startswith("error: "),
+    )
+    actual = (
+        rs.returncode,
+        rust.normalize(rs.stdout),
+        rs.stderr.startswith("error: "),
+    )
+    required = (expected_code, "", True)
+    if expected != required or actual != required:
+        raise AssertionError(
+            f"{label} error-class mismatch\nPython: {expected!r}\nRust:   {actual!r}"
+        )
 
 
 def compare_state(label: str, python: Side, rust: Side) -> None:
@@ -128,12 +189,107 @@ def compare_state(label: str, python: Side, rust: Side) -> None:
         )
 
 
-def pair(base: Path, name: str) -> tuple[Side, Side]:
-    return Side("python", base / name / "python"), Side("rust", base / name / "rust")
+def pair(base: Path, name: str, target: str) -> tuple[Side, Side]:
+    return (
+        Side("python", base / target / name / "python", target),
+        Side("rust", base / target / name / "rust", target),
+    )
 
 
-def install_status_uninstall(base: Path) -> None:
-    absent_python, absent_rust = pair(base, "absent-uninstall")
+def default_destination(base: Path, target: str) -> None:
+    cases: list[tuple[str, dict[str, str | None]]] = [
+        ("configured", {}),
+        ("home-unset", {"HOME": None, "HERMES_HOME": None}),
+    ]
+    if target == "hermes":
+        cases.extend(
+            [
+                ("hermes-empty", {"HERMES_HOME": ""}),
+                ("hermes-relative", {"HERMES_HOME": "relative-hermes"}),
+                ("hermes-tilde", {"HERMES_HOME": "~/custom-hermes"}),
+            ]
+        )
+
+    configured: tuple[Side, Side] | None = None
+    for name, environment in cases:
+        python, rust = pair(base, f"default-destination-{name}", target)
+        if name == "configured":
+            configured = (python, rust)
+        compare(
+            f"{target} default destination {name}",
+            python,
+            rust,
+            python.command(
+                "plan", explicit_destination=False, environment=environment
+            ),
+            rust.command("plan", explicit_destination=False, environment=environment),
+        )
+
+    assert configured is not None
+    python, rust = configured
+    compare(
+        f"{target} default install",
+        python,
+        rust,
+        python.command("install", explicit_destination=False),
+        rust.command("install", explicit_destination=False),
+    )
+    compare_state(f"{target} default install", python, rust)
+    for side in (python, rust):
+        root = (
+            side.base / "home/.agents/skills"
+            if target == "agents"
+            else side.base / "hermes-home/skills"
+        )
+        link = root / "example"
+        if not link.is_symlink() or Path(os.readlink(link)).is_absolute():
+            raise AssertionError(f"{target} default install did not create a relative link")
+    compare(
+        f"{target} default status",
+        python,
+        rust,
+        python.command("status", explicit_destination=False),
+        rust.command("status", explicit_destination=False),
+    )
+    compare(
+        f"{target} default uninstall",
+        python,
+        rust,
+        python.command("uninstall", explicit_destination=False),
+        rust.command("uninstall", explicit_destination=False),
+    )
+
+
+def explicit_destination_expansion(base: Path, target: str) -> None:
+    python, rust = pair(base, "explicit-destination-tilde", target)
+    compare(
+        f"{target} explicit destination tilde",
+        python,
+        rust,
+        python.command("plan", destination_value="~/custom-skills"),
+        rust.command("plan", destination_value="~/custom-skills"),
+    )
+
+
+def component_override(base: Path) -> None:
+    python, rust = pair(base, "component-override", "agents")
+    for side in (python, rust):
+        profile_path = side.root / "profiles/pstack.json"
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        profile["schemaVersion"] = 2
+        profile["targets"][0]["components"] = ["skills", "agents"]
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    compare(
+        "agents explicit skills component override",
+        python,
+        rust,
+        python.command("plan", "--component", "skills"),
+        rust.command("plan", "--component", "skills"),
+    )
+
+
+def install_status_uninstall(base: Path, target: str) -> None:
+    absent_python, absent_rust = pair(base, "absent-uninstall", target)
     compare(
         "absent-state uninstall",
         absent_python,
@@ -141,7 +297,7 @@ def install_status_uninstall(base: Path) -> None:
         absent_python.command("uninstall"),
         absent_rust.command("uninstall"),
     )
-    python, rust = pair(base, "clean")
+    python, rust = pair(base, "clean", target)
     compare("clean install", python, rust, python.command("install"), rust.command("install"))
     compare_state("clean install", python, rust)
     for side in (python, rust):
@@ -163,21 +319,21 @@ def install_status_uninstall(base: Path) -> None:
     assert not python.state_file.exists() and not rust.state_file.exists()
 
 
-def adoption_and_conflicts(base: Path) -> None:
-    python, rust = pair(base, "adopt")
+def adoption_and_conflicts(base: Path, target: str) -> None:
+    python, rust = pair(base, "adopt", target)
     for side in (python, rust):
         side.destination.mkdir(parents=True)
         (side.destination / "example").symlink_to(side.source, target_is_directory=True)
     compare("adoption", python, rust, python.command("install", "--adopt"), rust.command("install", "--adopt"))
     compare_state("adoption", python, rust)
 
-    python, rust = pair(base, "foreign")
+    python, rust = pair(base, "foreign", target)
     for side in (python, rust):
         side.destination.mkdir(parents=True)
         (side.destination / "example").write_text("foreign", encoding="utf-8")
     compare("foreign conflict", python, rust, python.command("status"), rust.command("status"))
 
-    python, rust = pair(base, "modified")
+    python, rust = pair(base, "modified", target)
     compare("modified setup", python, rust, python.command("install"), rust.command("install"))
     for side in (python, rust):
         (side.destination / "example").unlink()
@@ -186,8 +342,8 @@ def adoption_and_conflicts(base: Path) -> None:
     compare("modified uninstall", python, rust, python.command("uninstall"), rust.command("uninstall"))
 
 
-def relocation(base: Path) -> None:
-    python, rust = pair(base, "relocation")
+def relocation(base: Path, target: str) -> None:
+    python, rust = pair(base, "relocation", target)
     compare("relocation setup", python, rust, python.command("install"), rust.command("install"))
     second_roots = []
     for side in (python, rust):
@@ -210,7 +366,7 @@ def v2_state(side: Side) -> dict[str, object]:
         "repository": str(side.root),
         "marketplace": "market",
         "profile": "pstack",
-        "target": "hermes",
+        "target": side.target,
         "destinationRoot": str(side.destination),
         "entries": {
             "skill:example": {
@@ -230,36 +386,41 @@ def seed_v2(side: Side) -> None:
     side.state_file.write_text(json.dumps(v2_state(side), indent=2) + "\n", encoding="utf-8")
 
 
-def v2_compatibility(base: Path) -> None:
-    python, rust = pair(base, "v2-migrate")
+def v2_compatibility(base: Path, target: str) -> None:
+    python, rust = pair(base, "v2-migrate", target)
     seed_v2(python)
     seed_v2(rust)
     compare("v2 migration", python, rust, python.command("install"), rust.command("install"))
     compare_state("v2 migration", python, rust)
 
-    python, rust = pair(base, "v2-uninstall")
+    python, rust = pair(base, "v2-uninstall", target)
     seed_v2(python)
     seed_v2(rust)
     compare("v2 uninstall", python, rust, python.command("uninstall"), rust.command("uninstall"))
 
 
-def state_rejection(base: Path) -> None:
+def state_rejection(base: Path, target: str) -> None:
     cases = {
         "v4": {"schemaVersion": 4},
         "null": {"schemaVersion": None},
         "duplicate": '{"schemaVersion":3,"schemaVersion":3}',
     }
     for name, value in cases.items():
-        python, rust = pair(base, f"reject-{name}")
+        python, rust = pair(base, f"reject-{name}", target)
         for side in (python, rust):
             side.state_file.parent.mkdir(parents=True)
             text = value if isinstance(value, str) else json.dumps(value)
             side.state_file.write_text(text, encoding="utf-8")
-        py, rs = python.command("status"), rust.command("status")
-        if py.returncode != 2 or rs.returncode != 2:
-            raise AssertionError(f"state rejection {name}: Python={py.returncode}, Rust={rs.returncode}")
+        compare_error_class(
+            f"state rejection {name}",
+            python,
+            rust,
+            python.command("status"),
+            rust.command("status"),
+            2,
+        )
 
-    python, rust = pair(base, "broken-state-link")
+    python, rust = pair(base, "broken-state-link", target)
     for side in (python, rust):
         side.state_file.parent.mkdir(parents=True)
         side.state_file.symlink_to(side.state_file.with_name("missing.json"))
@@ -282,15 +443,22 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
-            install_status_uninstall(base)
-            adoption_and_conflicts(base)
-            relocation(base)
-            v2_compatibility(base)
-            state_rejection(base)
+            for target in ("agents", "hermes"):
+                default_destination(base, target)
+                explicit_destination_expansion(base, target)
+                install_status_uninstall(base, target)
+                adoption_and_conflicts(base, target)
+                relocation(base, target)
+                v2_compatibility(base, target)
+                state_rejection(base, target)
+            component_override(base)
     except AssertionError as error:
         print(error, file=sys.stderr)
         return 1
-    print("lifecycle parity: clean/adopt/conflict/relocation/v2/rejection scenarios match")
+    print(
+        "lifecycle parity: agents+hermes destinations/overrides/clean/adopt/"
+        "conflict/relocation/v2/rejection scenarios match"
+    )
     return 0
 
 
