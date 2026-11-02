@@ -50,7 +50,7 @@ Convert the workbench to a standalone Rust CLI without extending product behavio
 
 ### D. Trusted activation and state v4
 
-- [ ] Port strict state v4 decoding while retaining safe v2/v3 uninstall and migration behavior.
+- [x] Port strict state v4 decoding while retaining safe v2/v3 uninstall and migration behavior.
 - [ ] Port content-bound trust grants, token verification, changed-content invalidation, and read-only trust inspection.
 - [ ] Port immutable managed bundle publication and digest/mode verification.
 - [ ] Port slot-level shared-document ownership while preserving foreign fields, entries, and ordering.

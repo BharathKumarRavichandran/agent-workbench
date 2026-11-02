@@ -933,6 +933,264 @@ def copy_race_rows(base: Path) -> None:
             assert not python.state_file.exists() and not rust.state_file.exists()
 
 
+def state_wire_rows(base: Path) -> None:
+    """Python load_state/as_dict is the wire oracle, not an authority oracle."""
+    import copy
+    from typing import Any
+    if str(REPOSITORY) not in sys.path:
+        sys.path.insert(0, str(REPOSITORY))
+    from agent_workbench.state import load_state
+
+    inputs = base / "inputs"
+    inputs.mkdir(parents=True)
+    state = {
+        "schemaVersion": 4, "repository": "/repo", "marketplace": "market",
+        "profile": "pstack", "target": "cursor", "destinationRoot": "/skills",
+        "destinationRoots": {"skills": "/skills", "hooks": "/hooks", "mcp": "/config"},
+        "entries": {"hook:bundle": {
+            "key": "hook:bundle", "plugin": "pstack", "source": "plugins/hooks",
+            "destination": "/hooks/bundle", "component": "hooks",
+            "resourceKind": "directory-copy", "sourceRepository": "/repo",
+            "digest": "a" * 64, "trust": "aw-trust-v1:" + "b" * 64,
+            "trustProof": "aw-proof-v1:" + "c" * 64}},
+        "slots": {"mcp:pstack:server": {
+            "key": "mcp:pstack:server", "plugin": "pstack", "component": "mcp",
+            "document": "/arbitrary/config.json", "slot": "server", "digest": "d" * 64,
+            "trust": "aw-trust-v1:" + "e" * 64, "trustProof": "aw-proof-v1:" + "f" * 64}},
+    }
+    cases: dict[str, Any] = {"v4": state}
+    for label, route in (("state", ()), ("entry", ("entries", "hook:bundle")),
+                         ("slot", ("slots", "mcp:pstack:server"))):
+        obj = state
+        for key in route:
+            obj = obj[key]
+        for field in obj:
+            for variant in ("missing", "null"):
+                changed = copy.deepcopy(state)
+                cursor = changed
+                for key in route:
+                    cursor = cursor[key]
+                if variant == "missing":
+                    del cursor[field]
+                else:
+                    cursor[field] = None
+                cases[f"{label}-{field}-{variant}"] = changed
+        changed = copy.deepcopy(state)
+        cursor = changed
+        for key in route:
+            cursor = cursor[key]
+        cursor["unknown"] = True
+        cases[f"{label}-unknown"] = changed
+    variants = {
+        "bad-trust": ("entries", "hook:bundle", "trust", "aw-trust-v1:" + "A" * 64),
+        "bad-proof": ("slots", "mcp:pstack:server", "trustProof", "aw-proof-v1:bad"),
+        "bad-digest": ("entries", "hook:bundle", "digest", "a" * 63),
+        "wrong-key": ("entries", "hook:bundle", "key", "hook:other"),
+        "wrong-component": ("entries", "hook:bundle", "component", "agents"),
+        "wrong-resource": ("entries", "hook:bundle", "resourceKind", "file-copy"),
+        "wrong-slot-key": ("slots", "mcp:pstack:server", "slot", "other"),
+        "wrong-slot-component": ("slots", "mcp:pstack:server", "component", "agents"),
+        "slot-name-not-path": ("slots", "mcp:pstack:server", "slot", "../server"),
+        "relative-document": ("slots", "mcp:pstack:server", "document", "config.json"),
+        "parent-document": ("slots", "mcp:pstack:server", "document", "/a/../config.json"),
+        "wrong-destination": ("entries", "hook:bundle", "destination", "/hooks/other"),
+        "nested-destination": ("entries", "hook:bundle", "destination", "/hooks/nested/bundle"),
+        "parent-source": ("entries", "hook:bundle", "source", "../hooks"),
+        "normalized-source": ("entries", "hook:bundle", "source", "./plugins//hooks/"),
+    }
+    for label, (collection, key, field, value) in variants.items():
+        changed = copy.deepcopy(state)
+        changed[collection][key][field] = value
+        cases[label] = changed
+    for label, roots in (("missing-root", {"skills": "/skills"}),
+                         ("wrong-skills-root", {"skills": "/other", "hooks": "/hooks"})):
+        changed = copy.deepcopy(state)
+        changed["destinationRoots"] = roots
+        cases[label] = changed
+    for version in (2, 3, 4):
+        changed = copy.deepcopy(state)
+        changed["schemaVersion"] = version
+        changed["entries"] = {}
+        if version < 4:
+            del changed["slots"]
+        if version == 2:
+            del changed["destinationRoots"]
+        cases[f"empty-v{version}"] = changed
+    # Legacy entries and conditional evidence are part of the same wire contract.
+    for version in (2, 3, 4):
+        for component, prefix, kind in (("skills", "skill", "directory-symlink"),
+                                         ("agents", "agent", "file-copy"),
+                                         ("rules", "rule", "file-copy"),
+                                         ("commands", "command", "file-copy"),
+                                         ("hooks", "hook", "directory-copy")):
+            changed = copy.deepcopy(state)
+            changed["schemaVersion"] = version
+            key = f"{prefix}:example"
+            entry = {"key": key, "plugin": "pstack", "source": "./plugins//example/",
+                     "destination": "/skills/example"}
+            if version >= 3:
+                entry.update(component=component, resourceKind=kind, sourceRepository="/repo")
+                if kind != "directory-symlink":
+                    entry["digest"] = "a" * 64
+                if kind == "directory-copy":
+                    entry["trust"] = "aw-trust-v1:" + "b" * 64
+                changed["destinationRoots"][component] = "/skills"
+            else:
+                del changed["destinationRoots"]
+            if version < 4:
+                del changed["slots"]
+            changed["entries"] = {key: entry}
+            cases[f"v{version}-{component}"] = changed
+            for field in ("digest", "trust", "trustProof"):
+                extra = copy.deepcopy(changed)
+                extra["entries"][key][field] = ("aw-proof-v1:" if field == "trustProof" else "aw-trust-v1:" if field == "trust" else "") + "a" * 64
+                cases[f"v{version}-{component}-extra-{field}"] = extra
+    for component in ("hooks", "mcp"):
+        changed = copy.deepcopy(state)
+        slot = changed["slots"].pop("mcp:pstack:server")
+        key = f"{component}:pstack:../server"
+        slot.update(key=key, component=component, slot="../server")
+        changed["slots"][key] = slot
+        cases[f"opaque-slot-{component}"] = changed
+    for value in (True, 4.0, "4", -1, 5):
+        changed = copy.deepcopy(state)
+        changed["schemaVersion"] = value
+        cases[f"version-{value!r}"] = changed
+    # Cross-invalid rows pin first-error precedence, including insertion order.
+    for label, edits in {
+        "entry-before-metadata": [((), "repository", "relative"), (("entries", "hook:bundle"), "digest", "bad")],
+        "entry-before-roots": [((), "destinationRoots", None), (("entries", "hook:bundle"), "plugin", "!")],
+        "roots-before-slots": [((), "destinationRoots", {}), (("slots", "mcp:pstack:server"), "trustProof", "bad")],
+        "destination-before-slots": [(("entries", "hook:bundle"), "destination", "/hooks/wrong"), (("slots", "mcp:pstack:server"), "trustProof", "bad")],
+        "slots-before-metadata": [((), "repository", "relative"), (("slots", "mcp:pstack:server"), "trustProof", "bad")],
+        "digest-before-entry-keys": [(("entries", "hook:bundle"), "digest", "bad"), (("entries", "hook:bundle"), "unknown", True)],
+        "proof-before-slot-keys": [(("slots", "mcp:pstack:server"), "trustProof", "bad"), (("slots", "mcp:pstack:server"), "unknown", True)],
+        "metadata-order": [((), "repository", "relative"), ((), "marketplace", "!")],
+    }.items():
+        changed = copy.deepcopy(state)
+        for route, field, value in edits:
+            cursor = changed
+            for key in route:
+                cursor = cursor[key]
+            cursor[field] = value
+        cases[f"order-{label}"] = changed
+    for label, route in (("state", ()), ("entry", ("entries", "hook:bundle")),
+                         ("slot", ("slots", "mcp:pstack:server"))):
+        original = state
+        for key in route:
+            original = original[key]
+        for field in original:
+            for index, value in enumerate(("", "\x00", 0, 1.5, True, [], {})):
+                changed = copy.deepcopy(state)
+                cursor = changed
+                for key in route:
+                    cursor = cursor[key]
+                cursor[field] = value
+                cases[f"type-{label}-{field}-{index}"] = changed
+    for version in (2, 3, 4):
+        changed = copy.deepcopy(state)
+        changed["schemaVersion"] = version
+        changed["entries"] = copy.deepcopy(cases[f"v{version}-skills"])["entries"]
+        if version < 4:
+            changed.pop("slots")
+        if version == 2:
+            changed.pop("destinationRoots")
+        changed["repository"] = "//repo//./"
+        changed["destinationRoot"] = "/skills//./"
+        changed["entries"]["skill:example"]["destination"] = "/skills//./example/"
+        if version >= 3:
+            changed["destinationRoots"]["skills"] = "/skills//./"
+        cases[f"normalized-paths-v{version}"] = changed
+    for collection in ("entries", "slots", "destinationRoots"):
+        changed = copy.deepcopy(state)
+        if collection == "entries":
+            changed[collection] = {"hook:z": {"component": "invalid-first"}, "hook:a": {"component": "invalid-second"}}
+        elif collection == "slots":
+            changed[collection] = {"z": {"trustProof": "bad"}, "a": {}}
+        else:
+            changed[collection] = {"z": "relative", "a": "relative"}
+        cases[f"order-insertion-{collection}"] = changed
+    for version in (3, 4):
+        changed = copy.deepcopy(cases[f"v{version}-skills"])
+        changed["destinationRoots"]["agents"] = "/skills//./"
+        entry = copy.deepcopy(changed["entries"]["skill:example"])
+        entry.update(key="agent:example", component="agents", resourceKind="file-copy",
+                     digest="a" * 64, destination="/skills//./example/")
+        changed["entries"]["agent:example"] = entry
+        cases[f"repeated-normalized-destination-v{version}"] = changed
+    for label, field, value in (("quote", "component", "a'b"),
+                                ("double-quote", "component", 'a"b'),
+                                ("list", "component", [True, None, "x"]),
+                                ("map", "component", {"z": False, "a": 0})):
+        changed = copy.deepcopy(state)
+        changed["entries"]["hook:bundle"][field] = value
+        cases[f"repr-{label}"] = changed
+    for label, route in (("state", ()), ("entry", ("entries", "hook:bundle")),
+                         ("slot", ("slots", "mcp:pstack:server"))):
+        changed = copy.deepcopy(state)
+        cursor = changed
+        for key in route:
+            cursor = cursor[key]
+        del cursor["key" if route else "repository"]
+        del cursor["plugin" if route else "profile"]
+        cursor["unknown"] = True
+        cases[f"missing-before-unknown-{label}"] = changed
+    cases["top-array"] = []
+    cases["top-null"] = None
+    expected = {}
+    for label, value in cases.items():
+        path = inputs / f"{label}.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+    # Duplicate detection must operate before object decoding, at every depth.
+    for label, token in (("top", '"schemaVersion": 4'), ("entry", '"digest": "' + "a" * 64 + '"'),
+                         ("slot", '"slot": "server"')):
+        text = json.dumps(state).replace(token, token + ", " + token, 1)
+        (inputs / f"duplicate-{label}.json").write_text(text, encoding="utf-8")
+    for label, text in {
+        "quoted": "{\"a'b\": 1, \"a'b\": 2}",
+        "escaped": '{"a\\u0000": 1, "a\\u0000": 2}',
+        "nested-before-outer": '{"outer": 1, "outer": {"inner": 1, "inner": 2}}',
+        "earlier-duplicate-later-child": '{"outer": 1, "outer": 2, "later": {"inner": 1, "inner": 2}}',
+    }.items():
+        (inputs / f"duplicate-{label}.json").write_text(text, encoding="utf-8")
+    for path in sorted(inputs.iterdir()):
+        try:
+            loaded = load_state(path)
+            assert loaded is not None
+            expected[path.name] = {"accepted": True, "encoded": json.dumps(loaded.as_dict(), indent=2, ensure_ascii=False) + "\n"}
+        except ValueError as error:
+            expected[path.name] = {"accepted": False, "error_class": type(error).__name__, "error": str(error)}
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "state::parity_tests::differential_state_wire", "--", "--ignored", "--exact"],
+                 {"AW_STATE_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "results.json").read_text())
+    mismatches = {key: (value, actual.get(key)) for key, value in expected.items() if value != actual.get(key)}
+    assert not mismatches, f"state wire mismatches: {mismatches!r}"
+    print(f"state wire parity: {len(expected)} strict v2/v3/v4 cases match")
+
+
+def state_v4_fail_closed(base: Path) -> None:
+    side = Side("rust", base / "v4-fail-closed", "cursor")
+    seed_v2(side)
+    state = v2_state(side)
+    state.update(schemaVersion=4, slots={}, destinationRoots={"skills": str(side.destination)})
+    entries = state["entries"]
+    assert isinstance(entries, dict)
+    entry = entries["skill:example"]
+    assert isinstance(entry, dict)
+    entry.update(component="skills", resourceKind="directory-symlink", sourceRepository=str(side.root))
+    side.state_file.write_text(json.dumps(state), encoding="utf-8")
+    before = side.state_file.read_bytes()
+    target = os.readlink(side.destination / "example")
+    for action in ("plan", "status", "install", "uninstall"):
+        result = side.command(action)
+        assert result.returncode == 2 and "v4 executable lifecycle is not supported" in result.stderr, result
+        assert side.state_file.read_bytes() == before
+        assert os.readlink(side.destination / "example") == target
+    print("state v4 lifecycle: plan/status/install/uninstall fail closed without mutation")
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -941,6 +1199,8 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
+            state_wire_rows(base / "state-wire")
+            state_v4_fail_closed(base)
             for target in TARGETS:
                 default_destination(base, target)
                 explicit_destination_expansion(base, target)

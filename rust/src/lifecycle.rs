@@ -121,6 +121,14 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         catalog.marketplace.id, profile.id
     ));
     let previous = state::load(&state_file)?;
+    // v4 parsing is available, but executable planning/transactions are not ported.
+    // Do not classify, remove, downgrade, or silently drop recorded slots/evidence.
+    if previous
+        .as_ref()
+        .is_some_and(|state| state.schema_version == 4)
+    {
+        return Err("v4 executable lifecycle is not supported by Rust yet".into());
+    }
     let authorized = authorized_roots(cli.target, &destination, project_root.as_deref())?;
     if let Some(previous) = &previous {
         if previous.marketplace != catalog.marketplace.id
@@ -286,6 +294,7 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
     }
     let next = State {
         schema_version: 3,
+        slots: BTreeMap::new(),
         repository: repository.clone(),
         marketplace: catalog.marketplace.id.clone(),
         profile: profile.id.clone(),
@@ -1351,6 +1360,7 @@ fn write_progress(plan: &Plan, entries: &BTreeMap<String, Entry>) -> Result<()> 
     });
     let progress = State {
         schema_version: 3,
+        slots: BTreeMap::new(),
         repository: plan.next.repository.clone(),
         marketplace: plan.next.marketplace.clone(),
         profile: plan.next.profile.clone(),
