@@ -135,6 +135,10 @@ pub enum ComponentKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillsTarget {
     Agents,
+    Claude,
+    Codex,
+    Cursor,
+    Grok,
     Hermes,
 }
 
@@ -142,6 +146,10 @@ impl SkillsTarget {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "agents" => Ok(Self::Agents),
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "cursor" => Ok(Self::Cursor),
+            "grok" => Ok(Self::Grok),
             "hermes" => Ok(Self::Hermes),
             _ => Err(format!("unsupported target for Rust parity unit: {value}")),
         }
@@ -150,6 +158,10 @@ impl SkillsTarget {
     fn id(self) -> &'static str {
         match self {
             Self::Agents => "agents",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+            Self::Grok => "grok",
             Self::Hermes => "hermes",
         }
     }
@@ -157,15 +169,21 @@ impl SkillsTarget {
     fn default_destination(self) -> Result<PathBuf> {
         match self {
             Self::Agents => Ok(home_dir()?.join(".agents/skills")),
-            Self::Hermes => {
-                let base = match env::var_os("HERMES_HOME").filter(|value| !value.is_empty()) {
-                    Some(value) => expand_home_path(PathBuf::from(value))?,
-                    None => home_dir()?.join(".hermes"),
-                };
-                Ok(base.join("skills"))
-            }
+            Self::Claude => Ok(home_dir()?.join(".claude/skills")),
+            Self::Codex => environment_skills_destination("CODEX_HOME", ".codex"),
+            Self::Cursor => Ok(home_dir()?.join(".cursor/skills")),
+            Self::Grok => Ok(home_dir()?.join(".grok/skills")),
+            Self::Hermes => environment_skills_destination("HERMES_HOME", ".hermes"),
         }
     }
+}
+
+fn environment_skills_destination(variable: &str, fallback: &str) -> Result<PathBuf> {
+    let base = match env::var_os(variable).filter(|value| !value.is_empty()) {
+        Some(value) => expand_home_path(PathBuf::from(value))?,
+        None => home_dir()?.join(fallback),
+    };
+    Ok(base.join("skills"))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -282,7 +300,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 }
 
 fn usage() -> String {
-    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] {plan,status,install,uninstall} --target {agents,hermes} [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] --json".into()
+    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] {plan,status,install,uninstall} --target {agents,claude,codex,cursor,grok,hermes} [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] --json".into()
 }
 
 pub fn help_requested(args: &[String]) -> bool {
