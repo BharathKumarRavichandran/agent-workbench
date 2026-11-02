@@ -14,6 +14,7 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 RUST = REPOSITORY / "rust" / "target" / "debug" / "agent-workbench-rs"
+TARGETS = ("agents", "claude", "codex", "cursor", "grok", "hermes")
 
 
 def run(
@@ -74,7 +75,7 @@ def fixture(base: Path, name: str = "checkout") -> Path:
                 "schemaVersion": 1,
                 "id": "pstack",
                 "plugins": {"include": ["pstack"], "exclude": []},
-                "targets": [{"id": "agents"}, {"id": "hermes"}],
+                "targets": [{"id": target} for target in TARGETS],
             }
         ),
         encoding="utf-8",
@@ -83,11 +84,13 @@ def fixture(base: Path, name: str = "checkout") -> Path:
 
 
 class Side:
-    def __init__(self, implementation: str, base: Path, target: str) -> None:
+    def __init__(
+        self, implementation: str, base: Path, target: str, initialize: bool = True
+    ) -> None:
         self.implementation = implementation
         self.base = base.resolve()
         self.target = target
-        self.root = fixture(self.base)
+        self.root = fixture(self.base) if initialize else self.base / "checkout"
         self.destination = self.base / "destination"
         self.state = self.base / "state"
 
@@ -134,6 +137,7 @@ class Side:
         )
         process_environment: dict[str, str | None] = {
             "HOME": str(self.base / "home"),
+            "CODEX_HOME": str(self.base / "codex-home"),
             "HERMES_HOME": str(self.base / "hermes-home"),
         }
         if environment is not None:
@@ -197,16 +201,23 @@ def pair(base: Path, name: str, target: str) -> tuple[Side, Side]:
 
 
 def default_destination(base: Path, target: str) -> None:
+    environment_variable = {
+        "codex": "CODEX_HOME",
+        "hermes": "HERMES_HOME",
+    }.get(target)
     cases: list[tuple[str, dict[str, str | None]]] = [
         ("configured", {}),
-        ("home-unset", {"HOME": None, "HERMES_HOME": None}),
+        (
+            "home-unset",
+            {"HOME": None, "CODEX_HOME": None, "HERMES_HOME": None},
+        ),
     ]
-    if target == "hermes":
+    if environment_variable is not None:
         cases.extend(
             [
-                ("hermes-empty", {"HERMES_HOME": ""}),
-                ("hermes-relative", {"HERMES_HOME": "relative-hermes"}),
-                ("hermes-tilde", {"HERMES_HOME": "~/custom-hermes"}),
+                ("environment-empty", {environment_variable: ""}),
+                ("environment-relative", {environment_variable: "relative-home"}),
+                ("environment-tilde", {environment_variable: "~/custom-home"}),
             ]
         )
 
@@ -236,12 +247,15 @@ def default_destination(base: Path, target: str) -> None:
     )
     compare_state(f"{target} default install", python, rust)
     for side in (python, rust):
-        root = (
-            side.base / "home/.agents/skills"
-            if target == "agents"
-            else side.base / "hermes-home/skills"
-        )
-        link = root / "example"
+        roots = {
+            "agents": side.base / "home/.agents/skills",
+            "claude": side.base / "home/.claude/skills",
+            "codex": side.base / "codex-home/skills",
+            "cursor": side.base / "home/.cursor/skills",
+            "grok": side.base / "home/.grok/skills",
+            "hermes": side.base / "hermes-home/skills",
+        }
+        link = roots[target] / "example"
         if not link.is_symlink() or Path(os.readlink(link)).is_absolute():
             raise AssertionError(f"{target} default install did not create a relative link")
     compare(
@@ -272,20 +286,109 @@ def explicit_destination_expansion(base: Path, target: str) -> None:
 
 
 def component_override(base: Path) -> None:
-    python, rust = pair(base, "component-override", "agents")
-    for side in (python, rust):
-        profile_path = side.root / "profiles/pstack.json"
-        profile = json.loads(profile_path.read_text(encoding="utf-8"))
-        profile["schemaVersion"] = 2
-        profile["targets"][0]["components"] = ["skills", "agents"]
-        profile_path.write_text(json.dumps(profile), encoding="utf-8")
-    compare(
-        "agents explicit skills component override",
-        python,
-        rust,
-        python.command("plan", "--component", "skills"),
-        rust.command("plan", "--component", "skills"),
-    )
+    for target in ("agents", "claude", "cursor"):
+        python, rust = pair(base, f"component-override-{target}", target)
+        for side in (python, rust):
+            profile_path = side.root / "profiles/pstack.json"
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            profile["schemaVersion"] = 2
+            selected = next(item for item in profile["targets"] if item["id"] == target)
+            selected["components"] = ["skills", "agents"]
+            profile_path.write_text(json.dumps(profile), encoding="utf-8")
+        compare(
+            f"{target} explicit skills component override",
+            python,
+            rust,
+            python.command("plan", "--component", "skills"),
+            rust.command("plan", "--component", "skills"),
+        )
+
+
+def destination_precedence(base: Path) -> None:
+    for target in TARGETS:
+        python, rust = pair(base, f"{target}-destination-precedence", target)
+        for side in (python, rust):
+            profile_path = side.root / "profiles/pstack.json"
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            selected = next(item for item in profile["targets"] if item["id"] == target)
+            selected["destination"] = "~/profile-skills"
+            profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+        profile_results = (
+            python.command("plan", explicit_destination=False),
+            rust.command("plan", explicit_destination=False),
+        )
+        compare(
+            f"{target} profile destination overrides environment/default",
+            python,
+            rust,
+            *profile_results,
+        )
+        cli_results = (
+            python.command("plan", destination_value="~/cli-skills"),
+            rust.command("plan", destination_value="~/cli-skills"),
+        )
+        compare(
+            f"{target} CLI destination overrides profile",
+            python,
+            rust,
+            *cli_results,
+        )
+
+        for side, profile_result, cli_result in zip(
+            (python, rust), profile_results, cli_results
+        ):
+            destinations = (
+                Path(json.loads(profile_result.stdout)[0]["destination"]),
+                Path(json.loads(cli_result.stdout)[0]["destination"]),
+            )
+            expected = (
+                side.base / "home/profile-skills/example",
+                side.base / "home/cli-skills/example",
+            )
+            if destinations != expected:
+                raise AssertionError(
+                    f"{target} destination precedence mismatch: {destinations!r}"
+                )
+
+
+def shared_state_isolation(base: Path) -> None:
+    implementations: dict[str, list[Side]] = {}
+    for implementation in ("python", "rust"):
+        shared = base / "shared-state" / implementation
+        implementations[implementation] = [
+            Side(implementation, shared, target, initialize=index == 0)
+            for index, target in enumerate(TARGETS)
+        ]
+
+    for python, rust in zip(
+        implementations["python"], implementations["rust"]
+    ):
+        compare(
+            f"shared state install {python.target}",
+            python,
+            rust,
+            python.command("install", explicit_destination=False),
+            rust.command("install", explicit_destination=False),
+        )
+        compare_state(f"shared state install {python.target}", python, rust)
+
+    expected = {f"{target}.json" for target in TARGETS}
+    for sides in implementations.values():
+        actual = {path.name for path in sides[0].state_file.parent.glob("*.json")}
+        if actual != expected:
+            raise AssertionError(f"target state isolation mismatch: {actual!r}")
+
+    for python, rust in zip(
+        implementations["python"], implementations["rust"]
+    ):
+        compare(
+            f"shared state uninstall {python.target}",
+            python,
+            rust,
+            python.command("uninstall", explicit_destination=False),
+            rust.command("uninstall", explicit_destination=False),
+        )
 
 
 def install_status_uninstall(base: Path, target: str) -> None:
@@ -443,7 +546,7 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
-            for target in ("agents", "hermes"):
+            for target in TARGETS:
                 default_destination(base, target)
                 explicit_destination_expansion(base, target)
                 install_status_uninstall(base, target)
@@ -452,11 +555,13 @@ def main() -> int:
                 v2_compatibility(base, target)
                 state_rejection(base, target)
             component_override(base)
+            destination_precedence(base)
+            shared_state_isolation(base)
     except AssertionError as error:
         print(error, file=sys.stderr)
         return 1
     print(
-        "lifecycle parity: agents+hermes destinations/overrides/clean/adopt/"
+        "lifecycle parity: all six skills targets destinations/overrides/clean/adopt/"
         "conflict/relocation/v2/rejection scenarios match"
     )
     return 0
