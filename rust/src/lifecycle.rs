@@ -8,6 +8,10 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+#[path = "copy_parity_tests.rs"]
+mod copy_parity_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
     Plan,
@@ -34,7 +38,7 @@ pub(super) struct Plan {
     next: State,
     state_file: PathBuf,
     repository: PathBuf,
-    root: RootSnapshot,
+    roots: BTreeMap<PathBuf, RootSnapshot>,
 }
 
 pub(super) fn run(cli: &Cli) -> Result<(Vec<Operation>, bool)> {
@@ -83,24 +87,40 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
     }) {
         return Err("Rust parity unit supports only path components".into());
     }
-    let destination = resolve_destination(
-        cli.destination.as_deref(),
-        target.destination.as_deref(),
-        cli.target,
-    )?;
+    let project_root = cli
+        .project_root
+        .clone()
+        .or_else(|| target.project_root.as_deref().map(PathBuf::from));
+    let project_root = project_root
+        .map(|path| {
+            let path = expand_home_path(path)?;
+            if has_parent_component(&path) {
+                return Err("project root must be contained".into());
+            }
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                env::current_dir()
+                    .map_err(|error| error.to_string())?
+                    .join(path)
+            };
+            canonicalize_missing(&absolute)
+        })
+        .transpose()?;
+    let destination = match (&project_root, &cli.destination, &target.destination) {
+        (Some(project), None, None) => project.join(format!(".{target_id}/skills")),
+        _ => resolve_destination(
+            cli.destination.as_deref(),
+            target.destination.as_deref(),
+            cli.target,
+        )?,
+    };
     reject_destination_root_symlink(&destination)?;
     let state_file = canonicalize_missing(&cli.state_dir)?.join(format!(
         "agent-workbench/{}/{}/{target_id}.json",
         catalog.marketplace.id, profile.id
     ));
     let previous = state::load(&state_file)?;
-    let project_root = cli
-        .project_root
-        .clone()
-        .or_else(|| target.project_root.as_deref().map(PathBuf::from));
-    let project_root = project_root
-        .map(|path| expand_home_path(path).and_then(|path| canonicalize_missing(&path)))
-        .transpose()?;
     let authorized = authorized_roots(cli.target, &destination, project_root.as_deref())?;
     if let Some(previous) = &previous {
         if previous.marketplace != catalog.marketplace.id
@@ -274,14 +294,17 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         entries: next_entries,
         destination_roots,
     };
-    let root = snapshot_root(&destination)?;
+    let roots = authorized
+        .values()
+        .map(|path| Ok((path.clone(), snapshot_root(path)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
     Ok(Plan {
         operations,
         previous,
         next,
         state_file,
         repository,
-        root,
+        roots,
     })
 }
 
@@ -380,7 +403,10 @@ fn desired_entries(
                     component.as_str()
                 )
             })?;
-            let artifact_root = resolve_repo_path(&source_root, &artifact.path)?;
+            let artifact_root = canonicalize_missing(&source_root.join(&artifact.path))?;
+            if !artifact_root.starts_with(&source_root) {
+                return Err("repository path escapes checkout".into());
+            }
             for (name, source) in discover_files(&artifact_root, suffix, component)? {
                 let key = format!("{}:{name}", component_key_prefix(component));
                 if entries.contains_key(&key) {
@@ -430,14 +456,7 @@ fn discover_files(
     suffix: &str,
     component: ComponentKind,
 ) -> Result<Vec<(String, PathBuf)>> {
-    let metadata =
-        fs::symlink_metadata(root).map_err(|error| format!("{}: {error}", root.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!(
-            "artifact root may not be a symlink: {}",
-            root.display()
-        ));
-    }
+    reject_symlink_tree(root)?;
     let mut found = Vec::new();
     for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
@@ -701,9 +720,27 @@ fn matches_owned(entry: &Entry) -> Result<bool> {
     )
 }
 
-fn read_regular(path: &Path) -> Result<Vec<u8>> {
-    let file = rfs::open(
-        path,
+fn read_regular(repository: &Path, path: &Path) -> Result<Vec<u8>> {
+    let relative = path
+        .strip_prefix(repository)
+        .map_err(|_| "copy source escapes checkout")?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    let mut directory =
+        rfs::open(repository, flags, Mode::empty()).map_err(|error| error.to_string())?;
+    for component in relative
+        .parent()
+        .ok_or("copy source has no parent")?
+        .components()
+    {
+        if !matches!(component, Component::Normal(_)) {
+            return Err("copy source escapes checkout".into());
+        }
+        directory = rfs::openat(&directory, component.as_os_str(), flags, Mode::empty())
+            .map_err(|error| error.to_string())?;
+    }
+    let file = rfs::openat(
+        &directory,
+        relative.file_name().ok_or("copy source has no filename")?,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
@@ -719,7 +756,6 @@ fn read_regular(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn file_digest(path: &Path) -> Result<Option<String>> {
-    use sha2::{Digest, Sha256};
     let file = match rfs::open(
         path,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
@@ -729,6 +765,11 @@ fn file_digest(path: &Path) -> Result<Option<String>> {
         Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
+    digest_descriptor(file)
+}
+
+fn digest_descriptor(file: OwnedFd) -> Result<Option<String>> {
+    use sha2::{Digest, Sha256};
     let metadata = rfs::fstat(&file).map_err(|error| error.to_string())?;
     if !rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_file() {
         return Ok(None);
@@ -969,6 +1010,8 @@ impl DestinationRoot {
     }
 
     fn quarantine_file(&self, name: &str, expected_digest: &str) -> Result<Quarantine> {
+        #[cfg(test)]
+        copy_parity_tests::event("quarantine", &self.path.join(name))?;
         let directory = format!(".agent-workbench-quarantine-{}-{name}", std::process::id());
         rfs::mkdirat(&self.fd, &directory, Mode::from_raw_mode(0o700))
             .map_err(|error| error.to_string())?;
@@ -984,7 +1027,23 @@ impl DestinationRoot {
             return Err(error.to_string());
         }
         let moved = Quarantine { directory, qfd };
-        let actual = file_digest(&self.path.join(&moved.directory).join("entry"))?;
+        #[cfg(test)]
+        copy_parity_tests::event("quarantined", &self.path)?;
+        let actual = rfs::openat(
+            &moved.qfd,
+            "entry",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| error.to_string())
+        .and_then(digest_descriptor);
+        let actual = match actual {
+            Ok(actual) => actual,
+            Err(error) => {
+                self.restore(name, moved)?;
+                return Err(error);
+            }
+        };
         if actual.as_deref() != Some(expected_digest) {
             self.restore(name, moved)?;
             return Err(format!(
@@ -996,6 +1055,8 @@ impl DestinationRoot {
     }
 
     fn publish_file(&self, name: &str, content: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        copy_parity_tests::event("publish", &self.path)?;
         let temporary = format!(".agent-workbench-copy-{}-{}", std::process::id(), name);
         let file = rfs::openat(
             &self.fd,
@@ -1019,16 +1080,21 @@ impl DestinationRoot {
             return Err(error.to_string());
         }
         rfs::unlinkat(&self.fd, &temporary, AtFlags::empty()).map_err(|error| error.to_string())?;
-        let dir = rfs::open(
-            &self.path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(|error| error.to_string())?;
-        rfs::fsync(&dir).map_err(|error| error.to_string())
+        #[cfg(test)]
+        copy_parity_tests::event("published", &self.path)?;
+        rfs::fsync(&self.fd).map_err(|error| error.to_string())
     }
 
     fn restore(&self, name: &str, moved: Quarantine) -> Result<()> {
+        match rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(rustix::io::Errno::NOENT) => {}
+            _ => {
+                return Err(format!(
+                "destination changed while restoring quarantined entry; recover it from {}/entry",
+                self.path.join(&moved.directory).display()
+            ))
+            }
+        }
         rfs::renameat(&moved.qfd, "entry", &self.fd, name).map_err(|error| {
             format!(
                 "destination changed while restoring quarantined entry; recover it from {}/entry: {error}",
@@ -1053,17 +1119,32 @@ struct Quarantine {
     qfd: OwnedFd,
 }
 
+fn validate_operation_source(plan: &Plan, operation: &Operation) -> Result<Option<Vec<u8>>> {
+    let source = Path::new(&operation.source);
+    if let PathResource::FileCopy(digest) = &operation.resource {
+        let content = read_regular(&plan.repository, source)?;
+        use sha2::{Digest, Sha256};
+        if format!("{:x}", Sha256::digest(&content)) != digest.as_str() {
+            return Err(format!(
+                "copy source changed since planning: {}",
+                source.display()
+            ));
+        }
+        Ok(Some(content))
+    } else {
+        validate_source(&plan.repository, source)?;
+        Ok(None)
+    }
+}
+
 fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
     let _lock = LockedState::acquire(&plan.state_file)?;
     if state::load(&plan.state_file)? != plan.previous {
         return Err("installation state changed since planning".into());
     }
     for operation in &plan.operations {
-        if operation.kind != "remove-owned"
-            && !matches!(operation.resource, PathResource::FileCopy(_))
-        {
-            let source = Path::new(&operation.source);
-            validate_source(&plan.repository, source)?;
+        if operation.kind != "remove-owned" {
+            validate_operation_source(plan, operation)?;
         }
     }
     if plan.operations.is_empty() {
@@ -1073,7 +1154,25 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
             state::write(&plan.state_file, &plan.next)
         };
     }
-    let skills_root = DestinationRoot::open(&plan.root, !uninstall)?;
+    let needed: BTreeSet<_> = plan
+        .operations
+        .iter()
+        .map(|operation| {
+            Path::new(&operation.destination)
+                .parent()
+                .ok_or_else(|| "destination has no parent".to_owned())
+        })
+        .collect::<Result<_>>()?;
+    let roots = needed
+        .into_iter()
+        .map(|path| {
+            let snapshot = plan
+                .roots
+                .get(path)
+                .ok_or("destination root lacks planning snapshot")?;
+            Ok((path, DestinationRoot::open(snapshot, !uninstall)?))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let mut entries = plan
         .previous
         .as_ref()
@@ -1082,12 +1181,7 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
     for operation in &plan.operations {
         let destination = Path::new(&operation.destination);
         let parent = destination.parent().ok_or("destination has no parent")?;
-        let other = if parent != skills_root.path {
-            Some(DestinationRoot::open(&snapshot_root(parent)?, !uninstall)?)
-        } else {
-            None
-        };
-        let root = other.as_ref().unwrap_or(&skills_root);
+        let root = roots.get(parent).ok_or("destination root was not opened")?;
         root.verify()?;
         let name = destination
             .file_name()
@@ -1095,6 +1189,7 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
             .ok_or("destination name is not UTF-8")?;
         match operation.kind {
             "keep" | "adopt" => {
+                validate_operation_source(plan, operation)?;
                 if let PathResource::FileCopy(digest) = &operation.resource {
                     if file_digest(Path::new(&operation.destination))?.as_deref()
                         != Some(digest.as_str())
@@ -1129,19 +1224,15 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
             "create" => {
                 let source = Path::new(&operation.source);
                 if matches!(operation.resource, PathResource::FileCopy(_)) {
-                    let content = read_regular(source)?;
-                    let digest = file_digest(source)?.ok_or_else(|| {
-                        format!("copy source changed since planning: {}", source.display())
-                    })?;
-                    if operation.resource.digest().map(|value| value.as_str())
-                        != Some(digest.as_str())
-                    {
-                        return Err(format!(
-                            "copy source changed since planning: {}",
-                            source.display()
-                        ));
-                    }
+                    let content =
+                        validate_operation_source(plan, operation)?.ok_or("copy lacks content")?;
                     root.publish_file(name, &content)?;
+                    if let Err(error) = root.verify() {
+                        let digest = operation.resource.digest().ok_or("copy lacks digest")?;
+                        let moved = root.quarantine_file(name, digest.as_str())?;
+                        root.discard(moved)?;
+                        return Err(error);
+                    }
                 } else {
                     validate_source(&plan.repository, source)?;
                     root.create_verified(name, source)?;
@@ -1184,18 +1275,8 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
             "replace-owned" => {
                 let source = Path::new(&operation.source);
                 if matches!(operation.resource, PathResource::FileCopy(_)) {
-                    let content = read_regular(source)?;
-                    let digest = file_digest(source)?.ok_or_else(|| {
-                        format!("copy source changed since planning: {}", source.display())
-                    })?;
-                    if operation.resource.digest().map(|value| value.as_str())
-                        != Some(digest.as_str())
-                    {
-                        return Err(format!(
-                            "copy source changed since planning: {}",
-                            source.display()
-                        ));
-                    }
+                    let content =
+                        validate_operation_source(plan, operation)?.ok_or("copy lacks content")?;
                     let moved = operation
                         .expected_digest
                         .as_deref()
@@ -1256,6 +1337,18 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
 }
 
 fn write_progress(plan: &Plan, entries: &BTreeMap<String, Entry>) -> Result<()> {
+    #[cfg(test)]
+    copy_parity_tests::event("progress", &plan.state_file)?;
+    let mut destination_roots = plan
+        .previous
+        .as_ref()
+        .map(|state| state.destination_roots.clone())
+        .unwrap_or_default();
+    destination_roots.extend(plan.next.destination_roots.clone());
+    destination_roots.retain(|component, _| {
+        *component == ComponentKind::Skills
+            || entries.values().any(|entry| entry.component == *component)
+    });
     let progress = State {
         schema_version: 3,
         repository: plan.next.repository.clone(),
@@ -1264,7 +1357,7 @@ fn write_progress(plan: &Plan, entries: &BTreeMap<String, Entry>) -> Result<()> 
         target: plan.next.target.clone(),
         destination_root: plan.next.destination_root.clone(),
         entries: entries.clone(),
-        destination_roots: plan.next.destination_roots.clone(),
+        destination_roots,
     };
     state::write(&plan.state_file, &progress)
 }

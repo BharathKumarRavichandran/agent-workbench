@@ -46,7 +46,7 @@ Convert the workbench to a standalone Rust CLI without extending product behavio
 - [x] Port copied-resource create, keep, exact-copy adoption, replace-owned, remove-owned, conflict, rollback, and uninstall.
 - [x] Port Cursor agents, rules, and commands with project-root requirements and Python/Rust differential tests.
 - [x] Port Claude agents and legacy commands with exact representation selection and differential tests.
-- [ ] Prove source modes, installed bytes, digests, symlink rejection, parent/root swaps, mixed roots, and interrupted removal on macOS and Linux.
+- [x] Prove source modes, installed bytes, digests, symlink rejection, parent/root swaps, mixed roots, and interrupted removal on macOS and Linux.
 
 ### D. Trusted activation and state v4
 
