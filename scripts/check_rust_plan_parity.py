@@ -538,6 +538,57 @@ def state_rejection(base: Path, target: str) -> None:
         raise AssertionError("broken state symlink cleanup differs")
 
 
+def destination_root_authorization(base: Path) -> None:
+    python, rust = pair(base, "roots", "hermes")
+    for side in (python, rust):
+        state = {
+            "schemaVersion": 3,
+            "repository": str(side.root),
+            "marketplace": "market",
+            "profile": "pstack",
+            "target": "hermes",
+            "destinationRoot": str(side.destination),
+            "entries": {},
+            "destinationRoots": {
+                "skills": str(side.destination),
+                "agents": str(side.base / "unauthorized-agents"),
+            },
+        }
+        side.state_file.parent.mkdir(parents=True)
+        side.state_file.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    compare(
+        "unauthorized destination root",
+        python,
+        rust,
+        python.command("status"),
+        rust.command("status"),
+    )
+    python, rust = pair(base, "cursor-roots", "cursor")
+    for side in (python, rust):
+        state = {
+            "schemaVersion": 3,
+            "repository": str(side.root),
+            "marketplace": "market",
+            "profile": "pstack",
+            "target": "cursor",
+            "destinationRoot": str(side.destination),
+            "entries": {},
+            "destinationRoots": {
+                "agents": str(side.base / "home" / ".cursor" / "agents"),
+                "skills": str(side.destination),
+            },
+        }
+        side.state_file.parent.mkdir(parents=True)
+        side.state_file.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    compare(
+        "authorized cursor agents root",
+        python,
+        rust,
+        python.command("status"),
+        rust.command("status"),
+    )
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -554,6 +605,7 @@ def main() -> int:
                 relocation(base, target)
                 v2_compatibility(base, target)
                 state_rejection(base, target)
+            destination_root_authorization(base)
             component_override(base)
             destination_precedence(base)
             shared_state_isolation(base)
@@ -562,7 +614,7 @@ def main() -> int:
         return 1
     print(
         "lifecycle parity: all six skills targets destinations/overrides/clean/adopt/"
-        "conflict/relocation/v2/rejection scenarios match"
+        "conflict/relocation/v2/rejection/destination-root scenarios match"
     )
     return 0
 

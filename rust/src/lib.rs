@@ -123,7 +123,7 @@ pub struct ProfileTarget {
     pub project_root: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum ComponentKind {
     Skills,

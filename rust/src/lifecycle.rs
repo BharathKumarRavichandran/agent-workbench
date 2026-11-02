@@ -99,6 +99,7 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         if previous.destination_root != destination {
             return Err("recorded destination root differs from requested destination; pass the same explicit --destination used for installation".into());
         }
+        authorize_recorded_roots(previous, &authorized_roots(cli.target, &destination)?)?;
     }
 
     let desired = if cli.action == Action::Uninstall {
@@ -190,6 +191,7 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         target: target_id.into(),
         destination_root: destination.clone(),
         entries: next_entries,
+        destination_roots: BTreeMap::from([(ComponentKind::Skills, destination.clone())]),
     };
     let root = snapshot_root(&destination)?;
     Ok(Plan {
@@ -300,6 +302,51 @@ fn operation(
         trust_required: false,
         expected_link,
     }
+}
+
+fn authorize_recorded_roots(
+    previous: &State,
+    authorized: &BTreeMap<ComponentKind, PathBuf>,
+) -> Result<()> {
+    for (component, recorded) in &previous.destination_roots {
+        if authorized.get(component) != Some(recorded) {
+            return Err("recorded destination root differs from adapter-authorized root; pass the same --project-root".into());
+        }
+    }
+    Ok(())
+}
+
+fn authorized_roots(
+    target: SkillsTarget,
+    destination: &Path,
+) -> Result<BTreeMap<ComponentKind, PathBuf>> {
+    let mut roots = BTreeMap::from([(ComponentKind::Skills, destination.to_path_buf())]);
+    if !matches!(target, SkillsTarget::Cursor | SkillsTarget::Claude) {
+        return Ok(roots);
+    }
+    let base_name = match target {
+        SkillsTarget::Cursor => ".cursor",
+        SkillsTarget::Claude => ".claude",
+        _ => unreachable!(),
+    };
+    let home_base = home_dir()?.join(base_name);
+    let capability_base = home_base.join("skills");
+    let capability_parent = capability_base
+        .parent()
+        .ok_or("target home has no parent")?
+        .to_path_buf();
+    roots.insert(ComponentKind::Agents, capability_parent.join("agents"));
+    if target == SkillsTarget::Claude {
+        roots.insert(ComponentKind::Commands, capability_parent.join("commands"));
+    }
+    roots.insert(
+        ComponentKind::Hooks,
+        home_base.join(".agent-workbench-hooks"),
+    );
+    if target == SkillsTarget::Cursor {
+        roots.insert(ComponentKind::Mcp, home_base);
+    }
+    Ok(roots)
 }
 
 fn removal(key: &str, entry: &Entry, reason: &'static str) -> Result<Option<Operation>> {
@@ -722,6 +769,7 @@ fn write_progress(plan: &Plan, entries: &BTreeMap<String, Entry>) -> Result<()> 
         target: plan.next.target.clone(),
         destination_root: plan.next.destination_root.clone(),
         entries: entries.clone(),
+        destination_roots: plan.next.destination_roots.clone(),
     };
     state::write(&plan.state_file, &progress)
 }
