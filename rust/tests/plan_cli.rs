@@ -142,7 +142,7 @@ fn malformed_state_and_unknown_commands_fail_with_exit_two() {
     assert!(String::from_utf8_lossy(&state.stderr).contains("unsupported installation state"));
 
     let unknown = Command::new(env!("CARGO_BIN_EXE_agent-workbench-rs"))
-        .args(["--root", fixture.root.to_str().unwrap(), "trust"])
+        .args(["--root", fixture.root.to_str().unwrap(), "unknown"])
         .output()
         .unwrap();
     assert_eq!(code(&unknown), 2);

@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 mod lifecycle;
 mod resource;
 mod state;
+mod trust;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -277,6 +278,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
     let action = match token.as_str() {
         "plan" => lifecycle::Action::Plan,
         "status" => lifecycle::Action::Status,
+        "trust" => lifecycle::Action::Trust,
         "install" => lifecycle::Action::Install,
         "uninstall" => lifecycle::Action::Uninstall,
         _ => {
@@ -311,6 +313,12 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
             }
             "--component" if action != lifecycle::Action::Uninstall => {
                 components.push(args.next().ok_or("--component requires a value")?)
+            }
+            "--trust" if action != lifecycle::Action::Uninstall => {
+                // Path-only resources never consume activation grants. Keep
+                // Python's repeatable opaque-token parsing; executable selections
+                // remain rejected below, rather than accepting unused authority.
+                let _ = args.next().ok_or("--trust requires a value")?;
             }
             "--adopt" if action != lifecycle::Action::Uninstall => adopt = true,
             "--json" => json = true,
@@ -365,7 +373,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 }
 
 fn usage() -> String {
-    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] {plan,status,install,uninstall} --target {agents,claude,codex,cursor,grok,hermes} [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] --json".into()
+    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] {plan,status,trust,install,uninstall} --target {agents,claude,codex,cursor,grok,hermes} [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] [--trust TOKEN] --json".into()
 }
 
 pub fn help_requested(args: &[String]) -> bool {

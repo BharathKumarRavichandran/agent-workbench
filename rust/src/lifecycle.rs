@@ -16,6 +16,7 @@ mod copy_parity_tests;
 pub(super) enum Action {
     Plan,
     Status,
+    Trust,
     Install,
     Uninstall,
 }
@@ -120,6 +121,21 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         "agent-workbench/{}/{}/{target_id}.json",
         catalog.marketplace.id, profile.id
     ));
+    if cli.action == Action::Trust {
+        let roots = authorized_roots(cli.target, &destination, project_root.as_deref())?;
+        if let Some(hooks) = roots.get(&ComponentKind::Hooks) {
+            let journal = hooks
+                .parent()
+                .unwrap()
+                .join(".agent-workbench-transaction.json");
+            reject_destination_root_symlink(&journal)?;
+            match fs::symlink_metadata(&journal) {
+                Ok(_) => crate::trust::check_inspection(Some(&[]))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
     let previous = state::load(&state_file)?;
     // v4 parsing is available, but executable planning/transactions are not ported.
     // Do not classify, remove, downgrade, or silently drop recorded slots/evidence.
@@ -842,7 +858,9 @@ impl LockedState {
             ".{}.lock",
             path.file_name().unwrap().to_string_lossy()
         ));
+        use std::os::unix::fs::OpenOptionsExt;
         let file = OpenOptions::new()
+            .mode(0o600)
             .read(true)
             .write(true)
             .create(true)

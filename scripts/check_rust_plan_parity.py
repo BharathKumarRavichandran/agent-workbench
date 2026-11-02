@@ -1183,12 +1183,330 @@ def state_v4_fail_closed(base: Path) -> None:
     side.state_file.write_text(json.dumps(state), encoding="utf-8")
     before = side.state_file.read_bytes()
     target = os.readlink(side.destination / "example")
-    for action in ("plan", "status", "install", "uninstall"):
+    for action in ("plan", "status", "trust", "install", "uninstall"):
         result = side.command(action)
         assert result.returncode == 2 and "v4 executable lifecycle is not supported" in result.stderr, result
         assert side.state_file.read_bytes() == before
         assert os.readlink(side.destination / "example") == target
     print("state v4 lifecycle: plan/status/install/uninstall fail closed without mutation")
+
+
+def trust_contract_rows(base: Path) -> None:
+    """D2 dependency-bound contract; activation planning remains gated on D6."""
+    if str(REPOSITORY) not in sys.path:
+        sys.path.insert(0, str(REPOSITORY))
+    from agent_workbench.model import (ArtifactKind, ComponentKind, Plugin, Provenance,
+                                      RepoPath, ResolvedPlugin, Source, SourceKind, PluginId, SourceId)
+    from agent_workbench.trust import grant_token
+    base.mkdir(parents=True)
+    cases = []
+    expected = []
+    for component in ("hooks", "mcp"):
+        for kind in ("local", "curated-copy", "git-submodule"):
+            for variant in ("fallback", "override", "missing", "unicode", "changed", "null-source",
+                            "source-id", "source-path", "source-upstream", "source-branch",
+                            "plugin-upstream", "plugin-notice", "plugin-id", "controls", "path-document",
+                            "path-repository", "path-fallback", "path-override", "target", "document", "repository"):
+                unicode = variant == "unicode"
+                source = dict(id="local", kind=kind, path="plugins",
+                              upstream="https://source/é😀" if unicode else "https://source",
+                              branch="main")
+                provenance = dict(upstream="https://original/é😀", notice="NOTICE") if unicode else None
+                plugin = dict(id="pstack", source="local", artifacts={})
+                if provenance:
+                    plugin["provenance"] = provenance
+                fallback = None if variant == "missing" else str(base / "artifact")
+                override = str(base / "alias") if variant == "override" else None
+                digest = ("b" if variant == "changed" else "a") * 64
+                document = str(base / ("é😀\t.json" if unicode else "document.json"))
+                case = dict(source=source, plugin=plugin, component=component,
+                            repository=str(base), document=document, digest=digest,
+                            fallback=fallback, override=override, target="cursor")
+                resolved = ResolvedPlugin(
+                    Plugin(PluginId("pstack"), SourceId("local"), {}, Provenance(provenance["upstream"], RepoPath(provenance["notice"])) if provenance else None),
+                    Source(SourceId("local"), SourceKind(kind), RepoPath(source["path"]), source["upstream"], source["branch"]),
+                    {ArtifactKind(component): Path(fallback)} if fallback else {})
+                # Independently perturb each bound identity, not only content.
+                from dataclasses import replace
+                if variant == "null-source":
+                    case["source"] = {key: value for key, value in source.items() if key not in {"upstream", "branch"}}
+                    resolved = replace(resolved, source=replace(resolved.source, upstream=None, branch=None))
+                elif variant.startswith("source-"):
+                    field = variant.removeprefix("source-")
+                    source[field] = "other" if field != "upstream" else "https://other"
+                    resolved = replace(resolved, source=replace(resolved.source, **{
+                        field: SourceId(source[field]) if field == "id" else (RepoPath(source[field]) if field == "path" else source[field])}))
+                elif variant == "plugin-id":
+                    plugin["id"] = "other"
+                    resolved = replace(resolved, plugin=replace(resolved.plugin, id=PluginId("other")))
+                elif variant == "controls":
+                    case["target"] = ''.join(chr(i) for i in range(32)) + '\x7f"\\/é😀'
+                elif variant.startswith("path-"):
+                    field = variant.removeprefix("path-")
+                    # Pass lexical strings through pathlib on the Python side only.
+                    case[field] = "//" + str(base).lstrip("/") + "//./nested///file/"
+                    fallback = str(case["fallback"]) if case["fallback"] is not None else None
+                    override = str(case["override"]) if case["override"] is not None else None
+                    resolved = replace(resolved, artifact_paths={ArtifactKind(component): Path(fallback)} if fallback else {})
+                elif variant.startswith("plugin-"):
+                    notice = "OTHER-NOTICE" if variant == "plugin-notice" else None
+                    plugin["provenance"] = dict(upstream="https://original", **({"notice": notice} if notice else {}))
+                    resolved = replace(resolved, plugin=replace(resolved.plugin, provenance=Provenance("https://original", RepoPath(notice) if notice else None)))
+                elif variant in ("target", "document", "repository"):
+                    case[variant] = "claude" if variant == "target" else str(base / (variant + "-other"))
+                cases.append(case)
+                expected.append(grant_token(resolved, ComponentKind(component), str(case["target"]), Path(str(case["document"])), digest, Path(str(case["repository"])), Path(override) if override else None))
+    (base / "tokens.json").write_text(json.dumps(cases))
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "trust::parity_tests::differential_trust", "--", "--ignored", "--exact"],
+                 {"AW_TRUST_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "results.json").read_text())
+    assert len(actual) == len(expected)
+    mismatches = [(i, cases[i], e, a) for i, (e, a) in enumerate(zip(expected, actual)) if e != a]
+    assert not mismatches, f"content-bound trust mismatches ({len(mismatches)}): {mismatches[:1]!r}"
+    print(f"trust token parity: {len(expected)} dependency-bound cases match (D6 CLI not covered)")
+
+
+def trust_proof_rows(base: Path) -> None:
+    from dataclasses import replace
+    from agent_workbench.model import ComponentKind as C, DirectoryCopy, FileCopy
+    from agent_workbench.state import StateEntry, SlotState
+    from agent_workbench.trust import authenticated, record_proof, reuse_proof
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    token = "aw-trust-v1:" + "a" * 64
+    variants = ("valid", "missing-proof", "tampered", "transplanted", "missing-key",
+                "public-key", "special-mode", "short-key", "long-key", "symlink-key",
+                "hardlink-key", "directory-key", "fifo-key", "symlink-parent", "absent-parent",
+                "changed-candidate", "already-proof", "wrong-proof",
+                "changed-token", "explicit", "unrelated-explicit", "shared-slot", "other-plugin",
+                "other-component", "bundle", "other-bundle", "no-prior", "changed-digest", "changed-with-proof")
+    for record_type in ("entry", "slot", "hook-slot"):
+        fields = (("key", "plugin", "source", "destination", "component", "resourceKind", "sourceRepository", "trust", "digest", "trustProof")
+                  if record_type == "entry" else
+                  ("key", "plugin", "component", "document", "slot", "digest", "trust", "trustProof"))
+        for variant in (*variants, *("field-" + field for field in fields)):
+            case = base / f"{record_type}-{variant}"
+            case.mkdir()
+            file = case / "state.json"
+            key = case / ".state.json.transaction-key"
+            key.write_bytes(bytes(range(32)))
+            key.chmod(0o600)
+            record = (StateEntry("hook:pstack", "pstack", "plugins/é😀", str(case / "hooks/pstack"), C.HOOKS,
+                                 DirectoryCopy("b" * 64), str(base), token)
+                      if record_type == "entry" else
+                      SlotState(f"{'hooks' if record_type == 'hook-slot' else 'mcp'}:pstack:é😀", "pstack",
+                                C.HOOKS if record_type == "hook-slot" else C.MCP, str(case / "doc"), "é😀", "b" * 64, token))
+            signed = replace(record, trust_proof=record_proof(record, file))
+            prior = signed
+            bundle = None
+            candidate = record
+            if variant == "missing-proof":
+                prior = record
+            elif variant == "tampered":
+                prior = replace(signed, digest="c" * 64) if record_type != "entry" else replace(signed, source="other")
+            elif variant == "transplanted":
+                file = case / "other.json"
+                (case / ".other.json.transaction-key").write_bytes(bytes(range(32)))
+                (case / ".other.json.transaction-key").chmod(0o600)
+            elif variant == "missing-key":
+                key.unlink()
+            elif variant in ("public-key", "special-mode"):
+                key.chmod(0o644 if variant == "public-key" else 0o4600)
+            elif variant in ("short-key", "long-key"):
+                key.write_bytes(b"x" * (31 if variant == "short-key" else 33))
+            elif variant == "symlink-key":
+                key.rename(case / "real-key")
+                key.symlink_to("real-key")
+            elif variant == "hardlink-key":
+                os.link(key, case / "another-key")
+            elif variant == "directory-key":
+                key.unlink()
+                key.mkdir(mode=0o600)
+            elif variant == "fifo-key":
+                key.unlink()
+                os.mkfifo(key, 0o600)
+            elif variant == "symlink-parent":
+                (case / "alias").symlink_to(case, target_is_directory=True)
+                file = case / "alias/state.json"
+            elif variant == "absent-parent":
+                file = case / "absent/state.json"
+            elif variant == "changed-candidate":
+                candidate = replace(record, document=str(case / "other-doc")) if record_type != "entry" else replace(record, source="other")
+            elif variant == "already-proof":
+                candidate = replace(record, trust_proof="aw-proof-v1:" + "d" * 64)
+            elif variant == "wrong-proof":
+                prior = replace(signed, trust_proof="aw-proof-v1:" + "d" * 64)
+            elif variant == "changed-token":
+                candidate = replace(record, trust="aw-trust-v1:" + "c" * 64)
+            if variant in ("explicit", "unrelated-explicit", "no-prior"):
+                prior = None
+            elif variant in ("changed-digest", "changed-with-proof"):
+                candidate = replace(record, resource=DirectoryCopy("c" * 64)) if record_type == "entry" else replace(record, digest="c" * 64)
+                if variant == "changed-with-proof":
+                    candidate = replace(candidate, trust_proof="aw-proof-v1:" + "d" * 64)
+            elif variant in ("shared-slot", "other-plugin", "other-component") and record_type != "entry":
+                if variant == "shared-slot":
+                    prior = replace(record, key=f"{record.component.value}:pstack:second", slot="second")
+                elif variant == "other-plugin":
+                    prior = replace(record, key=f"{record.component.value}:other:é😀", plugin="other")
+                else:
+                    component = C.MCP if record.component is C.HOOKS else C.HOOKS
+                    prior = replace(record, key=f"{component.value}:pstack:é😀", component=component)
+                prior = replace(prior, trust_proof=record_proof(prior, file))
+            elif variant in ("bundle", "other-bundle") and record_type != "entry":
+                plugin_id = "other" if variant == "other-bundle" else "pstack"
+                bundle = StateEntry(f"hook:{plugin_id}", plugin_id, "plugins/hooks", str(case / f"hooks/{plugin_id}"),
+                                    C.HOOKS, DirectoryCopy("b" * 64), str(base), token)
+                bundle = replace(bundle, trust_proof=record_proof(bundle, file))
+                prior = None
+            mutation = None
+            saved_prior = prior
+            if variant.startswith("field-"):
+                field = variant.removeprefix("field-")
+                attr = {"resourceKind": "resource", "sourceRepository": "source_repository", "trustProof": "trust_proof"}.get(field, field)
+                value = ((C.MCP if record.component is C.HOOKS else C.HOOKS) if field == "component" else
+                         FileCopy("b" * 64) if field == "resourceKind" else
+                         DirectoryCopy("c" * 64) if field == "digest" and record_type == "entry" else
+                         "c" * 64 if field == "digest" else
+                         "aw-trust-v1:" + "c" * 64 if field == "trust" else
+                         "aw-proof-v1:" + "c" * 64 if field == "trustProof" else
+                         "other" if field in ("plugin", "source", "slot", "key") else str(case / "other"))
+                if field == "digest" and record_type == "entry":
+                    attr = "resource"
+                prior = replace(signed, **{attr: value})
+                mutation = dict(field=field, value=prior.as_dict()[field])
+                assert not authenticated(prior, file), (record_type, field)
+            explicit = [candidate.trust] if variant == "explicit" else (["unrelated"] if variant == "unrelated-explicit" else [])
+            try:
+                proof = record_proof(candidate, file)
+            except (OSError, ValueError):
+                proof = None
+            recorded = prior is not None and prior.trust == candidate.trust and authenticated(prior, file)
+            if record_type != "entry":
+                recorded = recorded and prior is not None and prior.plugin == candidate.plugin and prior.component is candidate.component
+                recorded = recorded or (candidate.component is C.HOOKS and bundle is not None and
+                           bundle.key == f"hook:{candidate.plugin}" and bundle.trust == candidate.trust and authenticated(bundle, file))
+            granted = candidate.trust in explicit or recorded
+            expected.append(dict(proof=proof, authenticated=authenticated(prior, file),
+                                 reused=(reuse_proof(candidate, prior if isinstance(prior, StateEntry) else None, file).as_dict()
+                                         if isinstance(candidate, StateEntry) else
+                                         reuse_proof(candidate, prior if isinstance(prior, SlotState) else None, file).as_dict()), granted=granted))
+            # The driver loads actual state through the strict D1 decoder.
+            def state_for(item):
+                return dict(schemaVersion=4, repository=str(base), marketplace="market", profile="pstack", target="cursor",
+                            destinationRoot=str(case), destinationRoots={"skills": str(case), "hooks": str(case / "hooks"), "mcp": str(case)},
+                            entries=({item.key: item.as_dict()} if item is not None and record_type == "entry" else
+                                     ({bundle.key: bundle.as_dict()} if item is None and bundle is not None else {})),
+                            slots={item.key: item.as_dict()} if item is not None and record_type != "entry" else {})
+            for name, item in (("prior", saved_prior), ("candidate", candidate)):
+                (case / f"{name}.json").write_text(json.dumps(state_for(item)))
+            rows.append(dict(file=str(file), prior=str(case / "prior.json"), candidate=str(case / "candidate.json"),
+                             explicit=explicit, mutation=mutation))
+    (base / "proofs.json").write_text(json.dumps(rows))
+    before = trust_snapshot(base)
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "trust::parity_tests::differential_proofs", "--", "--ignored", "--exact"], {"AW_TRUST_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "proof-results.json").read_text())
+    mismatches = [(rows[i], e, a) for i, (e, a) in enumerate(zip(expected, actual)) if e != a]
+    assert not mismatches, f"persisted trust mismatches ({len(mismatches)}): {mismatches[:1]!r}"
+    assert len(actual) == len(expected)
+    assert trust_snapshot(base) == before, "trust verification mutated fixtures or created authority"
+    print(f"persisted trust parity: {len(expected)} authentication/reuse/key-safety cases match")
+
+
+def trust_inspection_rows(base: Path) -> None:
+    from agent_workbench.installation import _recover_lifecycle
+    from agent_workbench.model import ComponentKind as C
+    from agent_workbench.adapters.activation import ACTIVATION_POLICIES
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    for target in ("cursor", "claude"):
+        for pending in (False, True):
+            case = base / f"{target}-{pending}"
+            case.mkdir()
+            journal = case / ACTIVATION_POLICIES[target].journal_name
+            if pending:
+                journal.write_text('{}')  # Even an unauthenticated journal blocks inspection.
+            try:
+                _recover_lifecycle(case / "state.json", {C.HOOKS: case / "hooks"}, repair=False, target_id=target)
+                expected.append(None)
+            except ValueError as error:
+                expected.append(str(error))
+            rows.append(str(journal))
+    (base / "inspection.json").write_text(json.dumps(rows))
+    before = trust_snapshot(base)
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "trust::parity_tests::differential_inspection", "--", "--ignored", "--exact"], {"AW_TRUST_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "inspection-results.json").read_text())
+    assert actual == expected, f"read-only inspection mismatch: {actual!r} != {expected!r}"
+    assert trust_snapshot(base) == before, "inspection mutated journal/state or created authority"
+    print(f"trust inspection parity: {len(rows)} dependency-bound pending-journal cases match without writes")
+
+
+def trust_cli_fail_closed(base: Path) -> None:
+    side = Side("rust", base / "trust-cli-rejection", "cursor")
+    rejection_before = trust_snapshot(side.base)
+    token = "aw-trust-v1:" + "a" * 64
+    # "trust" is read-only planning on non-executable resources; grants are
+    # accepted, repeatable, and irrelevant to these resources in Python.
+    for target in TARGETS:
+        py = Side("python", base / f"trust-cli-{target}-python", target)
+        rs = Side("rust", base / f"trust-cli-{target}-rust", target)
+        for phase in ("clean", "installed", "conflict"):
+            if phase == "installed":
+                compare("trust seed", py, rs, py.command("install"), rs.command("install"))
+            elif phase == "conflict":
+                for side in (py, rs):
+                    (side.destination / "example").unlink()
+                    (side.destination / "example").mkdir()
+            for action in ("trust", "plan", "status", "install"):
+                before = [trust_snapshot(side.base) for side in (py, rs)]
+                args = ("--component", "skills", "--trust", token, "--trust", "unrelated")
+                compare(f"{phase} {target} {action} --trust", py, rs, py.command(action, *args), rs.command(action, *args))
+                if action != "install":
+                    assert [trust_snapshot(side.base) for side in (py, rs)] == before
+                def normalized_snapshot(side):
+                    return {name: (mode, uid, links, side.normalize(content.decode()) if isinstance(content, bytes) else side.normalize(content) if isinstance(content, str) else content)
+                            for name, (mode, uid, links, content) in trust_snapshot(side.base).items()}
+                assert normalized_snapshot(py) == normalized_snapshot(rs), (target, phase, action)
+    for target in ("cursor", "claude"):
+        py = Side("python", base / f"trust-pending-{target}-python", target)
+        rs = Side("rust", base / f"trust-pending-{target}-rust", target)
+        for side in (py, rs):
+            journal = side.base / "home" / f".{target}" / ".agent-workbench-transaction.json"
+            journal.parent.mkdir(parents=True)
+            journal.write_text('{}')
+        snapshots = [trust_snapshot(side.base) for side in (py, rs)]
+        compare("trust pending journal", py, rs, py.command("trust"), rs.command("trust"))
+        assert [trust_snapshot(side.base) for side in (py, rs)] == snapshots
+    side = Side("rust", base / "trust-cli-rejection", "cursor", initialize=False)
+    for action, args in (("trust", ("--component", "hooks")),
+                         ("trust", ("--component", "mcp", "--trust", token)),
+                         ("install", ("--component", "hooks")),
+                         ("install", ("--component", "hooks", "--trust", token)),
+                         ("install", ("--component", "mcp", "--trust", token))):
+        result = side.command(action, *args)
+        assert result.returncode == 2, result
+        assert trust_snapshot(side.base) == rejection_before, "unsupported activation mutated fixtures"
+    print("trust CLI: six-target skills exits/output/typed snapshots match; activation remains fail-closed")
+
+
+def trust_snapshot(base: Path):
+    """Never follow fixture symlinks or open FIFOs; ignore only driver outputs."""
+    result = {}
+    for parent, directories, files in os.walk(base, followlinks=False):
+        for name in directories + files:
+            path = Path(parent) / name
+            if path.name in {"proof-results.json", "inspection-results.json"}:
+                continue
+            info = path.lstat()
+            content = path.read_bytes() if stat.S_ISREG(info.st_mode) else (os.readlink(path) if stat.S_ISLNK(info.st_mode) else None)
+            result[str(path.relative_to(base))] = (info.st_mode, info.st_uid, info.st_nlink, content)
+    return result
 
 
 def main() -> int:
@@ -1199,6 +1517,10 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
+            trust_contract_rows(base / "trust")
+            trust_proof_rows(base / "trust-proofs")
+            trust_inspection_rows(base / "trust-inspection")
+            trust_cli_fail_closed(base)
             state_wire_rows(base / "state-wire")
             state_v4_fail_closed(base)
             for target in TARGETS:
