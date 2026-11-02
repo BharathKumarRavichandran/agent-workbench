@@ -55,30 +55,40 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
     if profile.id != cli.profile {
         return Err("profile id must match profile filename".into());
     }
+    let target_id = cli.target.id();
     let target = profile
         .targets
         .iter()
-        .find(|target| target.id == "hermes")
-        .ok_or_else(|| format!("target hermes is not enabled by profile {}", profile.id))?;
-    let requested = target
+        .find(|target| target.id == target_id)
+        .ok_or_else(|| {
+            format!(
+                "target {target_id} is not enabled by profile {}",
+                profile.id
+            )
+        })?;
+    let requested = cli
         .components
         .clone()
+        .or_else(|| target.components.clone())
         .unwrap_or_else(|| vec![ComponentKind::Skills]);
     if requested != [ComponentKind::Skills] {
         return Err("Rust parity unit supports only the skills component".into());
     }
-    let destination =
-        resolve_destination(cli.destination.as_deref(), target.destination.as_deref())?;
+    let destination = resolve_destination(
+        cli.destination.as_deref(),
+        target.destination.as_deref(),
+        cli.target,
+    )?;
     reject_destination_root_symlink(&destination)?;
     let state_file = canonicalize_missing(&cli.state_dir)?.join(format!(
-        "agent-workbench/{}/{}/hermes.json",
+        "agent-workbench/{}/{}/{target_id}.json",
         catalog.marketplace.id, profile.id
     ));
     let previous = state::load(&state_file)?;
     if let Some(previous) = &previous {
         if previous.marketplace != catalog.marketplace.id
             || previous.profile != profile.id
-            || previous.target != "hermes"
+            || previous.target != target_id
         {
             return Err(
                 "installation state metadata does not match marketplace, profile, and target"
@@ -176,7 +186,7 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         repository: repository.clone(),
         marketplace: catalog.marketplace.id.clone(),
         profile: profile.id.clone(),
-        target: "hermes".into(),
+        target: target_id.into(),
         destination_root: destination.clone(),
         entries: next_entries,
     };
@@ -804,6 +814,8 @@ mod race_tests {
             Cli {
                 root: self.root.clone(),
                 profile: "pstack".into(),
+                target: SkillsTarget::Hermes,
+                components: None,
                 destination: Some(self.destination.clone()),
                 state_dir: self.state_root.clone(),
                 adopt: false,

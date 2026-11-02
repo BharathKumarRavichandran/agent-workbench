@@ -132,10 +132,48 @@ pub enum ComponentKind {
     Mcp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillsTarget {
+    Agents,
+    Hermes,
+}
+
+impl SkillsTarget {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "agents" => Ok(Self::Agents),
+            "hermes" => Ok(Self::Hermes),
+            _ => Err(format!("unsupported target for Rust parity unit: {value}")),
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Agents => "agents",
+            Self::Hermes => "hermes",
+        }
+    }
+
+    fn default_destination(self) -> Result<PathBuf> {
+        match self {
+            Self::Agents => Ok(home_dir()?.join(".agents/skills")),
+            Self::Hermes => {
+                let base = match env::var_os("HERMES_HOME").filter(|value| !value.is_empty()) {
+                    Some(value) => expand_home_path(PathBuf::from(value))?,
+                    None => home_dir()?.join(".hermes"),
+                };
+                Ok(base.join("skills"))
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Cli {
     pub root: PathBuf,
     pub profile: String,
+    pub target: SkillsTarget,
+    pub components: Option<Vec<ComponentKind>>,
     pub destination: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub adopt: bool,
@@ -198,9 +236,9 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         match option.as_str() {
             "--target" => target = Some(args.next().ok_or("--target requires a value")?),
             "--destination" => {
-                destination = Some(PathBuf::from(
-                    args.next().ok_or("--destination requires a value")?,
-                ))
+                destination = Some(expand_home(
+                    &args.next().ok_or("--destination requires a value")?,
+                )?)
             }
             "--state-dir" => {
                 state_dir = PathBuf::from(args.next().ok_or("--state-dir requires a value")?)
@@ -213,10 +251,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
             _ => return Err(format!("unsupported {} option: {option}", token)),
         }
     }
-    let target = target.ok_or("--target is required")?;
-    if target != "hermes" {
-        return Err(format!("unsupported target for Rust parity unit: {target}"));
-    }
+    let target = SkillsTarget::parse(&target.ok_or("--target is required")?)?;
     if profile != "pstack" {
         return Err(format!(
             "unsupported profile for Rust parity unit: {profile}"
@@ -225,12 +260,19 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
     if components.iter().any(|component| component != "skills") {
         return Err("Rust parity unit supports only the skills component".into());
     }
+    let components = if components.is_empty() {
+        None
+    } else {
+        Some(vec![ComponentKind::Skills])
+    };
     if !json {
         return Err("the Rust parity unit currently requires --json".into());
     }
     Ok(Cli {
         root,
         profile,
+        target,
+        components,
         destination,
         state_dir,
         adopt,
@@ -240,7 +282,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 }
 
 fn usage() -> String {
-    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] {plan,status,install,uninstall} --target hermes [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] --json".into()
+    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] {plan,status,install,uninstall} --target {agents,hermes} [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] --json".into()
 }
 
 pub fn help_requested(args: &[String]) -> bool {
@@ -261,9 +303,14 @@ fn default_state_dir() -> Result<PathBuf> {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("HOME is not set".into())
+    match env::var_os("HOME") {
+        Some(value) => Ok(PathBuf::from(value)),
+        None => platform_home_dir(),
+    }
+}
+
+fn platform_home_dir() -> Result<PathBuf> {
+    home::home_dir().ok_or("home directory is unavailable".into())
 }
 
 pub fn decode_catalog(path: &Path) -> Result<Catalog> {
@@ -492,15 +539,17 @@ impl<'de> Visitor<'de> for DuplicateVisitor {
     }
 }
 
-fn resolve_destination(explicit: Option<&Path>, profile: Option<&str>) -> Result<PathBuf> {
+fn resolve_destination(
+    explicit: Option<&Path>,
+    profile: Option<&str>,
+    target: SkillsTarget,
+) -> Result<PathBuf> {
     let path = if let Some(path) = explicit {
         path.to_path_buf()
     } else if let Some(path) = profile {
         expand_home(path)?
-    } else if let Some(home) = env::var_os("HERMES_HOME") {
-        PathBuf::from(home).join("skills")
     } else {
-        home_dir()?.join(".hermes/skills")
+        target.default_destination()?
     };
     let absolute = if path.is_absolute() {
         path
@@ -755,16 +804,25 @@ fn validate_branch(value: &str) -> Result<()> {
 }
 
 fn expand_home(value: &str) -> Result<PathBuf> {
-    if value == "~" {
+    expand_home_path(PathBuf::from(value))
+}
+
+fn expand_home_path(value: PathBuf) -> Result<PathBuf> {
+    if value == Path::new("~") {
         return home_dir();
     }
-    if let Some(rest) = value.strip_prefix("~/") {
+    if let Ok(rest) = value.strip_prefix("~") {
         return Ok(home_dir()?.join(rest));
     }
-    if value.starts_with('~') {
+    if value
+        .components()
+        .next()
+        .and_then(|part| part.as_os_str().to_str())
+        .is_some_and(|part| part.starts_with('~'))
+    {
         return Err("unknown user in path".into());
     }
-    Ok(PathBuf::from(value))
+    Ok(value)
 }
 
 fn has_parent_component(path: &Path) -> bool {
