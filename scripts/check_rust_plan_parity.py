@@ -1509,6 +1509,214 @@ def trust_snapshot(base: Path):
     return result
 
 
+def bundle_rows(base: Path) -> None:
+    """D3 inert snapshot dependency; no activation lifecycle is exercised."""
+    if str(REPOSITORY) not in sys.path:
+        sys.path.insert(0, str(REPOSITORY))
+    from agent_workbench import bundles
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    for mask in (0o022, 0o077):
+        case = base / f"snapshot-{mask:o}"
+        case.mkdir()
+        source = case / "source"
+        source.mkdir()
+        source.chmod(0o751)
+        (source / "empty").mkdir()
+        (source / "empty").chmod(0o711)
+        for name, content, mode in (("run", b"#!/bin/sh\n\x00\xff", 0o751), ("é😀", b"raw\r\n", 0o640),
+                                    ("\ue000", b"unicode sorting", 0o644), ("\n\x7f", b"controls", 0o640)):
+            (source / name).write_bytes(content)
+            (source / name).chmod(mode)
+        tree = bundles.source_tree(source)
+        rows.append(dict(source=str(source), umask=mask))
+        expected.append(tree.digest)
+    (base / "rows.json").write_text(json.dumps(rows))
+    before = trust_snapshot(base)
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "bundle_parity_tests::differential_bundles", "--", "--ignored", "--exact"],
+                 {"AW_BUNDLE_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "results.json").read_text())
+    assert actual == expected, f"bundle snapshot mismatch: {actual!r} != {expected!r}"
+    after = trust_snapshot(base)
+    after.pop("results.json", None)
+    assert after == before, "snapshot mutated fixture"
+    print(f"bundle parity: {len(rows)} inert snapshot rows match (D5 lifecycle not covered)")
+
+
+def bundle_snapshot(base: Path):
+    """Typed lstat snapshot: presence, kind, exact mode/bytes, lexical links."""
+    result: dict[str, tuple[str, int, bytes | str | None]] = {".": ("directory", stat.S_IMODE(base.lstat().st_mode), None)}
+    for parent, directories, files in os.walk(base, followlinks=False):
+        for name in directories + files:
+            path = Path(parent) / name
+            info = path.lstat()
+            kind = ("file" if stat.S_ISREG(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode)
+                    else "symlink" if stat.S_ISLNK(info.st_mode) else "fifo" if stat.S_ISFIFO(info.st_mode) else "special")
+            data = path.read_bytes() if kind == "file" else os.readlink(path) if kind == "symlink" else None
+            result[str(path.relative_to(base))] = (kind, stat.S_IMODE(info.st_mode), data)
+    return result
+
+
+def bundle_publication_rows(base: Path) -> None:
+    from types import SimpleNamespace
+    from typing import cast
+    from agent_workbench import bundles
+    from agent_workbench.installation import (DestinationSnapshot, InstallOperation, InstallPlan, OperationKind,
+                                              _DestinationRoot, _validate_install_source)
+    from agent_workbench.model import ComponentKind, DirectoryCopy
+    base.mkdir(parents=True)
+    rows, expected, pairs = [], [], []
+    for mask in (0o022, 0o077):
+        for scenario in ("create", "keep", "conflict", "conflict-symlink", "cleanup", "mode-change", "byte-change",
+                         "source-change", "source-mode", "symlink", "fifo", "special-file", "special-directory", "ancestor-symlink",
+                         "detached", "during-read", "snapshot"):
+            roots = [base / f"{mask:o}-{scenario}-{side}" for side in ("python", "rust")]
+            for case in roots:
+                case.mkdir()
+                (case / "source").mkdir()
+                (case / "source").chmod(0o751)
+                (case / "source/nested").mkdir()
+                (case / "source/nested").chmod(0o755)
+                (case / "source/locked").mkdir()
+                (case / "source/locked").chmod(0o555)
+                (case / "source/nested/run").write_bytes(b"#!/bin/sh\n\x00\xff")
+                (case / "source/nested/run").chmod(0o751)
+                fixture_mask = os.umask(mask)
+                try:
+                    (case / "source/default-mode").write_bytes(b"umask-controlled source")
+                finally:
+                    os.umask(fixture_mask)
+                (case / "source/é😀").write_bytes(b"\x00raw\xff\r\n")
+                (case / "source/é😀").chmod(0o640)
+                (case / "destination").mkdir()
+                (case / "outside").mkdir()
+                (case / "outside/sentinel").write_bytes(b"untouched")
+            case = roots[0]
+            source, destination = case / "source", case / "destination"
+            planned = bundles.source_tree(source).digest
+            # These are deterministic plan/apply changes, never timing races.
+            for current in roots:
+                path = current / "source/nested/run"
+                if scenario == "source-change":
+                    path.write_bytes(b"changed after plan")
+                elif scenario == "source-mode":
+                    path.chmod(0o750)
+                elif scenario in ("symlink", "fifo"):
+                    path.unlink()
+                    if scenario == "symlink":
+                        path.symlink_to("../../outside/sentinel")
+                    else:
+                        os.mkfifo(path, 0o600)
+                elif scenario == "special-file":
+                    path.chmod(0o4751)
+                elif scenario == "special-directory":
+                    (current / "source/nested").chmod(0o1755)
+                elif scenario == "ancestor-symlink":
+                    (current / "alias").symlink_to("source", target_is_directory=True)
+                if scenario == "conflict":
+                    (current / "destination/bundle").mkdir()
+                    (current / "destination/bundle/foreign").write_bytes(b"foreign")
+                elif scenario == "conflict-symlink":
+                    (current / "destination/bundle").symlink_to("../outside", target_is_directory=True)
+            if scenario == "ancestor-symlink":
+                source = case / "alias/nested"
+            operation = InstallOperation(OperationKind.CREATE, "hook:pstack", destination / "bundle", source, "test",
+                                         component=ComponentKind.HOOKS, resource=DirectoryCopy(planned), expected_digest=planned)
+            info = destination.stat()
+            snapshot = DestinationSnapshot(destination, (info.st_dev, info.st_ino), destination, (info.st_dev, info.st_ino))
+            old_mask = os.umask(mask)
+            outcome = {"accepted": False, "same": None}
+            try:
+                with _DestinationRoot(snapshot, create=False) as root:
+                    if scenario == "during-read":
+                        from unittest.mock import patch
+                        original_fstat = os.fstat
+                        file_stats = 0
+                        target_inode = (source / "nested/run").stat().st_ino
+                        def changing_fstat(fd):
+                            nonlocal file_stats
+                            info = original_fstat(fd)
+                            if stat.S_ISREG(info.st_mode) and info.st_ino == target_inode:
+                                file_stats += 1
+                                if file_stats == 2:
+                                    (source / "nested/run").write_bytes(b"changed while reading")
+                                    return original_fstat(fd)
+                            return info
+                        with patch.object(bundles.os, "fstat", changing_fstat):
+                            tree = _validate_install_source(cast(InstallPlan, SimpleNamespace(repository=case)), operation)
+                    else:
+                        tree = _validate_install_source(cast(InstallPlan, SimpleNamespace(repository=case)), operation)
+                    if scenario == "snapshot":
+                        (source / "nested/run").write_bytes(b"changed after snapshot")
+                    if scenario == "detached":
+                        destination.rename(case / "detached")
+                        destination.symlink_to("outside", target_is_directory=True)
+                    root.create(operation, tree)
+                    outcome["accepted"] = True
+                    if scenario == "mode-change":
+                        (destination / "bundle/hooks/nested/run").chmod(0o750)
+                    elif scenario == "byte-change":
+                        (destination / "bundle/hooks/nested/run").write_bytes(b"foreign edit")
+                    outcome["same"] = root.same_resource(operation)
+                    if scenario == "keep":
+                        assert _validate_install_source(cast(InstallPlan, SimpleNamespace(repository=case)), operation) == tree
+                    if scenario in ("cleanup", "detached"):
+                        if scenario == "detached":
+                            try:
+                                root.verify()
+                            except FileExistsError:
+                                outcome["accepted"] = False
+                            else:
+                                raise AssertionError("detached root accepted")
+                        moved = root.quarantine(operation)
+                        root.discard(moved)
+            except (OSError, ValueError) as error:
+                if scenario == "during-read":
+                    assert str(error) == "bundle changed while reading", str(error)
+            finally:
+                os.umask(old_mask)
+            rejected = {"conflict", "conflict-symlink", "source-change", "source-mode", "symlink", "fifo",
+                        "special-file", "special-directory", "ancestor-symlink", "during-read", "detached"}
+            required = {"accepted": scenario not in rejected,
+                        "same": (True if scenario == "detached" else None) if scenario in rejected else scenario not in {"mode-change", "byte-change"}}
+            assert outcome == required, f"Python bundle oracle {scenario}: {outcome!r} != {required!r}"
+            rows.append(dict(base=str(roots[1]), scenario=scenario, umask=mask, digest=planned))
+            expected.append(outcome)
+            pairs.append(roots)
+    (base / "publication.json").write_text(json.dumps(rows))
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "bundle_parity_tests::differential_publication", "--", "--ignored", "--exact"],
+                 {"AW_BUNDLE_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "publication-results.json").read_text())
+    assert len(actual) == len(expected)
+    for row, py, rs, (python, rust) in zip(rows, expected, actual, pairs):
+        assert py == rs, f"bundle {row} outcome mismatch: {py!r} != {rs!r}"
+        assert bundle_snapshot(python) == bundle_snapshot(rust), f"bundle {row} typed filesystem mismatch: {bundle_snapshot(python)!r} != {bundle_snapshot(rust)!r}"
+    print(f"bundle publication parity: {len(rows)} source/destination/outside/detached byte/mode/type rows match (isolated D3, not D5)")
+
+
+def bundle_name_rows(base: Path) -> None:
+    """Synthetic inert rows cover POSIX surrogateescape even on APFS."""
+    from agent_workbench.bundles import Tree, TreeFile
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    for names in ((b"bad\xff",), (b"\x80", "\ue000".encode(), "😀".encode()),
+                  (b"\xc3\x28", b"\xed\xa0\x80", b"\xf0\x90\x80", b"a\n\x7f")):
+        rows.append([list(name) for name in names])
+        expected.append(Tree((("", 0o755),), tuple(TreeFile(os.fsdecode(name), 0o751, b"raw\x00\xff") for name in names)).digest)
+    (base / "names.json").write_text(json.dumps(rows))
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "bundle_parity_tests::differential_names", "--", "--ignored", "--exact"],
+                 {"AW_BUNDLE_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "name-results.json").read_text())
+    assert actual == expected, f"POSIX name digest mismatch: {actual!r} != {expected!r}"
+    print(f"bundle names: {len(rows)} Unicode/surrogateescape digest rows match")
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -1517,6 +1725,9 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
+            bundle_rows(base / "bundles")
+            bundle_name_rows(base / "bundle-names")
+            bundle_publication_rows(base / "bundle-publication")
             trust_contract_rows(base / "trust")
             trust_proof_rows(base / "trust-proofs")
             trust_inspection_rows(base / "trust-inspection")

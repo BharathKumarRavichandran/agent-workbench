@@ -7,6 +7,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(test)]
+mod bundle_parity_tests;
+mod bundles;
 mod lifecycle;
 mod resource;
 mod state;
