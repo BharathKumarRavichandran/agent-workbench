@@ -227,6 +227,7 @@ pub struct Operation {
     trust_token: Option<String>,
     trust_required: bool,
     expected_link: Option<PathBuf>,
+    expected_digest: Option<String>,
 }
 
 impl Serialize for Operation {
@@ -311,13 +312,29 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
             "unsupported profile for Rust parity unit: {profile}"
         ));
     }
-    if components.iter().any(|component| component != "skills") {
-        return Err("Rust parity unit supports only the skills component".into());
+    if components.iter().any(|component| {
+        !matches!(
+            component.as_str(),
+            "skills" | "agents" | "rules" | "commands"
+        )
+    }) {
+        return Err("Rust parity unit supports only path components".into());
     }
     let components = if components.is_empty() {
         None
     } else {
-        Some(vec![ComponentKind::Skills])
+        Some(
+            components
+                .into_iter()
+                .map(|component| match component.as_str() {
+                    "skills" => Ok(ComponentKind::Skills),
+                    "agents" => Ok(ComponentKind::Agents),
+                    "rules" => Ok(ComponentKind::Rules),
+                    "commands" => Ok(ComponentKind::Commands),
+                    _ => Err("Rust parity unit supports only path components".into()),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )
     };
     if !json {
         return Err("the Rust parity unit currently requires --json".into());
@@ -1030,6 +1047,7 @@ mod tests {
             trust_token: None,
             trust_required: false,
             expected_link: None,
+            expected_digest: None,
         }
     }
 
@@ -1083,6 +1101,7 @@ mod tests {
             trust_token: None,
             trust_required: false,
             expected_link: None,
+            expected_digest: None,
         };
         let value = operations_json(&[operation]).unwrap();
         let expected = [

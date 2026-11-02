@@ -589,6 +589,91 @@ def destination_root_authorization(base: Path) -> None:
     )
 
 
+def copied_agent_lifecycle(base: Path) -> None:
+    python, rust = pair(base, "agent-copy", "cursor")
+    for side in (python, rust):
+        agent = side.root / "plugins/pstack/agents/sample-agent.md"
+        agent.parent.mkdir(parents=True)
+        agent.write_text(
+            "---\nname: sample-agent\ndescription: Example agent.\n---\nbody\n",
+            encoding="utf-8",
+        )
+        catalog_path = side.root / "catalog/plugins.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["plugins"][0]["artifacts"]["agents"] = {"path": "pstack/agents"}
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    compare(
+        "cursor agent copy install",
+        python,
+        rust,
+        python.command("install", "--component", "agents"),
+        rust.command("install", "--component", "agents"),
+    )
+    for side in (python, rust):
+        installed = side.base / "home" / ".cursor" / "agents" / "sample-agent.md"
+        assert installed.read_text(encoding="utf-8").endswith("body\n")
+        assert stat.S_IMODE(installed.stat().st_mode) == 0o644
+    compare(
+        "cursor agent copy keep",
+        python,
+        rust,
+        python.command("status", "--component", "agents"),
+        rust.command("status", "--component", "agents"),
+    )
+    for side in (python, rust):
+        installed = side.base / "home" / ".cursor" / "agents" / "sample-agent.md"
+        installed.write_text("changed\n", encoding="utf-8")
+    compare(
+        "cursor agent copy conflict",
+        python,
+        rust,
+        python.command("status", "--component", "agents"),
+        rust.command("status", "--component", "agents"),
+    )
+    compare(
+        "cursor agent copy conflict uninstall",
+        python,
+        rust,
+        python.command("uninstall"),
+        rust.command("uninstall"),
+    )
+    for side in (python, rust):
+        installed = side.base / "home" / ".cursor" / "agents" / "sample-agent.md"
+        assert installed.read_text(encoding="utf-8") == "changed\n"
+        installed.write_bytes((side.root / "plugins/pstack/agents/sample-agent.md").read_bytes())
+    compare(
+        "cursor agent copy uninstall",
+        python,
+        rust,
+        python.command("uninstall"),
+        rust.command("uninstall"),
+    )
+    for side in (python, rust):
+        installed = side.base / "home" / ".cursor" / "agents" / "sample-agent.md"
+        assert not installed.exists()
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_bytes((side.root / "plugins/pstack/agents/sample-agent.md").read_bytes())
+    compare(
+        "cursor agent copy adopt",
+        python,
+        rust,
+        python.command("install", "--component", "agents", "--adopt"),
+        rust.command("install", "--component", "agents", "--adopt"),
+    )
+    for side in (python, rust):
+        (side.root / "plugins/pstack/agents/sample-agent.md").write_text(
+            "---\nname: sample-agent\ndescription: Example agent.\n---\nreplaced\n",
+            encoding="utf-8",
+        )
+    compare(
+        "cursor agent copy replace",
+        python,
+        rust,
+        python.command("install", "--component", "agents"),
+        rust.command("install", "--component", "agents"),
+    )
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -606,6 +691,7 @@ def main() -> int:
                 v2_compatibility(base, target)
                 state_rejection(base, target)
             destination_root_authorization(base)
+            copied_agent_lifecycle(base)
             component_override(base)
             destination_precedence(base)
             shared_state_isolation(base)
