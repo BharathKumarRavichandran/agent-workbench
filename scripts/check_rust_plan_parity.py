@@ -730,6 +730,47 @@ def cursor_project_paths(base: Path) -> None:
         compare(f"cursor profile project override={override}", python, rust, *results)
 
 
+def claude_native_paths(base: Path) -> None:
+    for project in (False, True):
+        python, rust = pair(base, f"native-{project}", "claude")
+        for side in (python, rust):
+            add_document(side, "agents", "native.md", "---\nname: native\ndescription: Native agent.\n---\nagent bytes\n")
+            add_document(side, "commands", "legacy.md", "---\nargument-hint: value\n---\nlegacy bytes\n")
+            # Neither .mdc nor JSON is a legacy Markdown command.
+            add_document(side, "commands", "ignored.mdc", "cursor rule")
+            add_document(side, "commands", "ignored.json", '{"hooks": {}}')
+        for action in ("plan", "install", "status", "uninstall"):
+            results = []
+            for side in (python, rust):
+                extra = ["--project-root", str(side.base / "project")] if project else []
+                if action != "uninstall":
+                    extra += ["--component", "commands", "--component", "agents"]
+                results.append(side.command(action, *extra))
+            assert results[0].returncode == 0, results[0].stderr
+            compare(f"claude native project={project} {action}", python, rust, *results)
+            if action in ("install", "status"):
+                compare_state("claude native", python, rust)
+                for side in (python, rust):
+                    root = side.base / ("project/.claude" if project else "home/.claude")
+                    for kind, filename in (("agents", "native.md"), ("commands", "legacy.md")):
+                        assert (root / kind / filename).read_bytes() == (side.root / "plugins/pstack" / kind / filename).read_bytes()
+                    assert sorted(path.name for path in (root / "commands").iterdir()) == ["legacy.md"]
+        results = [side.command("install", "--component", "rules", "--component", "agents") for side in (python, rust)]
+        assert results[0].returncode == 1
+        compare("claude does not translate rules", python, rust, *results)
+        for side in (python, rust):
+            assert not (side.base / "home/.claude/agents/native.md").exists()
+    for kind, body in (("agents", "---\nname: wrong\ndescription: Agent.\n---\nbody"), ("agents", "---\nname: sample\n---\nbody"), ("commands", '{"hooks": {}}'), ("commands", "---\nnot closed")):
+        python, rust = pair(base, f"invalid-{kind}-{len(body)}", "claude")
+        for side in (python, rust):
+            add_document(side, kind, "sample.md", body)
+        results = [side.command("install", "--component", kind) for side in (python, rust)]
+        compare_error_class(f"claude invalid {kind}", python, rust, *results, 2)
+        for side in (python, rust):
+            assert not side.state.exists() and not side.destination.exists()
+            assert not (side.base / "home/.claude").exists()
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -747,6 +788,7 @@ def main() -> int:
                 v2_compatibility(base, target)
                 state_rejection(base, target)
             destination_root_authorization(base)
+            claude_native_paths(base)
             cursor_project_paths(base)
             copied_agent_lifecycle(base)
             component_override(base)

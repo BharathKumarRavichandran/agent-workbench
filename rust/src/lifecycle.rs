@@ -381,7 +381,7 @@ fn desired_entries(
                 )
             })?;
             let artifact_root = resolve_repo_path(&source_root, &artifact.path)?;
-            for (name, source) in discover_files(&artifact_root, suffix)? {
+            for (name, source) in discover_files(&artifact_root, suffix, component)? {
                 let key = format!("{}:{name}", component_key_prefix(component));
                 if entries.contains_key(&key) {
                     return Err(format!("duplicate exported component name: {name}"));
@@ -425,7 +425,11 @@ fn component_key_prefix(component: ComponentKind) -> &'static str {
     }
 }
 
-fn discover_files(root: &Path, suffix: &str) -> Result<Vec<(String, PathBuf)>> {
+fn discover_files(
+    root: &Path,
+    suffix: &str,
+    component: ComponentKind,
+) -> Result<Vec<(String, PathBuf)>> {
     let metadata =
         fs::symlink_metadata(root).map_err(|error| format!("{}: {error}", root.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -444,13 +448,67 @@ fn discover_files(root: &Path, suffix: &str) -> Result<Vec<(String, PathBuf)>> {
         }
         let name = entry.file_name();
         let name = name.to_str().ok_or("component filename is not UTF-8")?;
-        if !name.ends_with(suffix) {
+        if path.extension().and_then(|value| value.to_str()) != suffix.strip_prefix('.') {
             continue;
         }
+        validate_document(&path, component)?;
         found.push((name.to_owned(), path));
     }
     found.sort();
     Ok(found)
+}
+
+fn validate_document(path: &Path, component: ComponentKind) -> Result<()> {
+    // DocumentDirectoryInspector uses universal newlines and the last nonempty
+    // value for each stripped frontmatter key; it does not parse YAML.
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if !text.starts_with("---\n") {
+        return Err(format!(
+            "frontmatter must start at byte zero: {}",
+            path.display()
+        ));
+    }
+    let closing = text[4..]
+        .find("\n---\n")
+        .map(|index| index + 4)
+        .ok_or_else(|| format!("frontmatter is not closed: {}", path.display()))?;
+    let mut values = BTreeMap::new();
+    for line in text[4..closing].lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let value = value.trim().trim_matches(['\'', '"']);
+            if !key.trim().is_empty() && !value.is_empty() {
+                values.insert(key.trim(), value);
+            }
+        }
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or("invalid component filename")?;
+    let name = if component == ComponentKind::Agents {
+        values.get("name").copied().unwrap_or("")
+    } else {
+        stem
+    };
+    if !safe_filename(name) {
+        return Err("component name must be one safe filename component".into());
+    }
+    if component == ComponentKind::Agents && name != stem {
+        return Err(format!(
+            "component name must match filename stem: {}",
+            path.display()
+        ));
+    }
+    if matches!(component, ComponentKind::Agents | ComponentKind::Rules)
+        && !values.contains_key("description")
+    {
+        return Err(format!(
+            "component frontmatter requires description: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn operation(
