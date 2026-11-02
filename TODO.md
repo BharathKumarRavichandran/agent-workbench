@@ -41,12 +41,12 @@ Convert the workbench to a standalone Rust CLI without extending product behavio
 
 ### C. Copied path components and multi-root state
 
-- [ ] Model copied files/directories and digests as closed Rust resource types rather than stringly operation variants.
-- [ ] Port state v3 `destinationRoots` validation and authorization for multiple component roots.
-- [ ] Port copied-resource create, keep, exact-copy adoption, replace-owned, remove-owned, conflict, rollback, and uninstall.
-- [ ] Port Cursor agents, rules, and commands with project-root requirements and Python/Rust differential tests.
-- [ ] Port Claude agents and legacy commands with exact representation selection and differential tests.
-- [ ] Prove source modes, installed bytes, digests, symlink rejection, parent/root swaps, mixed roots, and interrupted removal on macOS and Linux.
+- [x] Model copied files/directories and digests as closed Rust resource types rather than stringly operation variants.
+- [x] Port state v3 `destinationRoots` validation and authorization for multiple component roots.
+- [x] Port copied-resource create, keep, exact-copy adoption, replace-owned, remove-owned, conflict, rollback, and uninstall.
+- [x] Port Cursor agents, rules, and commands with project-root requirements and Python/Rust differential tests.
+- [x] Port Claude agents and legacy commands with exact representation selection and differential tests.
+- [x] Prove source modes, installed bytes, digests, symlink rejection, parent/root swaps, mixed roots, and interrupted removal on macOS and Linux.
 
 ### D. Trusted activation and state v4
 

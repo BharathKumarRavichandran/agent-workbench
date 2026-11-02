@@ -18,7 +18,7 @@ TARGETS = ("agents", "claude", "codex", "cursor", "grok", "hermes")
 
 
 def run(
-    command: list[str], env: dict[str, str | None] | None = None
+    command: list[str], env: dict[str, str | None] | None = None, *, umask: int = -1
 ) -> subprocess.CompletedProcess[str]:
     process_env = None
     if env is not None:
@@ -35,6 +35,7 @@ def run(
         text=True,
         capture_output=True,
         check=False,
+        umask=umask,
     )
 
 
@@ -110,6 +111,7 @@ class Side:
         explicit_destination: bool = True,
         destination_value: str | None = None,
         environment: dict[str, str | None] | None = None,
+        umask: int = -1,
     ) -> subprocess.CompletedProcess[str]:
         common = [
             "--root",
@@ -137,12 +139,13 @@ class Side:
         )
         process_environment: dict[str, str | None] = {
             "HOME": str(self.base / "home"),
+            "PYTHONDONTWRITEBYTECODE": "1",
             "CODEX_HOME": str(self.base / "codex-home"),
             "HERMES_HOME": str(self.base / "hermes-home"),
         }
         if environment is not None:
             process_environment.update(environment)
-        return run(command, env=process_environment)
+        return run(command, env=process_environment, umask=umask)
 
     def normalize(self, text: str) -> str:
         return text.replace(str(self.base), "<BASE>")
@@ -538,6 +541,398 @@ def state_rejection(base: Path, target: str) -> None:
         raise AssertionError("broken state symlink cleanup differs")
 
 
+def destination_root_authorization(base: Path) -> None:
+    python, rust = pair(base, "roots", "hermes")
+    for side in (python, rust):
+        state = {
+            "schemaVersion": 3,
+            "repository": str(side.root),
+            "marketplace": "market",
+            "profile": "pstack",
+            "target": "hermes",
+            "destinationRoot": str(side.destination),
+            "entries": {},
+            "destinationRoots": {
+                "skills": str(side.destination),
+                "agents": str(side.base / "unauthorized-agents"),
+            },
+        }
+        side.state_file.parent.mkdir(parents=True)
+        side.state_file.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    compare(
+        "unauthorized destination root",
+        python,
+        rust,
+        python.command("status"),
+        rust.command("status"),
+    )
+    python, rust = pair(base, "cursor-roots", "cursor")
+    for side in (python, rust):
+        state = {
+            "schemaVersion": 3,
+            "repository": str(side.root),
+            "marketplace": "market",
+            "profile": "pstack",
+            "target": "cursor",
+            "destinationRoot": str(side.destination),
+            "entries": {},
+            "destinationRoots": {
+                "agents": str(side.base / "home" / ".cursor" / "agents"),
+                "skills": str(side.destination),
+            },
+        }
+        side.state_file.parent.mkdir(parents=True)
+        side.state_file.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    compare(
+        "authorized cursor agents root",
+        python,
+        rust,
+        python.command("status"),
+        rust.command("status"),
+    )
+
+
+def copied_agent_lifecycle(base: Path) -> None:
+    python, rust = pair(base, "agent-copy", "cursor")
+    for side in (python, rust):
+        agent = side.root / "plugins/pstack/agents/sample-agent.md"
+        agent.parent.mkdir(parents=True)
+        agent.write_text(
+            "---\nname: sample-agent\ndescription: Example agent.\n---\nbody\n",
+            encoding="utf-8",
+        )
+        catalog_path = side.root / "catalog/plugins.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["plugins"][0]["artifacts"]["agents"] = {"path": "pstack/agents"}
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    compare(
+        "cursor agent copy install",
+        python,
+        rust,
+        python.command("install", "--component", "agents"),
+        rust.command("install", "--component", "agents"),
+    )
+    for side in (python, rust):
+        installed = side.base / "home" / ".cursor" / "agents" / "sample-agent.md"
+        assert installed.read_text(encoding="utf-8").endswith("body\n")
+        assert stat.S_IMODE(installed.stat().st_mode) == 0o644
+    compare(
+        "cursor agent copy keep",
+        python,
+        rust,
+        python.command("status", "--component", "agents"),
+        rust.command("status", "--component", "agents"),
+    )
+    for side in (python, rust):
+        installed = side.base / "home" / ".cursor" / "agents" / "sample-agent.md"
+        installed.write_text("changed\n", encoding="utf-8")
+    compare(
+        "cursor agent copy conflict",
+        python,
+        rust,
+        python.command("status", "--component", "agents"),
+        rust.command("status", "--component", "agents"),
+    )
+    compare(
+        "cursor agent copy conflict uninstall",
+        python,
+        rust,
+        python.command("uninstall"),
+        rust.command("uninstall"),
+    )
+    for side in (python, rust):
+        installed = side.base / "home" / ".cursor" / "agents" / "sample-agent.md"
+        assert installed.read_text(encoding="utf-8") == "changed\n"
+        installed.write_bytes((side.root / "plugins/pstack/agents/sample-agent.md").read_bytes())
+    compare(
+        "cursor agent copy uninstall",
+        python,
+        rust,
+        python.command("uninstall"),
+        rust.command("uninstall"),
+    )
+    for side in (python, rust):
+        installed = side.base / "home" / ".cursor" / "agents" / "sample-agent.md"
+        assert not installed.exists()
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_bytes((side.root / "plugins/pstack/agents/sample-agent.md").read_bytes())
+    compare(
+        "cursor agent copy adopt",
+        python,
+        rust,
+        python.command("install", "--component", "agents", "--adopt"),
+        rust.command("install", "--component", "agents", "--adopt"),
+    )
+    for side in (python, rust):
+        (side.root / "plugins/pstack/agents/sample-agent.md").write_text(
+            "---\nname: sample-agent\ndescription: Example agent.\n---\nreplaced\n",
+            encoding="utf-8",
+        )
+    compare(
+        "cursor agent copy replace",
+        python,
+        rust,
+        python.command("install", "--component", "agents"),
+        rust.command("install", "--component", "agents"),
+    )
+
+
+def add_document(side: Side, kind: str, name: str, body: str) -> Path:
+    path = side.root / "plugins/pstack" / kind / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    catalog_path = side.root / "catalog/plugins.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog["plugins"][0]["artifacts"][kind] = {"path": f"pstack/{kind}"}
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    return path
+
+
+def cursor_project_paths(base: Path) -> None:
+    python, rust = pair(base, "project-paths", "cursor")
+    for side in (python, rust):
+        add_document(side, "agents", "sample.md", "---\nname: sample\ndescription: Sample.\n---\nagent\n")
+        add_document(side, "rules", "sample.mdc", "---\ndescription: Sample.\n---\nrule\n")
+        add_document(side, "commands", "sample.md", "---\ndescription: Sample.\n---\ncommand\n")
+    for component, diagnostic in (("rules", "PROJECT_ROOT_REQUIRED"), ("commands", "COMPONENT_UNSUPPORTED")):
+        for action in ("plan", "install", "status"):
+            py = python.command(action, "--component", component)
+            rs = rust.command(action, "--component", component)
+            assert py.returncode == 1 and json.loads(py.stdout)[0]["diagnostic"] == diagnostic
+            compare(f"cursor {component} {action} rejection", python, rust, py, rs)
+        for side in (python, rust):
+            assert not side.state.exists() and not side.destination.exists()
+            assert not (side.base / "home").exists()
+    for action in ("plan", "install", "status", "uninstall"):
+        results = []
+        for side in (python, rust):
+            extra = ["--project-root", str(side.base / "project")]
+            if action != "uninstall":
+                extra += ["--component", "skills", "--component", "agents", "--component", "rules"]
+            results.append(side.command(action, *extra))
+        assert results[0].returncode == 0, results[0].stderr
+        compare(f"cursor project {action}", python, rust, *results)
+        if action in ("install", "status"):
+            compare_state(f"cursor project {action}", python, rust)
+            for side in (python, rust):
+                assert (side.destination / "example").is_symlink()
+                for kind, filename in (("agents", "sample.md"), ("rules", "sample.mdc")):
+                    installed = side.base / "project/.cursor" / kind / filename
+                    assert installed.read_bytes() == (side.root / "plugins/pstack" / kind / filename).read_bytes()
+    # Profile projectRoot is honored; a disagreeing CLI value overrides it.
+    for side in (python, rust):
+        profile_path = side.root / "profiles/pstack.json"
+        profile = json.loads(profile_path.read_text())
+        profile["schemaVersion"] = 2
+        profile["targets"] = [{"id": "cursor", "components": ["agents", "rules"], "projectRoot": str(side.base / "profile-project")}]
+        profile_path.write_text(json.dumps(profile))
+    for override in (False, True):
+        results = [side.command("plan", *(["--project-root", str(side.base / "cli-project")] if override else [])) for side in (python, rust)]
+        assert results[0].returncode == 0
+        compare(f"cursor profile project override={override}", python, rust, *results)
+
+
+def claude_native_paths(base: Path) -> None:
+    for project in (False, True):
+        python, rust = pair(base, f"native-{project}", "claude")
+        for side in (python, rust):
+            add_document(side, "agents", "native.md", "---\nname: native\ndescription: Native agent.\n---\nagent bytes\n")
+            add_document(side, "commands", "legacy.md", "---\nargument-hint: value\n---\nlegacy bytes\n")
+            # Neither .mdc nor JSON is a legacy Markdown command.
+            add_document(side, "commands", "ignored.mdc", "cursor rule")
+            add_document(side, "commands", "ignored.json", '{"hooks": {}}')
+        for action in ("plan", "install", "status", "uninstall"):
+            results = []
+            for side in (python, rust):
+                extra = ["--project-root", str(side.base / "project")] if project else []
+                if action != "uninstall":
+                    extra += ["--component", "commands", "--component", "agents"]
+                results.append(side.command(action, *extra))
+            assert results[0].returncode == 0, results[0].stderr
+            compare(f"claude native project={project} {action}", python, rust, *results)
+            if action in ("install", "status"):
+                compare_state("claude native", python, rust)
+                for side in (python, rust):
+                    root = side.base / ("project/.claude" if project else "home/.claude")
+                    for kind, filename in (("agents", "native.md"), ("commands", "legacy.md")):
+                        assert (root / kind / filename).read_bytes() == (side.root / "plugins/pstack" / kind / filename).read_bytes()
+                    assert sorted(path.name for path in (root / "commands").iterdir()) == ["legacy.md"]
+        results = [side.command("install", "--component", "rules", "--component", "agents") for side in (python, rust)]
+        assert results[0].returncode == 1
+        compare("claude does not translate rules", python, rust, *results)
+        for side in (python, rust):
+            assert not (side.base / "home/.claude/agents/native.md").exists()
+    for kind, body in (("agents", "---\nname: wrong\ndescription: Agent.\n---\nbody"), ("agents", "---\nname: sample\n---\nbody"), ("commands", '{"hooks": {}}'), ("commands", "---\nnot closed")):
+        python, rust = pair(base, f"invalid-{kind}-{len(body)}", "claude")
+        for side in (python, rust):
+            add_document(side, kind, "sample.md", body)
+        results = [side.command("install", "--component", kind) for side in (python, rust)]
+        compare_error_class(f"claude invalid {kind}", python, rust, results[0], results[1], 2)
+        for side in (python, rust):
+            assert not side.state.exists() and not side.destination.exists()
+            assert not (side.base / "home/.claude").exists()
+
+
+def copied_safety_rows(base: Path) -> None:
+    import hashlib
+    for mode in (0o600, 0o644, 0o755):
+        python, rust = pair(base, f"copy-mode-{mode:o}", "cursor")
+        for side in (python, rust):
+            source = add_document(side, "agents", "sample.md", "---\r\nname: sample\r\ndescription: Bytes.\r\n---\r\nUnicode: café\r\n")
+            source.chmod(mode)
+        results = [side.command("install", "--component", "agents", umask=0o022) for side in (python, rust)]
+        compare(f"copy source mode {mode:o}", python, rust, *results)
+        assert results[0].returncode == 0
+        compare_state("copy byte digest", python, rust)
+        for side in (python, rust):
+            assert stat.S_IMODE((side.root / "plugins/pstack/agents/sample.md").stat().st_mode) == mode
+            content = (side.root / "plugins/pstack/agents/sample.md").read_bytes()
+            installed = side.base / "home/.cursor/agents/sample.md"
+            assert installed.read_bytes() == content
+            assert stat.S_IMODE(installed.stat().st_mode) == 0o644
+            assert json.loads(side.state_file.read_text())["entries"]["agent:sample.md"]["digest"] == hashlib.sha256(content).hexdigest()
+    for shape in ("file", "nested", "root"):
+        python, rust = pair(base, f"source-symlink-{shape}", "cursor")
+        for side in (python, rust):
+            source = add_document(side, "agents", "sample.md", "---\nname: sample\ndescription: Bytes.\n---\nbody\n")
+            path = source.parent if shape == "root" else source
+            if shape == "nested":
+                path = source.parent / "nested/ignored.txt"
+                path.parent.mkdir()
+                path.write_text("ignored")
+            moved = path.with_name(path.name + "-saved")
+            path.rename(moved)
+            path.symlink_to(moved)
+        results = [side.command("install", "--component", "agents") for side in (python, rust)]
+        if shape == "root":
+            # RepoPath resolves an internal artifact alias before inspection.
+            compare("copy canonical artifact alias", python, rust, *results)
+            assert results[0].returncode == 0
+            compare_state("copy canonical artifact alias", python, rust)
+        else:
+            compare_error_class(f"copy symlink {shape}", python, rust, results[0], results[1], 2)
+            for side in (python, rust):
+                assert not side.state.exists() and not (side.base / "home/.cursor").exists()
+    python, rust = pair(base, "project-default-skills", "cursor")
+    results = [side.command("install", "--project-root", str(side.base / "project"), explicit_destination=False) for side in (python, rust)]
+    compare("project default skills root", python, rust, *results)
+    compare_state("project default skills root", python, rust)
+
+
+def python_copy_race(side: Side, scenario: str) -> bool:
+    if str(REPOSITORY) not in sys.path:
+        sys.path.insert(0, str(REPOSITORY))
+    from unittest import mock
+    from agent_workbench import installation as install
+    from agent_workbench.model import ComponentKind as C
+    from agent_workbench.workspace import Workspace
+    with mock.patch.dict(os.environ, {"HOME": str(side.base / "home")}):
+        workspace = Workspace.load(side.root, "pstack")
+        project = side.base / "project"
+        source = side.root / "plugins/pstack/agents/sample.md"
+        agents = project / ".cursor/agents"
+        components = (C.AGENTS,) if scenario.endswith("state-failure") else (C.SKILLS, C.AGENTS, C.RULES)
+        def plan():
+            return install.plan_install(workspace, "cursor", side.state, side.destination, components=components, project_root=project)
+        removal = scenario.startswith("remove") or scenario == "selection-interrupted"
+        if removal or scenario in ("replace-state-failure", "keep-source-change"):
+            install.apply_plan(plan())
+        if scenario == "replace-state-failure":
+            source.write_text(source.read_text() + "updated\n")
+        if scenario == "selection-interrupted":
+            components = (C.SKILLS,)
+        if scenario == "root-swap":
+            agents.mkdir(parents=True)
+        if scenario == "parent-swap":
+            project.mkdir(parents=True)
+        pending = install.plan_uninstall(workspace, "cursor", side.state, side.destination, project) if removal and scenario != "selection-interrupted" else plan()
+        if scenario in ("source-change", "keep-source-change"):
+            source.write_text("changed after planning")
+        if scenario in ("source-symlink", "source-parent-symlink"):
+            path = source if scenario == "source-symlink" else source.parent
+            moved = path.with_suffix(".saved")
+            path.rename(moved)
+            path.symlink_to(moved)
+        if scenario in ("root-swap", "parent-swap"):
+            path = agents if scenario == "root-swap" else project
+            path.rename(path.with_suffix(".detached"))
+            path.mkdir()
+        if scenario == "remove-modified":
+            (agents / "sample.md").write_text("foreign after plan")
+        real_create = install._DestinationRoot.create
+        real_quarantine = install._DestinationRoot.quarantine
+        real_write = install.write_state
+        def swap_root(root):
+            root.path.rename(root.path.with_suffix(".detached"))
+            outside = side.base / "outside"
+            outside.mkdir()
+            root.path.symlink_to(outside)
+        def create(root, operation, content):
+            if scenario == "publish-root-swap" and root.path == agents:
+                swap_root(root)
+            result = real_create(root, operation, content)
+            if scenario == "published-root-swap" and root.path == agents:
+                swap_root(root)
+            return result
+        def quarantine(root, operation):
+            if scenario in ("remove-interrupted", "selection-interrupted") and operation.component is C.RULES:
+                raise OSError("injected failure")
+            result = real_quarantine(root, operation)
+            if scenario == "remove-root-swap" and root.path == agents:
+                swap_root(root)
+            return result
+        def write(*args):
+            if scenario.endswith("state-failure"):
+                if scenario == "remove-foreign-state-failure":
+                    (agents / "sample.md").write_text("foreign during rollback")
+                raise OSError("injected failure")
+            return real_write(*args)
+        with mock.patch.object(install._DestinationRoot, "create", create), mock.patch.object(install._DestinationRoot, "quarantine", quarantine), mock.patch.object(install, "write_state", write):
+            try:
+                (install.apply_uninstall if removal and scenario != "selection-interrupted" else install.apply_plan)(pending)
+            except (OSError, ValueError):
+                return True
+        return False
+
+
+def copy_race_rows(base: Path) -> None:
+    def snapshot(side: Side):
+        found = {}
+        def visit(path):
+            import re
+            key = re.sub(r"\.agent-workbench-quarantine-[^/]+", ".agent-workbench-quarantine-<ID>", str(path.relative_to(side.base)))
+            if path.is_symlink():
+                found[key] = ("link", side.normalize(str(path.readlink())))
+            elif path.is_dir():
+                found[key] = ("directory",)
+                for child in sorted(path.iterdir()):
+                    visit(child)
+            elif path.exists():
+                found[key] = ("file", stat.S_IMODE(path.stat().st_mode), path.read_bytes().hex())
+        for name in ("project", "project.detached", "destination", "outside"):
+            visit(side.base / name)
+        if side.state_file.exists():
+            found["state"] = (stat.S_IMODE(side.state_file.stat().st_mode), side.normalize(side.state_file.read_text()))
+        return found
+    for scenario in ("source-change", "keep-source-change", "source-symlink", "source-parent-symlink", "root-swap", "parent-swap", "publish-root-swap", "published-root-swap", "remove-root-swap", "create-state-failure", "replace-state-failure", "remove-state-failure", "remove-foreign-state-failure", "remove-modified", "remove-interrupted", "selection-interrupted"):
+        python, rust = pair(base, f"race-{scenario}", "cursor")
+        for side in (python, rust):
+            add_document(side, "agents", "sample.md", "---\nname: sample\ndescription: Sample.\n---\nagent\n")
+            add_document(side, "rules", "sample.mdc", "---\ndescription: Sample.\n---\nrule\n")
+        py_failed = python_copy_race(python, scenario)
+        result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib", "lifecycle::copy_parity_tests::differential_copy_race", "--", "--ignored", "--exact"], {"AW_COPY_CASE": scenario, "AW_COPY_BASE": str(rust.base)})
+        assert result.returncode == 0, result.stdout + result.stderr
+        rs_failed = json.loads((rust.base / "race-result.json").read_text())
+        assert py_failed and rs_failed, f"{scenario}: failure Python={py_failed}, Rust={rs_failed}"
+        py_snapshot, rs_snapshot = snapshot(python), snapshot(rust)
+        assert py_snapshot == rs_snapshot, f"{scenario} filesystem mismatch\nPython: {py_snapshot!r}\nRust: {rs_snapshot!r}"
+        if scenario in ("remove-interrupted", "selection-interrupted"):
+            results = [side.command("uninstall", "--project-root", str(side.base / "project")) for side in (python, rust)]
+            compare(f"{scenario} retry", python, rust, *results)
+            assert results[0].returncode == 0
+            assert not python.state_file.exists() and not rust.state_file.exists()
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -554,15 +949,23 @@ def main() -> int:
                 relocation(base, target)
                 v2_compatibility(base, target)
                 state_rejection(base, target)
+            destination_root_authorization(base)
+            copy_race_rows(base)
+            copied_safety_rows(base)
+            claude_native_paths(base)
+            cursor_project_paths(base)
+            copied_agent_lifecycle(base)
             component_override(base)
             destination_precedence(base)
             shared_state_isolation(base)
-    except AssertionError as error:
-        print(error, file=sys.stderr)
+    except AssertionError:
+        import traceback
+        traceback.print_exc()
         return 1
     print(
         "lifecycle parity: all six skills targets destinations/overrides/clean/adopt/"
-        "conflict/relocation/v2/rejection scenarios match"
+        "conflict/relocation/v2/rejection/destination-root scenarios match; "
+        "Cursor/Claude native paths and copied-file bytes/modes/digests/races match"
     )
     return 0
 

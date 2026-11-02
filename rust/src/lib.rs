@@ -1,4 +1,5 @@
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::ser::{Serialize, SerializeMap};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -7,6 +8,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 mod lifecycle;
+mod resource;
 mod state;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -121,7 +123,7 @@ pub struct ProfileTarget {
     pub project_root: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum ComponentKind {
     Skills,
@@ -130,6 +132,19 @@ pub enum ComponentKind {
     Commands,
     Hooks,
     Mcp,
+}
+
+impl ComponentKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Skills => "skills",
+            Self::Agents => "agents",
+            Self::Rules => "rules",
+            Self::Commands => "commands",
+            Self::Hooks => "hooks",
+            Self::Mcp => "mcp",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,28 +208,55 @@ pub struct Cli {
     pub target: SkillsTarget,
     pub components: Option<Vec<ComponentKind>>,
     pub destination: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub adopt: bool,
     pub json: bool,
     action: lifecycle::Action,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug)]
 pub struct Operation {
     kind: &'static str,
     key: String,
     destination: String,
     source: String,
-    reason: &'static str,
+    reason: String,
     component: &'static str,
-    resource_kind: &'static str,
-    digest: Option<String>,
+    resource: resource::PathResource,
     diagnostic: Option<String>,
     trust_token: Option<String>,
     trust_required: bool,
-    #[serde(skip)]
     expected_link: Option<PathBuf>,
+    expected_digest: Option<String>,
+}
+
+impl Serialize for Operation {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(11))?;
+        map.serialize_entry("kind", self.kind)?;
+        map.serialize_entry("key", &self.key)?;
+        map.serialize_entry("destination", &self.destination)?;
+        let projected_conflict = self.key.starts_with("component:");
+        map.serialize_entry("source", &(!projected_conflict).then_some(&self.source))?;
+        map.serialize_entry("reason", &self.reason)?;
+        map.serialize_entry("component", self.component)?;
+        map.serialize_entry(
+            "resourceKind",
+            &(!projected_conflict).then_some(self.resource.kind()),
+        )?;
+        map.serialize_entry(
+            "digest",
+            &self.resource.digest().map(resource::ContentDigest::as_str),
+        )?;
+        map.serialize_entry("diagnostic", &self.diagnostic)?;
+        map.serialize_entry("trustToken", &self.trust_token)?;
+        map.serialize_entry("trustRequired", &self.trust_required)?;
+        map.end()
+    }
 }
 
 pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
@@ -246,6 +288,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 
     let mut target = None;
     let mut destination = None;
+    let mut project_root = None;
     let mut state_dir = default_state_dir()?;
     let mut adopt = false;
     let mut json = false;
@@ -256,6 +299,11 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
             "--destination" => {
                 destination = Some(expand_home(
                     &args.next().ok_or("--destination requires a value")?,
+                )?)
+            }
+            "--project-root" => {
+                project_root = Some(expand_home(
+                    &args.next().ok_or("--project-root requires a value")?,
                 )?)
             }
             "--state-dir" => {
@@ -275,13 +323,29 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
             "unsupported profile for Rust parity unit: {profile}"
         ));
     }
-    if components.iter().any(|component| component != "skills") {
-        return Err("Rust parity unit supports only the skills component".into());
+    if components.iter().any(|component| {
+        !matches!(
+            component.as_str(),
+            "skills" | "agents" | "rules" | "commands"
+        )
+    }) {
+        return Err("Rust parity unit supports only path components".into());
     }
     let components = if components.is_empty() {
         None
     } else {
-        Some(vec![ComponentKind::Skills])
+        Some(
+            components
+                .into_iter()
+                .map(|component| match component.as_str() {
+                    "skills" => Ok(ComponentKind::Skills),
+                    "agents" => Ok(ComponentKind::Agents),
+                    "rules" => Ok(ComponentKind::Rules),
+                    "commands" => Ok(ComponentKind::Commands),
+                    _ => Err("Rust parity unit supports only path components".into()),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )
     };
     if !json {
         return Err("the Rust parity unit currently requires --json".into());
@@ -292,6 +356,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         target,
         components,
         destination,
+        project_root,
         state_dir,
         adopt,
         json,
@@ -917,20 +982,138 @@ mod tests {
     }
 
     #[test]
+    fn copied_resource_json_matches_python_oracle() {
+        let digest = resource::ContentDigest::parse(&"ab".repeat(32)).unwrap();
+        let proof = format!("aw-proof-v1:{}", "cd".repeat(32));
+        let trust = format!("aw-trust-v1:{}", "ef".repeat(32));
+        let actual = serde_json::json!({
+            "symlink-operation": serde_json::to_string_pretty(&operation_fixture(
+                "skills",
+                resource::PathResource::DirectorySymlink,
+                "/src/skill",
+            )).unwrap(),
+            "file-operation": serde_json::to_string_pretty(&operation_fixture(
+                "agents",
+                resource::PathResource::FileCopy(digest.clone()),
+                "/src/agent.md",
+            )).unwrap(),
+            "directory-operation": serde_json::to_string_pretty(&operation_fixture(
+                "hooks",
+                resource::PathResource::DirectoryCopy(digest.clone()),
+                "/src/hooks",
+            )).unwrap(),
+            "symlink-entry": state::entry_json(&entry_fixture(
+                "skill:sample",
+                ComponentKind::Skills,
+                resource::PathResource::DirectorySymlink,
+                None,
+                None,
+            )).unwrap(),
+            "file-entry": state::entry_json(&entry_fixture(
+                "agent:sample.md",
+                ComponentKind::Agents,
+                resource::PathResource::FileCopy(digest.clone()),
+                None,
+                None,
+            )).unwrap(),
+            "directory-entry": state::entry_json(&entry_fixture(
+                "hook:sample",
+                ComponentKind::Hooks,
+                resource::PathResource::DirectoryCopy(digest.clone()),
+                Some(trust.clone()),
+                None,
+            )).unwrap(),
+            "directory-entry-proof": state::entry_json(&entry_fixture(
+                "hook:sample",
+                ComponentKind::Hooks,
+                resource::PathResource::DirectoryCopy(digest.clone()),
+                Some(trust),
+                Some(proof),
+            )).unwrap(),
+            "directory-entry-null-trust": state::entry_json(&entry_fixture(
+                "hook:sample",
+                ComponentKind::Hooks,
+                resource::PathResource::DirectoryCopy(digest),
+                None,
+                None,
+            )).unwrap(),
+        });
+        let expected = python_resource_contract();
+        assert_eq!(expected, actual, "{expected:#?}\n{actual:#?}");
+    }
+
+    fn operation_fixture(
+        component: &'static str,
+        resource: resource::PathResource,
+        source: &str,
+    ) -> Operation {
+        Operation {
+            kind: "create",
+            key: "sample".into(),
+            destination: "/dest/sample".into(),
+            source: source.into(),
+            reason: "destination is absent".into(),
+            component,
+            resource,
+            diagnostic: None,
+            trust_token: None,
+            trust_required: false,
+            expected_link: None,
+            expected_digest: None,
+        }
+    }
+
+    fn entry_fixture(
+        key: &str,
+        component: ComponentKind,
+        resource: resource::PathResource,
+        trust: Option<String>,
+        trust_proof: Option<String>,
+    ) -> state::Entry {
+        state::Entry {
+            key: key.into(),
+            plugin: "pstack".into(),
+            source: "plugins/sample".into(),
+            destination: PathBuf::from("/dest/sample"),
+            source_repository: PathBuf::from("/repo"),
+            component,
+            resource,
+            trust,
+            trust_proof,
+        }
+    }
+
+    fn python_resource_contract() -> serde_json::Value {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let output = std::process::Command::new("python3")
+            .current_dir(root)
+            .arg("-c")
+            .arg(include_str!("resource_contract.py"))
+            .output()
+            .expect("python resource oracle");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("python resource oracle json")
+    }
+
+    #[test]
     fn output_field_order_is_the_python_contract() {
         let operation = Operation {
             kind: "create",
             key: "skill:x".into(),
             destination: "/d/x".into(),
             source: "/s/x".into(),
-            reason: "destination is absent",
+            reason: "destination is absent".into(),
             component: "skills",
-            resource_kind: "directory-symlink",
-            digest: None,
+            resource: resource::PathResource::DirectorySymlink,
             diagnostic: None,
             trust_token: None,
             trust_required: false,
             expected_link: None,
+            expected_digest: None,
         };
         let value = operations_json(&[operation]).unwrap();
         let expected = [

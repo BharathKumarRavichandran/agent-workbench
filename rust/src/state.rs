@@ -1,7 +1,9 @@
-use super::{reject_duplicate_json_keys, Result};
+use super::resource::PathResource;
+use super::{reject_duplicate_json_keys, ComponentKind, Result};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -14,6 +16,10 @@ pub(super) struct Entry {
     pub source: String,
     pub destination: PathBuf,
     pub source_repository: PathBuf,
+    pub component: ComponentKind,
+    pub resource: PathResource,
+    pub trust: Option<String>,
+    pub trust_proof: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +31,7 @@ pub(super) struct State {
     pub target: String,
     pub destination_root: PathBuf,
     pub entries: BTreeMap<String, Entry>,
+    pub destination_roots: BTreeMap<ComponentKind, PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +78,19 @@ struct V3Entry {
     component: String,
     resource_kind: String,
     source_repository: String,
+    #[serde(default, deserialize_with = "present_string")]
+    digest: Option<String>,
+    #[serde(default, deserialize_with = "present_string")]
+    trust: Option<String>,
+    #[serde(default, deserialize_with = "present_string")]
+    trust_proof: Option<String>,
+}
+
+fn present_string<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(String::deserialize(deserializer)?))
 }
 
 #[derive(Serialize)]
@@ -83,19 +103,77 @@ struct Encoded<'a> {
     target: &'a str,
     destination_root: &'a str,
     entries: BTreeMap<&'a str, EncodedEntry<'a>>,
-    destination_roots: BTreeMap<&'static str, &'a str>,
+    destination_roots: BTreeMap<&'a str, &'a str>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct EncodedEntry<'a> {
+    trust_proof: Option<&'a str>,
     key: &'a str,
     plugin: &'a str,
     source: &'a str,
     destination: &'a str,
-    component: &'static str,
-    resource_kind: &'static str,
+    component: &'a str,
+    resource_kind: &'a str,
     source_repository: &'a str,
+    include_trust: bool,
+    trust: Option<&'a str>,
+    digest: Option<&'a str>,
+}
+
+impl Serialize for EncodedEntry<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(proof) = self.trust_proof {
+            map.serialize_entry("trustProof", proof)?;
+        }
+        map.serialize_entry("key", self.key)?;
+        map.serialize_entry("plugin", self.plugin)?;
+        map.serialize_entry("source", self.source)?;
+        map.serialize_entry("destination", self.destination)?;
+        map.serialize_entry("component", self.component)?;
+        map.serialize_entry("resourceKind", self.resource_kind)?;
+        map.serialize_entry("sourceRepository", self.source_repository)?;
+        if self.include_trust {
+            map.serialize_entry("trust", &self.trust)?;
+        }
+        if let Some(digest) = self.digest {
+            map.serialize_entry("digest", digest)?;
+        }
+        map.end()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn entry_json(entry: &Entry) -> Result<String> {
+    serde_json::to_string_pretty(&encoded_entry(entry)?).map_err(|error| error.to_string())
+}
+
+fn encoded_entry(entry: &Entry) -> Result<EncodedEntry<'_>> {
+    Ok(EncodedEntry {
+        trust_proof: entry.trust_proof.as_deref(),
+        key: &entry.key,
+        plugin: &entry.plugin,
+        source: &entry.source,
+        destination: entry
+            .destination
+            .to_str()
+            .ok_or("state destination is not UTF-8")?,
+        component: entry.component.as_str(),
+        resource_kind: entry.resource.kind(),
+        source_repository: entry
+            .source_repository
+            .to_str()
+            .ok_or("state source repository is not UTF-8")?,
+        include_trust: matches!(entry.resource, PathResource::DirectoryCopy(_)),
+        trust: entry.trust.as_deref(),
+        digest: entry
+            .resource
+            .digest()
+            .map(super::resource::ContentDigest::as_str),
+    })
 }
 
 pub(super) fn load(path: &Path) -> Result<Option<State>> {
@@ -146,6 +224,10 @@ fn decode_v2(raw: V2) -> Result<State> {
                 source: value.source,
                 destination,
                 source_repository: repository.clone(),
+                component: ComponentKind::Skills,
+                resource: PathResource::DirectorySymlink,
+                trust: None,
+                trust_proof: None,
             },
         );
     }
@@ -155,8 +237,9 @@ fn decode_v2(raw: V2) -> Result<State> {
         marketplace: identifier(raw.marketplace, "installation state.marketplace")?,
         profile: identifier(raw.profile, "installation state.profile")?,
         target: identifier(raw.target, "installation state.target")?,
-        destination_root: root,
+        destination_root: root.clone(),
         entries,
+        destination_roots: BTreeMap::from([(ComponentKind::Skills, root)]),
     })
 }
 
@@ -164,41 +247,27 @@ fn decode_v3(raw: V3) -> Result<State> {
     if raw.schema_version != 3 {
         return Err("unsupported installation state".into());
     }
-    if raw.destination_roots.len() != 1 || !raw.destination_roots.contains_key("skills") {
-        return Err("installation state destinationRoots contains unsupported components".into());
-    }
     let repository = absolute(&raw.repository, "installation state.repository")?;
     let root = absolute(&raw.destination_root, "installation state.destinationRoot")?;
-    let skills_root = absolute(
-        raw.destination_roots.get("skills").unwrap(),
-        "installation state.destinationRoots.skills",
-    )?;
-    if skills_root != root {
+    let mut destination_roots = BTreeMap::new();
+    for (key, value) in raw.destination_roots {
+        let component = component_kind(&key)?;
+        destination_roots.insert(
+            component,
+            absolute(&value, "installation state.destinationRoots")?,
+        );
+    }
+    if destination_roots.get(&ComponentKind::Skills) != Some(&root) {
         return Err("installation state destinationRoots skills must match destinationRoot".into());
     }
     let mut entries = BTreeMap::new();
+    let mut destinations = BTreeSet::new();
     for (key, value) in raw.entries {
-        validate_entry_identity(&key, &value.key, &value.plugin, &value.source)?;
-        if value.component != "skills" || value.resource_kind != "directory-symlink" {
-            return Err(
-                "installation state entry key, component and resource kind disagree".into(),
-            );
+        let entry = decode_v3_entry(&key, &value, &destination_roots)?;
+        if !destinations.insert(entry.destination.clone()) {
+            return Err("installation state destinations must be unique".into());
         }
-        let destination = absolute(&value.destination, "installation state entry destination")?;
-        validate_destination(&key, &destination, &root)?;
-        entries.insert(
-            key.clone(),
-            Entry {
-                key,
-                plugin: value.plugin,
-                source: value.source,
-                destination,
-                source_repository: absolute(
-                    &value.source_repository,
-                    "installation state entry sourceRepository",
-                )?,
-            },
-        );
+        entries.insert(key, entry);
     }
     Ok(State {
         schema_version: 3,
@@ -208,7 +277,141 @@ fn decode_v3(raw: V3) -> Result<State> {
         target: identifier(raw.target, "installation state.target")?,
         destination_root: root,
         entries,
+        destination_roots,
     })
+}
+
+fn decode_v3_entry(
+    key: &str,
+    value: &V3Entry,
+    roots: &BTreeMap<ComponentKind, PathBuf>,
+) -> Result<Entry> {
+    let component = component_kind(&value.component)?;
+    let prefix = component_prefix(component)
+        .ok_or("installation state entry key, component and resource kind disagree")?;
+    let name = entry_name(key, &["skill", "agent", "rule", "command", "hook"])?;
+    if value.key != key {
+        return Err(format!(
+            "installation state entry key does not match mapping key: {key:?}"
+        ));
+    }
+    if !key.starts_with(&format!("{prefix}:")) {
+        return Err("installation state entry key, component and resource kind disagree".into());
+    }
+    let resource = decode_v3_resource(value)?;
+    if matches!(resource, PathResource::DirectorySymlink) != (component == ComponentKind::Skills)
+        || !key.starts_with(&format!("{prefix}:"))
+    {
+        return Err("installation state entry key, component and resource kind disagree".into());
+    }
+    if (component == ComponentKind::Hooks) != matches!(resource, PathResource::DirectoryCopy(_)) {
+        return Err("hook bundles require directory-copy".into());
+    }
+    reject_disallowed_entry_fields(key, value, &resource)?;
+    identifier(value.plugin.clone(), "installation state entry plugin")?;
+    source_path(&value.source)?;
+    let destination = absolute(&value.destination, "installation state entry destination")?;
+    let component_root = roots
+        .get(&component)
+        .ok_or("installation state entry lacks a destination root")?;
+    if destination.file_name().and_then(|item| item.to_str()) != Some(name) {
+        return Err(format!(
+            "installation state entry key does not match destination: '{key}'"
+        ));
+    }
+    if destination.parent() != Some(component_root) {
+        return Err(format!(
+            "state destination must be a direct child of installation root: {}",
+            destination.display()
+        ));
+    }
+    Ok(Entry {
+        key: key.to_owned(),
+        plugin: value.plugin.clone(),
+        source: value.source.clone(),
+        destination,
+        source_repository: absolute(
+            &value.source_repository,
+            "installation state entry sourceRepository",
+        )?,
+        component,
+        resource,
+        trust: value.trust.clone(),
+        trust_proof: value.trust_proof.clone(),
+    })
+}
+
+fn decode_v3_resource(value: &V3Entry) -> Result<PathResource> {
+    match value.resource_kind.as_str() {
+        "directory-symlink" => Ok(PathResource::DirectorySymlink),
+        "file-copy" => Ok(PathResource::FileCopy(content_digest(
+            value.digest.as_deref(),
+        )?)),
+        _ => Err("installation state entry resourceKind is unsupported".into()),
+    }
+}
+
+fn content_digest(value: Option<&str>) -> Result<super::resource::ContentDigest> {
+    let digest = value.ok_or("installation state entry digest must be a non-empty string")?;
+    super::resource::ContentDigest::parse(digest)
+        .map_err(|_| "installation state entry digest must be SHA-256".into())
+}
+
+fn reject_disallowed_entry_fields(
+    key: &str,
+    value: &V3Entry,
+    resource: &PathResource,
+) -> Result<()> {
+    let mut unknown = Vec::new();
+    if value.digest.is_some() && !matches!(resource, PathResource::FileCopy(_)) {
+        unknown.push("digest");
+    }
+    if value.trust.is_some() {
+        unknown.push("trust");
+    }
+    if value.trust_proof.is_some() {
+        unknown.push("trustProof");
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(format!(
+        "installation state.entries['{key}'] has unknown fields: {}",
+        unknown.join(", ")
+    ))
+}
+
+fn component_kind(value: &str) -> Result<ComponentKind> {
+    match value {
+        "skills" => Ok(ComponentKind::Skills),
+        "agents" => Ok(ComponentKind::Agents),
+        "rules" => Ok(ComponentKind::Rules),
+        "commands" => Ok(ComponentKind::Commands),
+        "hooks" => Ok(ComponentKind::Hooks),
+        "mcp" => Ok(ComponentKind::Mcp),
+        _ => Err(format!("'{value}' is not a valid ComponentKind")),
+    }
+}
+
+fn component_prefix(component: ComponentKind) -> Option<&'static str> {
+    match component {
+        ComponentKind::Skills => Some("skill"),
+        ComponentKind::Agents => Some("agent"),
+        ComponentKind::Rules => Some("rule"),
+        ComponentKind::Commands => Some("command"),
+        ComponentKind::Hooks => Some("hook"),
+        ComponentKind::Mcp => None,
+    }
+}
+
+fn entry_name<'a>(key: &'a str, prefixes: &[&str]) -> Result<&'a str> {
+    let (prefix, name) = key
+        .split_once(':')
+        .filter(|(prefix, name)| prefixes.contains(prefix) && safe_name(name))
+        .ok_or("installation state entry key is not a valid entry key")?;
+    let _ = prefix;
+    Ok(name)
 }
 
 fn validate_entry_identity(key: &str, embedded: &str, plugin: &str, source: &str) -> Result<()> {
@@ -305,24 +508,15 @@ pub(super) fn encode(state: &State) -> Result<String> {
     let entries = state
         .entries
         .iter()
-        .map(|(key, entry)| {
+        .map(|(key, entry)| Ok((key.as_str(), encoded_entry(entry)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let destination_roots = state
+        .destination_roots
+        .iter()
+        .map(|(component, path)| {
             Ok((
-                key.as_str(),
-                EncodedEntry {
-                    key: &entry.key,
-                    plugin: &entry.plugin,
-                    source: &entry.source,
-                    destination: entry
-                        .destination
-                        .to_str()
-                        .ok_or("state destination is not UTF-8")?,
-                    component: "skills",
-                    resource_kind: "directory-symlink",
-                    source_repository: entry
-                        .source_repository
-                        .to_str()
-                        .ok_or("state source repository is not UTF-8")?,
-                },
+                component.as_str(),
+                path.to_str().ok_or("state destination root is not UTF-8")?,
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
@@ -334,7 +528,7 @@ pub(super) fn encode(state: &State) -> Result<String> {
         target: &state.target,
         destination_root,
         entries,
-        destination_roots: BTreeMap::from([("skills", destination_root)]),
+        destination_roots,
     };
     serde_json::to_string_pretty(&encoded)
         .map(|value| value + "\n")

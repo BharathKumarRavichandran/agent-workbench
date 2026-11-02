@@ -1,3 +1,4 @@
+use super::resource::PathResource;
 use super::*;
 use crate::state::{self, Entry, State};
 use rustix::fd::OwnedFd;
@@ -6,6 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+#[path = "copy_parity_tests.rs"]
+mod copy_parity_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -33,7 +38,7 @@ pub(super) struct Plan {
     next: State,
     state_file: PathBuf,
     repository: PathBuf,
-    root: RootSnapshot,
+    roots: BTreeMap<PathBuf, RootSnapshot>,
 }
 
 pub(super) fn run(cli: &Cli) -> Result<(Vec<Operation>, bool)> {
@@ -71,20 +76,52 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         .clone()
         .or_else(|| target.components.clone())
         .unwrap_or_else(|| vec![ComponentKind::Skills]);
-    if requested != [ComponentKind::Skills] {
-        return Err("Rust parity unit supports only the skills component".into());
+    if requested.iter().any(|component| {
+        !matches!(
+            component,
+            ComponentKind::Skills
+                | ComponentKind::Agents
+                | ComponentKind::Rules
+                | ComponentKind::Commands
+        )
+    }) {
+        return Err("Rust parity unit supports only path components".into());
     }
-    let destination = resolve_destination(
-        cli.destination.as_deref(),
-        target.destination.as_deref(),
-        cli.target,
-    )?;
+    let project_root = cli
+        .project_root
+        .clone()
+        .or_else(|| target.project_root.as_deref().map(PathBuf::from));
+    let project_root = project_root
+        .map(|path| {
+            let path = expand_home_path(path)?;
+            if has_parent_component(&path) {
+                return Err("project root must be contained".into());
+            }
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                env::current_dir()
+                    .map_err(|error| error.to_string())?
+                    .join(path)
+            };
+            canonicalize_missing(&absolute)
+        })
+        .transpose()?;
+    let destination = match (&project_root, &cli.destination, &target.destination) {
+        (Some(project), None, None) => project.join(format!(".{target_id}/skills")),
+        _ => resolve_destination(
+            cli.destination.as_deref(),
+            target.destination.as_deref(),
+            cli.target,
+        )?,
+    };
     reject_destination_root_symlink(&destination)?;
     let state_file = canonicalize_missing(&cli.state_dir)?.join(format!(
         "agent-workbench/{}/{}/{target_id}.json",
         catalog.marketplace.id, profile.id
     ));
     let previous = state::load(&state_file)?;
+    let authorized = authorized_roots(cli.target, &destination, project_root.as_deref())?;
     if let Some(previous) = &previous {
         if previous.marketplace != catalog.marketplace.id
             || previous.profile != profile.id
@@ -98,68 +135,128 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         if previous.destination_root != destination {
             return Err("recorded destination root differs from requested destination; pass the same explicit --destination used for installation".into());
         }
+        authorize_recorded_roots(previous, &authorized)?;
     }
 
+    let mut projection_conflicts = Vec::new();
+    if cli.action != Action::Uninstall {
+        for component in &requested {
+            let supported = match cli.target {
+                SkillsTarget::Cursor => matches!(
+                    component,
+                    ComponentKind::Skills
+                        | ComponentKind::Agents
+                        | ComponentKind::Rules
+                        | ComponentKind::Hooks
+                        | ComponentKind::Mcp
+                ),
+                SkillsTarget::Claude => matches!(
+                    component,
+                    ComponentKind::Skills
+                        | ComponentKind::Agents
+                        | ComponentKind::Commands
+                        | ComponentKind::Hooks
+                        | ComponentKind::Mcp
+                ),
+                _ => *component == ComponentKind::Skills,
+            };
+            let rejection = if !supported {
+                Some((
+                    "COMPONENT_UNSUPPORTED",
+                    format!(
+                        "{target_id} does not support current {} format",
+                        component.as_str()
+                    ),
+                ))
+            } else if !authorized.contains_key(component) {
+                Some((
+                    "PROJECT_ROOT_REQUIRED",
+                    format!("{target_id} {} requires --project-root", component.as_str()),
+                ))
+            } else {
+                None
+            };
+            if let Some((code, reason)) = rejection {
+                projection_conflicts.push(Operation {
+                    kind: "conflict",
+                    key: format!("component:{}", component.as_str()),
+                    destination: authorized
+                        .get(component)
+                        .unwrap_or(&destination)
+                        .to_string_lossy()
+                        .into_owned(),
+                    source: String::new(),
+                    reason,
+                    component: component.as_str(),
+                    resource: PathResource::DirectorySymlink,
+                    diagnostic: Some(code.into()),
+                    trust_token: None,
+                    trust_required: false,
+                    expected_link: None,
+                    expected_digest: None,
+                });
+            }
+        }
+    }
+    let accepted: Vec<_> = requested
+        .iter()
+        .copied()
+        .filter(|component| {
+            !projection_conflicts
+                .iter()
+                .any(|op| op.component == component.as_str())
+        })
+        .collect();
     let desired = if cli.action == Action::Uninstall {
         BTreeMap::new()
     } else {
-        desired_entries(&repository, &catalog, &profile, &destination)?
+        desired_entries(
+            &repository,
+            &catalog,
+            &profile,
+            &destination,
+            &accepted,
+            &authorized,
+        )?
     };
     let owned = previous
         .as_ref()
         .map(|value| &value.entries)
         .cloned()
         .unwrap_or_default();
-    let mut operations = Vec::new();
+    let mut operations = projection_conflicts;
     let mut next_entries = BTreeMap::new();
-    for (key, entry) in &desired {
+    let mut ordered_desired: Vec<_> = desired.iter().collect();
+    ordered_desired.sort_by_key(|(key, entry)| {
+        (
+            catalog
+                .plugins
+                .iter()
+                .position(|plugin| plugin.id == entry.plugin),
+            accepted
+                .iter()
+                .position(|component| *component == entry.component),
+            *key,
+        )
+    });
+    for (key, entry) in ordered_desired {
         let source = entry.source_repository.join(&entry.source);
         let prior = owned.get(key);
-        let same_owner = prior.is_some_and(|prior| prior.destination == entry.destination);
-        let (kind, reason, expected_link) = match fs::symlink_metadata(&entry.destination) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ("create", "destination is absent", None)
-            }
-            Err(error) => return Err(format!("{}: {error}", entry.destination.display())),
-            Ok(_) if same_owner && !matches_owned(prior.unwrap())? => {
-                ("conflict", "managed path was modified", None)
-            }
-            Ok(metadata)
-                if metadata.file_type().is_symlink() && same_link(&entry.destination, &source)? =>
-            {
-                if same_owner {
-                    ("keep", "managed resource already matches", None)
-                } else if cli.adopt {
-                    (
-                        "adopt",
-                        "matching unmanaged resource explicitly adopted",
-                        None,
-                    )
-                } else {
-                    (
-                        "conflict",
-                        "matching resource is not recorded as owned; use --adopt",
-                        None,
-                    )
-                }
-            }
-            Ok(_) if same_owner && matches_owned(prior.unwrap())? => (
-                "replace-owned",
-                "managed resource has a new source",
-                Some(
-                    fs::read_link(&entry.destination)
-                        .map_err(|error| format!("{}: {error}", entry.destination.display()))?,
-                ),
-            ),
-            Ok(_) => ("conflict", "destination is a foreign file or link", None),
-        };
+        let same_owner = prior.is_some_and(|prior| {
+            prior.destination == entry.destination
+                && prior.component == entry.component
+                && std::mem::discriminant(&prior.resource)
+                    == std::mem::discriminant(&entry.resource)
+        });
+        let (kind, reason, expected_link, expected_digest) =
+            classify(entry, &source, prior, same_owner, cli.adopt)?;
         operations.push(operation(
             kind,
-            key,
-            &entry.destination,
+            entry,
             &source,
             reason,
             expected_link,
+            expected_digest,
         ));
         next_entries.insert(key.clone(), entry.clone());
     }
@@ -181,6 +278,12 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
             }
         }
     }
+    let mut destination_roots = BTreeMap::from([(ComponentKind::Skills, destination.clone())]);
+    for entry in next_entries.values() {
+        if let Some(root) = authorized.get(&entry.component) {
+            destination_roots.insert(entry.component, root.clone());
+        }
+    }
     let next = State {
         schema_version: 3,
         repository: repository.clone(),
@@ -189,15 +292,19 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         target: target_id.into(),
         destination_root: destination.clone(),
         entries: next_entries,
+        destination_roots,
     };
-    let root = snapshot_root(&destination)?;
+    let roots = authorized
+        .values()
+        .map(|path| Ok((path.clone(), snapshot_root(path)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
     Ok(Plan {
         operations,
         previous,
         next,
         state_file,
         repository,
-        root,
+        roots,
     })
 }
 
@@ -206,6 +313,8 @@ fn desired_entries(
     catalog: &Catalog,
     profile: &Profile,
     destination: &Path,
+    components: &[ComponentKind],
+    roots: &BTreeMap<ComponentKind, PathBuf>,
 ) -> Result<BTreeMap<String, Entry>> {
     let source_by_id: BTreeMap<_, _> = catalog
         .sources
@@ -244,94 +353,431 @@ fn desired_entries(
                 plugin.id, plugin.source
             )
         })?;
-        let artifact = plugin
-            .artifacts
-            .get("agent-skills")
-            .ok_or_else(|| format!("plugin {} has no agent-skills artifact", plugin.id))?;
         let source_root = resolve_repo_path(repository, &source.path)?;
-        let artifact_root = resolve_repo_path(&source_root, &artifact.path)?;
-        for (name, skill_root) in discover_skills(&artifact_root)? {
-            let key = format!("skill:{name}");
-            if entries.contains_key(&key) {
-                return Err(format!("duplicate exported skill name: {name}"));
+        if components.contains(&ComponentKind::Skills) {
+            let artifact = plugin
+                .artifacts
+                .get("agent-skills")
+                .ok_or_else(|| format!("plugin {} has no agent-skills artifact", plugin.id))?;
+            let artifact_root = resolve_repo_path(&source_root, &artifact.path)?;
+            for (name, skill_root) in discover_skills(&artifact_root)? {
+                let key = format!("skill:{name}");
+                if entries.contains_key(&key) {
+                    return Err(format!("duplicate exported skill name: {name}"));
+                }
+                entries.insert(
+                    key.clone(),
+                    Entry {
+                        key,
+                        plugin: plugin.id.clone(),
+                        source: skill_root
+                            .strip_prefix(repository)
+                            .map_err(|_| "skill source escapes checkout")?
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        destination: destination.join(name),
+                        source_repository: repository.to_path_buf(),
+                        component: ComponentKind::Skills,
+                        resource: PathResource::DirectorySymlink,
+                        trust: None,
+                        trust_proof: None,
+                    },
+                );
             }
-            entries.insert(
-                key.clone(),
-                Entry {
-                    key,
-                    plugin: plugin.id.clone(),
-                    source: skill_root
-                        .strip_prefix(repository)
-                        .map_err(|_| "skill source escapes checkout")?
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                    destination: destination.join(name),
-                    source_repository: repository.to_path_buf(),
-                },
-            );
+        }
+        for (component, artifact_name, suffix) in [
+            (ComponentKind::Agents, "agents", ".md"),
+            (ComponentKind::Rules, "rules", ".mdc"),
+            (ComponentKind::Commands, "commands", ".md"),
+        ] {
+            if !components.contains(&component) {
+                continue;
+            }
+            let Some(artifact) = plugin.artifacts.get(artifact_name) else {
+                continue;
+            };
+            let root = roots.get(&component).ok_or_else(|| {
+                format!(
+                    "{} {} requires --project-root",
+                    "cursor",
+                    component.as_str()
+                )
+            })?;
+            let artifact_root = canonicalize_missing(&source_root.join(&artifact.path))?;
+            if !artifact_root.starts_with(&source_root) {
+                return Err("repository path escapes checkout".into());
+            }
+            for (name, source) in discover_files(&artifact_root, suffix, component)? {
+                let key = format!("{}:{name}", component_key_prefix(component));
+                if entries.contains_key(&key) {
+                    return Err(format!("duplicate exported component name: {name}"));
+                }
+                let digest = file_digest(&source)?
+                    .ok_or_else(|| format!("copy requires a regular file: {}", source.display()))?;
+                entries.insert(
+                    key.clone(),
+                    Entry {
+                        key,
+                        plugin: plugin.id.clone(),
+                        source: source
+                            .strip_prefix(repository)
+                            .map_err(|_| "component source escapes checkout")?
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        destination: root.join(&name),
+                        source_repository: repository.to_path_buf(),
+                        component,
+                        resource: PathResource::FileCopy(crate::resource::ContentDigest::parse(
+                            &digest,
+                        )?),
+                        trust: None,
+                        trust_proof: None,
+                    },
+                );
+            }
         }
     }
     Ok(entries)
 }
 
+fn component_key_prefix(component: ComponentKind) -> &'static str {
+    match component {
+        ComponentKind::Skills => "skill",
+        ComponentKind::Agents => "agent",
+        ComponentKind::Rules => "rule",
+        ComponentKind::Commands => "command",
+        ComponentKind::Hooks => "hook",
+        ComponentKind::Mcp => "mcp",
+    }
+}
+
+fn discover_files(
+    root: &Path,
+    suffix: &str,
+    component: ComponentKind,
+) -> Result<Vec<(String, PathBuf)>> {
+    reject_symlink_tree(root)?;
+    let mut found = Vec::new();
+    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_str().ok_or("component filename is not UTF-8")?;
+        if path.extension().and_then(|value| value.to_str()) != suffix.strip_prefix('.') {
+            continue;
+        }
+        validate_document(&path, component)?;
+        found.push((name.to_owned(), path));
+    }
+    found.sort();
+    Ok(found)
+}
+
+fn validate_document(path: &Path, component: ComponentKind) -> Result<()> {
+    // DocumentDirectoryInspector uses universal newlines and the last nonempty
+    // value for each stripped frontmatter key; it does not parse YAML.
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if !text.starts_with("---\n") {
+        return Err(format!(
+            "frontmatter must start at byte zero: {}",
+            path.display()
+        ));
+    }
+    let closing = text[4..]
+        .find("\n---\n")
+        .map(|index| index + 4)
+        .ok_or_else(|| format!("frontmatter is not closed: {}", path.display()))?;
+    let mut values = BTreeMap::new();
+    for line in text[4..closing].lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let value = value.trim().trim_matches(['\'', '"']);
+            if !key.trim().is_empty() && !value.is_empty() {
+                values.insert(key.trim(), value);
+            }
+        }
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or("invalid component filename")?;
+    let name = if component == ComponentKind::Agents {
+        values.get("name").copied().unwrap_or("")
+    } else {
+        stem
+    };
+    if !safe_filename(name) {
+        return Err("component name must be one safe filename component".into());
+    }
+    if component == ComponentKind::Agents && name != stem {
+        return Err(format!(
+            "component name must match filename stem: {}",
+            path.display()
+        ));
+    }
+    if matches!(component, ComponentKind::Agents | ComponentKind::Rules)
+        && !values.contains_key("description")
+    {
+        return Err(format!(
+            "component frontmatter requires description: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn operation(
     kind: &'static str,
-    key: &str,
-    destination: &Path,
+    entry: &Entry,
     source: &Path,
     reason: &'static str,
     expected_link: Option<PathBuf>,
+    expected_digest: Option<String>,
 ) -> Operation {
     Operation {
         kind,
-        key: key.into(),
-        destination: destination.to_string_lossy().into_owned(),
+        key: entry.key.clone(),
+        destination: entry.destination.to_string_lossy().into_owned(),
         source: source.to_string_lossy().into_owned(),
-        reason,
-        component: "skills",
-        resource_kind: "directory-symlink",
-        digest: None,
+        reason: reason.into(),
+        component: entry.component.as_str(),
+        resource: entry.resource.clone(),
         diagnostic: None,
         trust_token: None,
         trust_required: false,
         expected_link,
+        expected_digest,
     }
 }
 
-fn removal(key: &str, entry: &Entry, reason: &'static str) -> Result<Option<Operation>> {
+fn authorize_recorded_roots(
+    previous: &State,
+    authorized: &BTreeMap<ComponentKind, PathBuf>,
+) -> Result<()> {
+    for (component, recorded) in &previous.destination_roots {
+        if authorized.get(component) != Some(recorded) {
+            return Err("recorded destination root differs from adapter-authorized root; pass the same --project-root".into());
+        }
+    }
+    Ok(())
+}
+
+fn authorized_roots(
+    target: SkillsTarget,
+    destination: &Path,
+    project_root: Option<&Path>,
+) -> Result<BTreeMap<ComponentKind, PathBuf>> {
+    let mut roots = BTreeMap::from([(ComponentKind::Skills, destination.to_path_buf())]);
+    if !matches!(target, SkillsTarget::Cursor | SkillsTarget::Claude) {
+        return Ok(roots);
+    }
+    let base_name = match target {
+        SkillsTarget::Cursor => ".cursor",
+        SkillsTarget::Claude => ".claude",
+        _ => unreachable!(),
+    };
+    let home_base = match project_root {
+        Some(project) => project.join(base_name),
+        None => home_dir()?.join(base_name),
+    };
+    let capability_base = home_base.join("skills");
+    let capability_parent = capability_base
+        .parent()
+        .ok_or("target home has no parent")?
+        .to_path_buf();
+    roots.insert(ComponentKind::Agents, capability_parent.join("agents"));
+    if target == SkillsTarget::Cursor && project_root.is_some() {
+        roots.insert(ComponentKind::Rules, capability_parent.join("rules"));
+    }
+    if target == SkillsTarget::Claude {
+        roots.insert(ComponentKind::Commands, capability_parent.join("commands"));
+    }
+    roots.insert(
+        ComponentKind::Hooks,
+        home_base.join(".agent-workbench-hooks"),
+    );
+    if target == SkillsTarget::Cursor {
+        roots.insert(ComponentKind::Mcp, home_base);
+    }
+    Ok(roots)
+}
+
+fn removal(_key: &str, entry: &Entry, reason: &'static str) -> Result<Option<Operation>> {
     match fs::symlink_metadata(&entry.destination) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("{}: {error}", entry.destination.display())),
-        Ok(_) if matches_owned(entry)? => Ok(Some(operation(
-            "remove-owned",
-            key,
-            &entry.destination,
-            &entry.source_repository.join(&entry.source),
-            reason,
-            Some(fs::read_link(&entry.destination).map_err(|error| error.to_string())?),
-        ))),
+        Ok(_) if matches_owned(entry)? => {
+            let (expected_link, expected_digest) = ownership_evidence(entry)?;
+            Ok(Some(operation(
+                "remove-owned",
+                entry,
+                &entry.source_repository.join(&entry.source),
+                reason,
+                expected_link,
+                expected_digest,
+            )))
+        }
         Ok(_) => Ok(Some(operation(
             "conflict",
-            key,
-            &entry.destination,
+            entry,
             &entry.source_repository.join(&entry.source),
             "managed path was modified",
+            None,
             None,
         ))),
     }
 }
 
+fn classify(
+    entry: &Entry,
+    source: &Path,
+    prior: Option<&Entry>,
+    same_owner: bool,
+    adopt: bool,
+) -> Result<(&'static str, &'static str, Option<PathBuf>, Option<String>)> {
+    match fs::symlink_metadata(&entry.destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(("create", "destination is absent", None, None))
+        }
+        Err(error) => Err(format!("{}: {error}", entry.destination.display())),
+        Ok(_) if same_owner && !matches_owned(prior.unwrap())? => {
+            Ok(("conflict", "managed path was modified", None, None))
+        }
+        Ok(_) if matches_resource(&entry.destination, source, &entry.resource)? => {
+            if same_owner {
+                Ok(("keep", "managed resource already matches", None, None))
+            } else if adopt {
+                Ok((
+                    "adopt",
+                    "matching unmanaged resource explicitly adopted",
+                    None,
+                    None,
+                ))
+            } else {
+                Ok((
+                    "conflict",
+                    "matching resource is not recorded as owned; use --adopt",
+                    None,
+                    None,
+                ))
+            }
+        }
+        Ok(_) if same_owner && matches_owned(prior.unwrap())? => {
+            let (expected_link, expected_digest) = ownership_evidence(prior.unwrap())?;
+            Ok((
+                "replace-owned",
+                "managed resource has a new source",
+                expected_link,
+                expected_digest,
+            ))
+        }
+        Ok(_) => Ok((
+            "conflict",
+            "destination is a foreign file or link",
+            None,
+            None,
+        )),
+    }
+}
+
+fn ownership_evidence(entry: &Entry) -> Result<(Option<PathBuf>, Option<String>)> {
+    match &entry.resource {
+        PathResource::DirectorySymlink => Ok((
+            Some(
+                fs::read_link(&entry.destination)
+                    .map_err(|error| format!("{}: {error}", entry.destination.display()))?,
+            ),
+            None,
+        )),
+        PathResource::FileCopy(digest) | PathResource::DirectoryCopy(digest) => {
+            Ok((None, Some(digest.as_str().to_owned())))
+        }
+    }
+}
+
+fn matches_resource(destination: &Path, source: &Path, resource: &PathResource) -> Result<bool> {
+    match resource {
+        PathResource::DirectorySymlink => Ok(fs::symlink_metadata(destination)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+            && same_link(destination, source)?),
+        PathResource::FileCopy(digest) => {
+            Ok(file_digest(destination)?.as_deref() == Some(digest.as_str()))
+        }
+        PathResource::DirectoryCopy(_) => Ok(false),
+    }
+}
+
 fn matches_owned(entry: &Entry) -> Result<bool> {
-    let metadata = match fs::symlink_metadata(&entry.destination) {
+    matches_resource(
+        &entry.destination,
+        &entry.source_repository.join(&entry.source),
+        &entry.resource,
+    )
+}
+
+fn read_regular(repository: &Path, path: &Path) -> Result<Vec<u8>> {
+    let relative = path
+        .strip_prefix(repository)
+        .map_err(|_| "copy source escapes checkout")?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    let mut directory =
+        rfs::open(repository, flags, Mode::empty()).map_err(|error| error.to_string())?;
+    for component in relative
+        .parent()
+        .ok_or("copy source has no parent")?
+        .components()
+    {
+        if !matches!(component, Component::Normal(_)) {
+            return Err("copy source escapes checkout".into());
+        }
+        directory = rfs::openat(&directory, component.as_os_str(), flags, Mode::empty())
+            .map_err(|error| error.to_string())?;
+    }
+    let file = rfs::openat(
+        &directory,
+        relative.file_name().ok_or("copy source has no filename")?,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = rfs::fstat(&file).map_err(|error| error.to_string())?;
+    if !rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_file() {
+        return Err(format!("copy requires a regular file: {}", path.display()));
+    }
+    let mut reader = std::fs::File::from(file);
+    let mut content = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut content).map_err(|error| error.to_string())?;
+    Ok(content)
+}
+
+fn file_digest(path: &Path) -> Result<Option<String>> {
+    let file = match rfs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
         Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
-    Ok(metadata.file_type().is_symlink()
-        && same_link(
-            &entry.destination,
-            &entry.source_repository.join(&entry.source),
-        )?)
+    digest_descriptor(file)
+}
+
+fn digest_descriptor(file: OwnedFd) -> Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let metadata = rfs::fstat(&file).map_err(|error| error.to_string())?;
+    if !rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_file() {
+        return Ok(None);
+    }
+    let mut reader = std::fs::File::from(file);
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut reader, &mut hasher).map_err(|error| error.to_string())?;
+    Ok(Some(format!("{:x}", hasher.finalize())))
 }
 
 fn identity(path: &Path) -> Result<Option<Identity>> {
@@ -563,7 +1009,92 @@ impl DestinationRoot {
         Ok(moved)
     }
 
+    fn quarantine_file(&self, name: &str, expected_digest: &str) -> Result<Quarantine> {
+        #[cfg(test)]
+        copy_parity_tests::event("quarantine", &self.path.join(name))?;
+        let directory = format!(".agent-workbench-quarantine-{}-{name}", std::process::id());
+        rfs::mkdirat(&self.fd, &directory, Mode::from_raw_mode(0o700))
+            .map_err(|error| error.to_string())?;
+        let qfd = rfs::openat(
+            &self.fd,
+            &directory,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| error.to_string())?;
+        if let Err(error) = rfs::renameat(&self.fd, name, &qfd, "entry") {
+            let _ = rfs::unlinkat(&self.fd, &directory, AtFlags::REMOVEDIR);
+            return Err(error.to_string());
+        }
+        let moved = Quarantine { directory, qfd };
+        #[cfg(test)]
+        copy_parity_tests::event("quarantined", &self.path)?;
+        let actual = rfs::openat(
+            &moved.qfd,
+            "entry",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| error.to_string())
+        .and_then(digest_descriptor);
+        let actual = match actual {
+            Ok(actual) => actual,
+            Err(error) => {
+                self.restore(name, moved)?;
+                return Err(error);
+            }
+        };
+        if actual.as_deref() != Some(expected_digest) {
+            self.restore(name, moved)?;
+            return Err(format!(
+                "destination changed since planning: {}",
+                self.path.join(name).display()
+            ));
+        }
+        Ok(moved)
+    }
+
+    fn publish_file(&self, name: &str, content: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        copy_parity_tests::event("publish", &self.path)?;
+        let temporary = format!(".agent-workbench-copy-{}-{}", std::process::id(), name);
+        let file = rfs::openat(
+            &self.fd,
+            &temporary,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+            Mode::from_raw_mode(0o644),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut writer = std::fs::File::from(file);
+        let write = (|| {
+            std::io::Write::write_all(&mut writer, content).map_err(|error| error.to_string())?;
+            writer.sync_all().map_err(|error| error.to_string())
+        })();
+        drop(writer);
+        if let Err(error) = write {
+            let _ = rfs::unlinkat(&self.fd, &temporary, AtFlags::empty());
+            return Err(error);
+        }
+        if let Err(error) = rfs::linkat(&self.fd, &temporary, &self.fd, name, AtFlags::empty()) {
+            let _ = rfs::unlinkat(&self.fd, &temporary, AtFlags::empty());
+            return Err(error.to_string());
+        }
+        rfs::unlinkat(&self.fd, &temporary, AtFlags::empty()).map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        copy_parity_tests::event("published", &self.path)?;
+        rfs::fsync(&self.fd).map_err(|error| error.to_string())
+    }
+
     fn restore(&self, name: &str, moved: Quarantine) -> Result<()> {
+        match rfs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(rustix::io::Errno::NOENT) => {}
+            _ => {
+                return Err(format!(
+                "destination changed while restoring quarantined entry; recover it from {}/entry",
+                self.path.join(&moved.directory).display()
+            ))
+            }
+        }
         rfs::renameat(&moved.qfd, "entry", &self.fd, name).map_err(|error| {
             format!(
                 "destination changed while restoring quarantined entry; recover it from {}/entry: {error}",
@@ -588,6 +1119,24 @@ struct Quarantine {
     qfd: OwnedFd,
 }
 
+fn validate_operation_source(plan: &Plan, operation: &Operation) -> Result<Option<Vec<u8>>> {
+    let source = Path::new(&operation.source);
+    if let PathResource::FileCopy(digest) = &operation.resource {
+        let content = read_regular(&plan.repository, source)?;
+        use sha2::{Digest, Sha256};
+        if format!("{:x}", Sha256::digest(&content)) != digest.as_str() {
+            return Err(format!(
+                "copy source changed since planning: {}",
+                source.display()
+            ));
+        }
+        Ok(Some(content))
+    } else {
+        validate_source(&plan.repository, source)?;
+        Ok(None)
+    }
+}
+
 fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
     let _lock = LockedState::acquire(&plan.state_file)?;
     if state::load(&plan.state_file)? != plan.previous {
@@ -595,8 +1144,7 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
     }
     for operation in &plan.operations {
         if operation.kind != "remove-owned" {
-            let source = Path::new(&operation.source);
-            validate_source(&plan.repository, source)?;
+            validate_operation_source(plan, operation)?;
         }
     }
     if plan.operations.is_empty() {
@@ -606,34 +1154,66 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
             state::write(&plan.state_file, &plan.next)
         };
     }
-    let root = DestinationRoot::open(&plan.root, !uninstall)?;
+    let needed: BTreeSet<_> = plan
+        .operations
+        .iter()
+        .map(|operation| {
+            Path::new(&operation.destination)
+                .parent()
+                .ok_or_else(|| "destination has no parent".to_owned())
+        })
+        .collect::<Result<_>>()?;
+    let roots = needed
+        .into_iter()
+        .map(|path| {
+            let snapshot = plan
+                .roots
+                .get(path)
+                .ok_or("destination root lacks planning snapshot")?;
+            Ok((path, DestinationRoot::open(snapshot, !uninstall)?))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let mut entries = plan
         .previous
         .as_ref()
         .map(|value| value.entries.clone())
         .unwrap_or_default();
     for operation in &plan.operations {
-        root.verify()?;
         let destination = Path::new(&operation.destination);
+        let parent = destination.parent().ok_or("destination has no parent")?;
+        let root = roots.get(parent).ok_or("destination root was not opened")?;
+        root.verify()?;
         let name = destination
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or("destination name is not UTF-8")?;
         match operation.kind {
             "keep" | "adopt" => {
-                validate_source(&plan.repository, Path::new(&operation.source))?;
-                if root
-                    .target(name)
-                    .ok()
-                    .as_deref()
-                    .map(|target| canonicalize_missing(&root.path.join(target)))
-                    .transpose()?
-                    != Some(canonicalize_missing(Path::new(&operation.source))?)
-                {
-                    return Err(format!(
-                        "destination changed since planning: {}",
-                        destination.display()
-                    ));
+                validate_operation_source(plan, operation)?;
+                if let PathResource::FileCopy(digest) = &operation.resource {
+                    if file_digest(Path::new(&operation.destination))?.as_deref()
+                        != Some(digest.as_str())
+                    {
+                        return Err(format!(
+                            "destination changed since planning: {}",
+                            destination.display()
+                        ));
+                    }
+                } else {
+                    validate_source(&plan.repository, Path::new(&operation.source))?;
+                    if root
+                        .target(name)
+                        .ok()
+                        .as_deref()
+                        .map(|target| canonicalize_missing(&root.path.join(target)))
+                        .transpose()?
+                        != Some(canonicalize_missing(Path::new(&operation.source))?)
+                    {
+                        return Err(format!(
+                            "destination changed since planning: {}",
+                            destination.display()
+                        ));
+                    }
                 }
                 entries.insert(
                     operation.key.clone(),
@@ -642,25 +1222,45 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
                 write_progress(plan, &entries)?;
             }
             "create" => {
-                validate_source(&plan.repository, Path::new(&operation.source))?;
-                root.create_verified(name, Path::new(&operation.source))?;
+                let source = Path::new(&operation.source);
+                if matches!(operation.resource, PathResource::FileCopy(_)) {
+                    let content =
+                        validate_operation_source(plan, operation)?.ok_or("copy lacks content")?;
+                    root.publish_file(name, &content)?;
+                    if let Err(error) = root.verify() {
+                        let digest = operation.resource.digest().ok_or("copy lacks digest")?;
+                        let moved = root.quarantine_file(name, digest.as_str())?;
+                        root.discard(moved)?;
+                        return Err(error);
+                    }
+                } else {
+                    validate_source(&plan.repository, source)?;
+                    root.create_verified(name, source)?;
+                }
                 entries.insert(
                     operation.key.clone(),
                     plan.next.entries[&operation.key].clone(),
                 );
                 if let Err(error) = write_progress(plan, &entries) {
-                    let expected = relative_link(Path::new(&operation.source), &root.path)?;
-                    let moved = root.quarantine(name, &expected)?;
-                    root.discard(moved)?;
+                    if let PathResource::FileCopy(digest) = &operation.resource {
+                        let moved = root.quarantine_file(name, digest.as_str())?;
+                        root.discard(moved)?;
+                    } else {
+                        let expected = relative_link(Path::new(&operation.source), &root.path)?;
+                        let moved = root.quarantine(name, &expected)?;
+                        root.discard(moved)?;
+                    }
                     return Err(error);
                 }
             }
             "remove-owned" => {
-                let expected = operation
-                    .expected_link
-                    .as_deref()
-                    .ok_or("owned removal lacks source evidence")?;
-                let moved = root.quarantine(name, expected)?;
+                let moved = if let Some(expected) = operation.expected_link.as_deref() {
+                    root.quarantine(name, expected)?
+                } else if let Some(digest) = operation.expected_digest.as_deref() {
+                    root.quarantine_file(name, digest)?
+                } else {
+                    return Err("owned removal lacks source evidence".into());
+                };
                 if let Err(error) = root.verify() {
                     root.restore(name, moved)?;
                     return Err(error);
@@ -673,31 +1273,58 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
                 root.discard(moved)?;
             }
             "replace-owned" => {
-                validate_source(&plan.repository, Path::new(&operation.source))?;
-                let expected = operation
-                    .expected_link
-                    .as_deref()
-                    .ok_or("owned replacement lacks source evidence")?;
-                let moved = root.quarantine(name, expected)?;
-                if let Err(error) = root
-                    .create(name, Path::new(&operation.source))
-                    .and_then(|_| root.verify())
-                {
-                    let _ = rfs::unlinkat(&root.fd, name, AtFlags::empty());
-                    root.restore(name, moved)?;
-                    return Err(error);
+                let source = Path::new(&operation.source);
+                if matches!(operation.resource, PathResource::FileCopy(_)) {
+                    let content =
+                        validate_operation_source(plan, operation)?.ok_or("copy lacks content")?;
+                    let moved = operation
+                        .expected_digest
+                        .as_deref()
+                        .ok_or("owned replacement lacks source evidence")?;
+                    let moved = root.quarantine_file(name, moved)?;
+                    if let Err(error) = root
+                        .publish_file(name, &content)
+                        .and_then(|_| root.verify())
+                    {
+                        let _ = rfs::unlinkat(&root.fd, name, AtFlags::empty());
+                        root.restore(name, moved)?;
+                        return Err(error);
+                    }
+                    entries.insert(
+                        operation.key.clone(),
+                        plan.next.entries[&operation.key].clone(),
+                    );
+                    if let Err(error) = write_progress(plan, &entries) {
+                        rfs::unlinkat(&root.fd, name, AtFlags::empty())
+                            .map_err(|value| value.to_string())?;
+                        root.restore(name, moved)?;
+                        return Err(error);
+                    }
+                    root.discard(moved)?;
+                } else {
+                    validate_source(&plan.repository, source)?;
+                    let expected = operation
+                        .expected_link
+                        .as_deref()
+                        .ok_or("owned replacement lacks source evidence")?;
+                    let moved = root.quarantine(name, expected)?;
+                    if let Err(error) = root.create(name, source).and_then(|_| root.verify()) {
+                        let _ = rfs::unlinkat(&root.fd, name, AtFlags::empty());
+                        root.restore(name, moved)?;
+                        return Err(error);
+                    }
+                    entries.insert(
+                        operation.key.clone(),
+                        plan.next.entries[&operation.key].clone(),
+                    );
+                    if let Err(error) = write_progress(plan, &entries) {
+                        rfs::unlinkat(&root.fd, name, AtFlags::empty())
+                            .map_err(|value| value.to_string())?;
+                        root.restore(name, moved)?;
+                        return Err(error);
+                    }
+                    root.discard(moved)?;
                 }
-                entries.insert(
-                    operation.key.clone(),
-                    plan.next.entries[&operation.key].clone(),
-                );
-                if let Err(error) = write_progress(plan, &entries) {
-                    rfs::unlinkat(&root.fd, name, AtFlags::empty())
-                        .map_err(|value| value.to_string())?;
-                    root.restore(name, moved)?;
-                    return Err(error);
-                }
-                root.discard(moved)?;
             }
             _ => {}
         }
@@ -710,6 +1337,18 @@ fn apply(plan: &Plan, uninstall: bool) -> Result<()> {
 }
 
 fn write_progress(plan: &Plan, entries: &BTreeMap<String, Entry>) -> Result<()> {
+    #[cfg(test)]
+    copy_parity_tests::event("progress", &plan.state_file)?;
+    let mut destination_roots = plan
+        .previous
+        .as_ref()
+        .map(|state| state.destination_roots.clone())
+        .unwrap_or_default();
+    destination_roots.extend(plan.next.destination_roots.clone());
+    destination_roots.retain(|component, _| {
+        *component == ComponentKind::Skills
+            || entries.values().any(|entry| entry.component == *component)
+    });
     let progress = State {
         schema_version: 3,
         repository: plan.next.repository.clone(),
@@ -718,6 +1357,7 @@ fn write_progress(plan: &Plan, entries: &BTreeMap<String, Entry>) -> Result<()> 
         target: plan.next.target.clone(),
         destination_root: plan.next.destination_root.clone(),
         entries: entries.clone(),
+        destination_roots,
     };
     state::write(&plan.state_file, &progress)
 }
@@ -817,6 +1457,7 @@ mod race_tests {
                 target: SkillsTarget::Hermes,
                 components: None,
                 destination: Some(self.destination.clone()),
+                project_root: None,
                 state_dir: self.state_root.clone(),
                 adopt: false,
                 json: true,
