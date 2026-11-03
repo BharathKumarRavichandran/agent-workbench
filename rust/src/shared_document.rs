@@ -71,7 +71,9 @@ pub(crate) fn parse_bytes(content: &[u8]) -> Result<Wire> {
     }
     let text = if width == 2 {
         let words = content
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| {
                 if little {
                     u16::from_le_bytes([b[0], b[1]])
@@ -83,7 +85,9 @@ pub(crate) fn parse_bytes(content: &[u8]) -> Result<Wire> {
         String::from_utf16(&words).map_err(|_| invalid())?
     } else {
         content
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| {
                 let b = [b[0], b[1], b[2], b[3]];
                 char::from_u32(if little {
