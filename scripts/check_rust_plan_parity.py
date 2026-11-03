@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+if str(REPOSITORY) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY))
 RUST = REPOSITORY / "rust" / "target" / "debug" / "agent-workbench-rs"
 TARGETS = ("agents", "claude", "codex", "cursor", "grok", "hermes")
 
@@ -933,6 +935,1090 @@ def copy_race_rows(base: Path) -> None:
             assert not python.state_file.exists() and not rust.state_file.exists()
 
 
+def state_wire_rows(base: Path) -> None:
+    """Python load_state/as_dict is the wire oracle, not an authority oracle."""
+    import copy
+    from typing import Any
+    if str(REPOSITORY) not in sys.path:
+        sys.path.insert(0, str(REPOSITORY))
+    from agent_workbench.state import load_state
+
+    inputs = base / "inputs"
+    inputs.mkdir(parents=True)
+    state = {
+        "schemaVersion": 4, "repository": "/repo", "marketplace": "market",
+        "profile": "pstack", "target": "cursor", "destinationRoot": "/skills",
+        "destinationRoots": {"skills": "/skills", "hooks": "/hooks", "mcp": "/config"},
+        "entries": {"hook:bundle": {
+            "key": "hook:bundle", "plugin": "pstack", "source": "plugins/hooks",
+            "destination": "/hooks/bundle", "component": "hooks",
+            "resourceKind": "directory-copy", "sourceRepository": "/repo",
+            "digest": "a" * 64, "trust": "aw-trust-v1:" + "b" * 64,
+            "trustProof": "aw-proof-v1:" + "c" * 64}},
+        "slots": {"mcp:pstack:server": {
+            "key": "mcp:pstack:server", "plugin": "pstack", "component": "mcp",
+            "document": "/arbitrary/config.json", "slot": "server", "digest": "d" * 64,
+            "trust": "aw-trust-v1:" + "e" * 64, "trustProof": "aw-proof-v1:" + "f" * 64}},
+    }
+    cases: dict[str, Any] = {"v4": state}
+    for label, route in (("state", ()), ("entry", ("entries", "hook:bundle")),
+                         ("slot", ("slots", "mcp:pstack:server"))):
+        obj = state
+        for key in route:
+            obj = obj[key]
+        for field in obj:
+            for variant in ("missing", "null"):
+                changed = copy.deepcopy(state)
+                cursor = changed
+                for key in route:
+                    cursor = cursor[key]
+                if variant == "missing":
+                    del cursor[field]
+                else:
+                    cursor[field] = None
+                cases[f"{label}-{field}-{variant}"] = changed
+        changed = copy.deepcopy(state)
+        cursor = changed
+        for key in route:
+            cursor = cursor[key]
+        cursor["unknown"] = True
+        cases[f"{label}-unknown"] = changed
+    variants = {
+        "bad-trust": ("entries", "hook:bundle", "trust", "aw-trust-v1:" + "A" * 64),
+        "bad-proof": ("slots", "mcp:pstack:server", "trustProof", "aw-proof-v1:bad"),
+        "bad-digest": ("entries", "hook:bundle", "digest", "a" * 63),
+        "wrong-key": ("entries", "hook:bundle", "key", "hook:other"),
+        "wrong-component": ("entries", "hook:bundle", "component", "agents"),
+        "wrong-resource": ("entries", "hook:bundle", "resourceKind", "file-copy"),
+        "wrong-slot-key": ("slots", "mcp:pstack:server", "slot", "other"),
+        "wrong-slot-component": ("slots", "mcp:pstack:server", "component", "agents"),
+        "slot-name-not-path": ("slots", "mcp:pstack:server", "slot", "../server"),
+        "relative-document": ("slots", "mcp:pstack:server", "document", "config.json"),
+        "parent-document": ("slots", "mcp:pstack:server", "document", "/a/../config.json"),
+        "wrong-destination": ("entries", "hook:bundle", "destination", "/hooks/other"),
+        "nested-destination": ("entries", "hook:bundle", "destination", "/hooks/nested/bundle"),
+        "parent-source": ("entries", "hook:bundle", "source", "../hooks"),
+        "normalized-source": ("entries", "hook:bundle", "source", "./plugins//hooks/"),
+    }
+    for label, (collection, key, field, value) in variants.items():
+        changed = copy.deepcopy(state)
+        changed[collection][key][field] = value
+        cases[label] = changed
+    for label, roots in (("missing-root", {"skills": "/skills"}),
+                         ("wrong-skills-root", {"skills": "/other", "hooks": "/hooks"})):
+        changed = copy.deepcopy(state)
+        changed["destinationRoots"] = roots
+        cases[label] = changed
+    for version in (2, 3, 4):
+        changed = copy.deepcopy(state)
+        changed["schemaVersion"] = version
+        changed["entries"] = {}
+        if version < 4:
+            del changed["slots"]
+        if version == 2:
+            del changed["destinationRoots"]
+        cases[f"empty-v{version}"] = changed
+    # Legacy entries and conditional evidence are part of the same wire contract.
+    for version in (2, 3, 4):
+        for component, prefix, kind in (("skills", "skill", "directory-symlink"),
+                                         ("agents", "agent", "file-copy"),
+                                         ("rules", "rule", "file-copy"),
+                                         ("commands", "command", "file-copy"),
+                                         ("hooks", "hook", "directory-copy")):
+            changed = copy.deepcopy(state)
+            changed["schemaVersion"] = version
+            key = f"{prefix}:example"
+            entry = {"key": key, "plugin": "pstack", "source": "./plugins//example/",
+                     "destination": "/skills/example"}
+            if version >= 3:
+                entry.update(component=component, resourceKind=kind, sourceRepository="/repo")
+                if kind != "directory-symlink":
+                    entry["digest"] = "a" * 64
+                if kind == "directory-copy":
+                    entry["trust"] = "aw-trust-v1:" + "b" * 64
+                changed["destinationRoots"][component] = "/skills"
+            else:
+                del changed["destinationRoots"]
+            if version < 4:
+                del changed["slots"]
+            changed["entries"] = {key: entry}
+            cases[f"v{version}-{component}"] = changed
+            for field in ("digest", "trust", "trustProof"):
+                extra = copy.deepcopy(changed)
+                extra["entries"][key][field] = ("aw-proof-v1:" if field == "trustProof" else "aw-trust-v1:" if field == "trust" else "") + "a" * 64
+                cases[f"v{version}-{component}-extra-{field}"] = extra
+    for component in ("hooks", "mcp"):
+        changed = copy.deepcopy(state)
+        slot = changed["slots"].pop("mcp:pstack:server")
+        key = f"{component}:pstack:../server"
+        slot.update(key=key, component=component, slot="../server")
+        changed["slots"][key] = slot
+        cases[f"opaque-slot-{component}"] = changed
+    for value in (True, 4.0, "4", -1, 5):
+        changed = copy.deepcopy(state)
+        changed["schemaVersion"] = value
+        cases[f"version-{value!r}"] = changed
+    # Cross-invalid rows pin first-error precedence, including insertion order.
+    for label, edits in {
+        "entry-before-metadata": [((), "repository", "relative"), (("entries", "hook:bundle"), "digest", "bad")],
+        "entry-before-roots": [((), "destinationRoots", None), (("entries", "hook:bundle"), "plugin", "!")],
+        "roots-before-slots": [((), "destinationRoots", {}), (("slots", "mcp:pstack:server"), "trustProof", "bad")],
+        "destination-before-slots": [(("entries", "hook:bundle"), "destination", "/hooks/wrong"), (("slots", "mcp:pstack:server"), "trustProof", "bad")],
+        "slots-before-metadata": [((), "repository", "relative"), (("slots", "mcp:pstack:server"), "trustProof", "bad")],
+        "digest-before-entry-keys": [(("entries", "hook:bundle"), "digest", "bad"), (("entries", "hook:bundle"), "unknown", True)],
+        "proof-before-slot-keys": [(("slots", "mcp:pstack:server"), "trustProof", "bad"), (("slots", "mcp:pstack:server"), "unknown", True)],
+        "metadata-order": [((), "repository", "relative"), ((), "marketplace", "!")],
+    }.items():
+        changed = copy.deepcopy(state)
+        for route, field, value in edits:
+            cursor = changed
+            for key in route:
+                cursor = cursor[key]
+            cursor[field] = value
+        cases[f"order-{label}"] = changed
+    for label, route in (("state", ()), ("entry", ("entries", "hook:bundle")),
+                         ("slot", ("slots", "mcp:pstack:server"))):
+        original = state
+        for key in route:
+            original = original[key]
+        for field in original:
+            for index, value in enumerate(("", "\x00", 0, 1.5, True, [], {})):
+                changed = copy.deepcopy(state)
+                cursor = changed
+                for key in route:
+                    cursor = cursor[key]
+                cursor[field] = value
+                cases[f"type-{label}-{field}-{index}"] = changed
+    for version in (2, 3, 4):
+        changed = copy.deepcopy(state)
+        changed["schemaVersion"] = version
+        changed["entries"] = copy.deepcopy(cases[f"v{version}-skills"])["entries"]
+        if version < 4:
+            changed.pop("slots")
+        if version == 2:
+            changed.pop("destinationRoots")
+        changed["repository"] = "//repo//./"
+        changed["destinationRoot"] = "/skills//./"
+        changed["entries"]["skill:example"]["destination"] = "/skills//./example/"
+        if version >= 3:
+            changed["destinationRoots"]["skills"] = "/skills//./"
+        cases[f"normalized-paths-v{version}"] = changed
+    for collection in ("entries", "slots", "destinationRoots"):
+        changed = copy.deepcopy(state)
+        if collection == "entries":
+            changed[collection] = {"hook:z": {"component": "invalid-first"}, "hook:a": {"component": "invalid-second"}}
+        elif collection == "slots":
+            changed[collection] = {"z": {"trustProof": "bad"}, "a": {}}
+        else:
+            changed[collection] = {"z": "relative", "a": "relative"}
+        cases[f"order-insertion-{collection}"] = changed
+    for version in (3, 4):
+        changed = copy.deepcopy(cases[f"v{version}-skills"])
+        changed["destinationRoots"]["agents"] = "/skills//./"
+        entry = copy.deepcopy(changed["entries"]["skill:example"])
+        entry.update(key="agent:example", component="agents", resourceKind="file-copy",
+                     digest="a" * 64, destination="/skills//./example/")
+        changed["entries"]["agent:example"] = entry
+        cases[f"repeated-normalized-destination-v{version}"] = changed
+    for label, field, value in (("quote", "component", "a'b"),
+                                ("double-quote", "component", 'a"b'),
+                                ("list", "component", [True, None, "x"]),
+                                ("map", "component", {"z": False, "a": 0})):
+        changed = copy.deepcopy(state)
+        changed["entries"]["hook:bundle"][field] = value
+        cases[f"repr-{label}"] = changed
+    for label, route in (("state", ()), ("entry", ("entries", "hook:bundle")),
+                         ("slot", ("slots", "mcp:pstack:server"))):
+        changed = copy.deepcopy(state)
+        cursor = changed
+        for key in route:
+            cursor = cursor[key]
+        del cursor["key" if route else "repository"]
+        del cursor["plugin" if route else "profile"]
+        cursor["unknown"] = True
+        cases[f"missing-before-unknown-{label}"] = changed
+    cases["top-array"] = []
+    cases["top-null"] = None
+    expected = {}
+    for label, value in cases.items():
+        path = inputs / f"{label}.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+    # Duplicate detection must operate before object decoding, at every depth.
+    for label, token in (("top", '"schemaVersion": 4'), ("entry", '"digest": "' + "a" * 64 + '"'),
+                         ("slot", '"slot": "server"')):
+        text = json.dumps(state).replace(token, token + ", " + token, 1)
+        (inputs / f"duplicate-{label}.json").write_text(text, encoding="utf-8")
+    for label, text in {
+        "quoted": "{\"a'b\": 1, \"a'b\": 2}",
+        "escaped": '{"a\\u0000": 1, "a\\u0000": 2}',
+        "nested-before-outer": '{"outer": 1, "outer": {"inner": 1, "inner": 2}}',
+        "earlier-duplicate-later-child": '{"outer": 1, "outer": 2, "later": {"inner": 1, "inner": 2}}',
+    }.items():
+        (inputs / f"duplicate-{label}.json").write_text(text, encoding="utf-8")
+    for path in sorted(inputs.iterdir()):
+        try:
+            loaded = load_state(path)
+            assert loaded is not None
+            expected[path.name] = {"accepted": True, "encoded": json.dumps(loaded.as_dict(), indent=2, ensure_ascii=False) + "\n"}
+        except ValueError as error:
+            expected[path.name] = {"accepted": False, "error_class": type(error).__name__, "error": str(error)}
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "state::parity_tests::differential_state_wire", "--", "--ignored", "--exact"],
+                 {"AW_STATE_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "results.json").read_text())
+    mismatches = {key: (value, actual.get(key)) for key, value in expected.items() if value != actual.get(key)}
+    assert not mismatches, f"state wire mismatches: {mismatches!r}"
+    print(f"state wire parity: {len(expected)} strict v2/v3/v4 cases match")
+
+
+def state_v4_fail_closed(base: Path) -> None:
+    side = Side("rust", base / "v4-fail-closed", "cursor")
+    seed_v2(side)
+    state = v2_state(side)
+    state.update(schemaVersion=4, slots={}, destinationRoots={"skills": str(side.destination)})
+    entries = state["entries"]
+    assert isinstance(entries, dict)
+    entry = entries["skill:example"]
+    assert isinstance(entry, dict)
+    entry.update(component="skills", resourceKind="directory-symlink", sourceRepository=str(side.root))
+    side.state_file.write_text(json.dumps(state), encoding="utf-8")
+    before = side.state_file.read_bytes()
+    target = os.readlink(side.destination / "example")
+    for action in ("plan", "status", "trust", "install", "uninstall"):
+        result = side.command(action)
+        assert result.returncode == 2 and "v4 executable lifecycle is not supported" in result.stderr, result
+        assert side.state_file.read_bytes() == before
+        assert os.readlink(side.destination / "example") == target
+    print("state v4 lifecycle: plan/status/install/uninstall fail closed without mutation")
+
+
+def trust_contract_rows(base: Path) -> None:
+    """D2 dependency-bound contract; activation planning remains gated on D6."""
+    if str(REPOSITORY) not in sys.path:
+        sys.path.insert(0, str(REPOSITORY))
+    from agent_workbench.model import (ArtifactKind, ComponentKind, Plugin, Provenance,
+                                      RepoPath, ResolvedPlugin, Source, SourceKind, PluginId, SourceId)
+    from agent_workbench.trust import grant_token
+    base.mkdir(parents=True)
+    cases = []
+    expected = []
+    for component in ("hooks", "mcp"):
+        for kind in ("local", "curated-copy", "git-submodule"):
+            for variant in ("fallback", "override", "missing", "unicode", "changed", "null-source",
+                            "source-id", "source-path", "source-upstream", "source-branch",
+                            "plugin-upstream", "plugin-notice", "plugin-id", "controls", "path-document",
+                            "path-repository", "path-fallback", "path-override", "target", "document", "repository"):
+                unicode = variant == "unicode"
+                source = dict(id="local", kind=kind, path="plugins",
+                              upstream="https://source/é😀" if unicode else "https://source",
+                              branch="main")
+                provenance = dict(upstream="https://original/é😀", notice="NOTICE") if unicode else None
+                plugin = dict(id="pstack", source="local", artifacts={})
+                if provenance:
+                    plugin["provenance"] = provenance
+                fallback = None if variant == "missing" else str(base / "artifact")
+                override = str(base / "alias") if variant == "override" else None
+                digest = ("b" if variant == "changed" else "a") * 64
+                document = str(base / ("é😀\t.json" if unicode else "document.json"))
+                case = dict(source=source, plugin=plugin, component=component,
+                            repository=str(base), document=document, digest=digest,
+                            fallback=fallback, override=override, target="cursor")
+                resolved = ResolvedPlugin(
+                    Plugin(PluginId("pstack"), SourceId("local"), {}, Provenance(provenance["upstream"], RepoPath(provenance["notice"])) if provenance else None),
+                    Source(SourceId("local"), SourceKind(kind), RepoPath(source["path"]), source["upstream"], source["branch"]),
+                    {ArtifactKind(component): Path(fallback)} if fallback else {})
+                # Independently perturb each bound identity, not only content.
+                from dataclasses import replace
+                if variant == "null-source":
+                    case["source"] = {key: value for key, value in source.items() if key not in {"upstream", "branch"}}
+                    resolved = replace(resolved, source=replace(resolved.source, upstream=None, branch=None))
+                elif variant.startswith("source-"):
+                    field = variant.removeprefix("source-")
+                    source[field] = "other" if field != "upstream" else "https://other"
+                    resolved = replace(resolved, source=replace(resolved.source, **{
+                        field: SourceId(source[field]) if field == "id" else (RepoPath(source[field]) if field == "path" else source[field])}))
+                elif variant == "plugin-id":
+                    plugin["id"] = "other"
+                    resolved = replace(resolved, plugin=replace(resolved.plugin, id=PluginId("other")))
+                elif variant == "controls":
+                    case["target"] = ''.join(chr(i) for i in range(32)) + '\x7f"\\/é😀'
+                elif variant.startswith("path-"):
+                    field = variant.removeprefix("path-")
+                    # Pass lexical strings through pathlib on the Python side only.
+                    case[field] = "//" + str(base).lstrip("/") + "//./nested///file/"
+                    fallback = str(case["fallback"]) if case["fallback"] is not None else None
+                    override = str(case["override"]) if case["override"] is not None else None
+                    resolved = replace(resolved, artifact_paths={ArtifactKind(component): Path(fallback)} if fallback else {})
+                elif variant.startswith("plugin-"):
+                    notice = "OTHER-NOTICE" if variant == "plugin-notice" else None
+                    plugin["provenance"] = dict(upstream="https://original", **({"notice": notice} if notice else {}))
+                    resolved = replace(resolved, plugin=replace(resolved.plugin, provenance=Provenance("https://original", RepoPath(notice) if notice else None)))
+                elif variant in ("target", "document", "repository"):
+                    case[variant] = "claude" if variant == "target" else str(base / (variant + "-other"))
+                cases.append(case)
+                expected.append(grant_token(resolved, ComponentKind(component), str(case["target"]), Path(str(case["document"])), digest, Path(str(case["repository"])), Path(override) if override else None))
+    (base / "tokens.json").write_text(json.dumps(cases))
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "trust::parity_tests::differential_trust", "--", "--ignored", "--exact"],
+                 {"AW_TRUST_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "results.json").read_text())
+    assert len(actual) == len(expected)
+    mismatches = [(i, cases[i], e, a) for i, (e, a) in enumerate(zip(expected, actual)) if e != a]
+    assert not mismatches, f"content-bound trust mismatches ({len(mismatches)}): {mismatches[:1]!r}"
+    print(f"trust token parity: {len(expected)} dependency-bound cases match (D6 CLI not covered)")
+
+
+def trust_proof_rows(base: Path) -> None:
+    from dataclasses import replace
+    from agent_workbench.model import ComponentKind as C, DirectoryCopy, FileCopy
+    from agent_workbench.state import StateEntry, SlotState
+    from agent_workbench.trust import authenticated, record_proof, reuse_proof
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    token = "aw-trust-v1:" + "a" * 64
+    variants = ("valid", "missing-proof", "tampered", "transplanted", "missing-key",
+                "public-key", "special-mode", "short-key", "long-key", "symlink-key",
+                "hardlink-key", "directory-key", "fifo-key", "symlink-parent", "absent-parent",
+                "changed-candidate", "already-proof", "wrong-proof",
+                "changed-token", "explicit", "unrelated-explicit", "shared-slot", "other-plugin",
+                "other-component", "bundle", "other-bundle", "no-prior", "changed-digest", "changed-with-proof")
+    for record_type in ("entry", "slot", "hook-slot"):
+        fields = (("key", "plugin", "source", "destination", "component", "resourceKind", "sourceRepository", "trust", "digest", "trustProof")
+                  if record_type == "entry" else
+                  ("key", "plugin", "component", "document", "slot", "digest", "trust", "trustProof"))
+        for variant in (*variants, *("field-" + field for field in fields)):
+            case = base / f"{record_type}-{variant}"
+            case.mkdir()
+            file = case / "state.json"
+            key = case / ".state.json.transaction-key"
+            key.write_bytes(bytes(range(32)))
+            key.chmod(0o600)
+            record = (StateEntry("hook:pstack", "pstack", "plugins/é😀", str(case / "hooks/pstack"), C.HOOKS,
+                                 DirectoryCopy("b" * 64), str(base), token)
+                      if record_type == "entry" else
+                      SlotState(f"{'hooks' if record_type == 'hook-slot' else 'mcp'}:pstack:é😀", "pstack",
+                                C.HOOKS if record_type == "hook-slot" else C.MCP, str(case / "doc"), "é😀", "b" * 64, token))
+            signed = replace(record, trust_proof=record_proof(record, file))
+            prior = signed
+            bundle = None
+            candidate = record
+            if variant == "missing-proof":
+                prior = record
+            elif variant == "tampered":
+                prior = replace(signed, digest="c" * 64) if record_type != "entry" else replace(signed, source="other")
+            elif variant == "transplanted":
+                file = case / "other.json"
+                (case / ".other.json.transaction-key").write_bytes(bytes(range(32)))
+                (case / ".other.json.transaction-key").chmod(0o600)
+            elif variant == "missing-key":
+                key.unlink()
+            elif variant in ("public-key", "special-mode"):
+                key.chmod(0o644 if variant == "public-key" else 0o4600)
+            elif variant in ("short-key", "long-key"):
+                key.write_bytes(b"x" * (31 if variant == "short-key" else 33))
+            elif variant == "symlink-key":
+                key.rename(case / "real-key")
+                key.symlink_to("real-key")
+            elif variant == "hardlink-key":
+                os.link(key, case / "another-key")
+            elif variant == "directory-key":
+                key.unlink()
+                key.mkdir(mode=0o600)
+            elif variant == "fifo-key":
+                key.unlink()
+                os.mkfifo(key, 0o600)
+            elif variant == "symlink-parent":
+                (case / "alias").symlink_to(case, target_is_directory=True)
+                file = case / "alias/state.json"
+            elif variant == "absent-parent":
+                file = case / "absent/state.json"
+            elif variant == "changed-candidate":
+                candidate = replace(record, document=str(case / "other-doc")) if record_type != "entry" else replace(record, source="other")
+            elif variant == "already-proof":
+                candidate = replace(record, trust_proof="aw-proof-v1:" + "d" * 64)
+            elif variant == "wrong-proof":
+                prior = replace(signed, trust_proof="aw-proof-v1:" + "d" * 64)
+            elif variant == "changed-token":
+                candidate = replace(record, trust="aw-trust-v1:" + "c" * 64)
+            if variant in ("explicit", "unrelated-explicit", "no-prior"):
+                prior = None
+            elif variant in ("changed-digest", "changed-with-proof"):
+                candidate = replace(record, resource=DirectoryCopy("c" * 64)) if record_type == "entry" else replace(record, digest="c" * 64)
+                if variant == "changed-with-proof":
+                    candidate = replace(candidate, trust_proof="aw-proof-v1:" + "d" * 64)
+            elif variant in ("shared-slot", "other-plugin", "other-component") and record_type != "entry":
+                if variant == "shared-slot":
+                    prior = replace(record, key=f"{record.component.value}:pstack:second", slot="second")
+                elif variant == "other-plugin":
+                    prior = replace(record, key=f"{record.component.value}:other:é😀", plugin="other")
+                else:
+                    component = C.MCP if record.component is C.HOOKS else C.HOOKS
+                    prior = replace(record, key=f"{component.value}:pstack:é😀", component=component)
+                prior = replace(prior, trust_proof=record_proof(prior, file))
+            elif variant in ("bundle", "other-bundle") and record_type != "entry":
+                plugin_id = "other" if variant == "other-bundle" else "pstack"
+                bundle = StateEntry(f"hook:{plugin_id}", plugin_id, "plugins/hooks", str(case / f"hooks/{plugin_id}"),
+                                    C.HOOKS, DirectoryCopy("b" * 64), str(base), token)
+                bundle = replace(bundle, trust_proof=record_proof(bundle, file))
+                prior = None
+            mutation = None
+            saved_prior = prior
+            if variant.startswith("field-"):
+                field = variant.removeprefix("field-")
+                attr = {"resourceKind": "resource", "sourceRepository": "source_repository", "trustProof": "trust_proof"}.get(field, field)
+                value = ((C.MCP if record.component is C.HOOKS else C.HOOKS) if field == "component" else
+                         FileCopy("b" * 64) if field == "resourceKind" else
+                         DirectoryCopy("c" * 64) if field == "digest" and record_type == "entry" else
+                         "c" * 64 if field == "digest" else
+                         "aw-trust-v1:" + "c" * 64 if field == "trust" else
+                         "aw-proof-v1:" + "c" * 64 if field == "trustProof" else
+                         "other" if field in ("plugin", "source", "slot", "key") else str(case / "other"))
+                if field == "digest" and record_type == "entry":
+                    attr = "resource"
+                prior = replace(signed, **{attr: value})
+                mutation = dict(field=field, value=prior.as_dict()[field])
+                assert not authenticated(prior, file), (record_type, field)
+            explicit = [candidate.trust] if variant == "explicit" else (["unrelated"] if variant == "unrelated-explicit" else [])
+            try:
+                proof = record_proof(candidate, file)
+            except (OSError, ValueError):
+                proof = None
+            recorded = prior is not None and prior.trust == candidate.trust and authenticated(prior, file)
+            if record_type != "entry":
+                recorded = recorded and prior is not None and prior.plugin == candidate.plugin and prior.component is candidate.component
+                recorded = recorded or (candidate.component is C.HOOKS and bundle is not None and
+                           bundle.key == f"hook:{candidate.plugin}" and bundle.trust == candidate.trust and authenticated(bundle, file))
+            granted = candidate.trust in explicit or recorded
+            expected.append(dict(proof=proof, authenticated=authenticated(prior, file),
+                                 reused=(reuse_proof(candidate, prior if isinstance(prior, StateEntry) else None, file).as_dict()
+                                         if isinstance(candidate, StateEntry) else
+                                         reuse_proof(candidate, prior if isinstance(prior, SlotState) else None, file).as_dict()), granted=granted))
+            # The driver loads actual state through the strict D1 decoder.
+            def state_for(item):
+                return dict(schemaVersion=4, repository=str(base), marketplace="market", profile="pstack", target="cursor",
+                            destinationRoot=str(case), destinationRoots={"skills": str(case), "hooks": str(case / "hooks"), "mcp": str(case)},
+                            entries=({item.key: item.as_dict()} if item is not None and record_type == "entry" else
+                                     ({bundle.key: bundle.as_dict()} if item is None and bundle is not None else {})),
+                            slots={item.key: item.as_dict()} if item is not None and record_type != "entry" else {})
+            for name, item in (("prior", saved_prior), ("candidate", candidate)):
+                (case / f"{name}.json").write_text(json.dumps(state_for(item)))
+            rows.append(dict(file=str(file), prior=str(case / "prior.json"), candidate=str(case / "candidate.json"),
+                             explicit=explicit, mutation=mutation))
+    (base / "proofs.json").write_text(json.dumps(rows))
+    before = trust_snapshot(base)
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "trust::parity_tests::differential_proofs", "--", "--ignored", "--exact"], {"AW_TRUST_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "proof-results.json").read_text())
+    mismatches = [(rows[i], e, a) for i, (e, a) in enumerate(zip(expected, actual)) if e != a]
+    assert not mismatches, f"persisted trust mismatches ({len(mismatches)}): {mismatches[:1]!r}"
+    assert len(actual) == len(expected)
+    assert trust_snapshot(base) == before, "trust verification mutated fixtures or created authority"
+    print(f"persisted trust parity: {len(expected)} authentication/reuse/key-safety cases match")
+
+
+def trust_inspection_rows(base: Path) -> None:
+    from agent_workbench.installation import _recover_lifecycle
+    from agent_workbench.model import ComponentKind as C
+    from agent_workbench.adapters.activation import ACTIVATION_POLICIES
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    for target in ("cursor", "claude"):
+        for pending in (False, True):
+            case = base / f"{target}-{pending}"
+            case.mkdir()
+            journal = case / ACTIVATION_POLICIES[target].journal_name
+            if pending:
+                journal.write_text('{}')  # Even an unauthenticated journal blocks inspection.
+            try:
+                _recover_lifecycle(case / "state.json", {C.HOOKS: case / "hooks"}, repair=False, target_id=target)
+                expected.append(None)
+            except ValueError as error:
+                expected.append(str(error))
+            rows.append(str(journal))
+    (base / "inspection.json").write_text(json.dumps(rows))
+    before = trust_snapshot(base)
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "trust::parity_tests::differential_inspection", "--", "--ignored", "--exact"], {"AW_TRUST_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "inspection-results.json").read_text())
+    assert actual == expected, f"read-only inspection mismatch: {actual!r} != {expected!r}"
+    assert trust_snapshot(base) == before, "inspection mutated journal/state or created authority"
+    print(f"trust inspection parity: {len(rows)} dependency-bound pending-journal cases match without writes")
+
+
+def trust_cli_fail_closed(base: Path) -> None:
+    side = Side("rust", base / "trust-cli-rejection", "cursor")
+    rejection_before = trust_snapshot(side.base)
+    token = "aw-trust-v1:" + "a" * 64
+    # "trust" is read-only planning on non-executable resources; grants are
+    # accepted, repeatable, and irrelevant to these resources in Python.
+    for target in TARGETS:
+        py = Side("python", base / f"trust-cli-{target}-python", target)
+        rs = Side("rust", base / f"trust-cli-{target}-rust", target)
+        for phase in ("clean", "installed", "conflict"):
+            if phase == "installed":
+                compare("trust seed", py, rs, py.command("install"), rs.command("install"))
+            elif phase == "conflict":
+                for side in (py, rs):
+                    (side.destination / "example").unlink()
+                    (side.destination / "example").mkdir()
+            for action in ("trust", "plan", "status", "install"):
+                before = [trust_snapshot(side.base) for side in (py, rs)]
+                args = ("--component", "skills", "--trust", token, "--trust", "unrelated")
+                compare(f"{phase} {target} {action} --trust", py, rs, py.command(action, *args), rs.command(action, *args))
+                if action != "install":
+                    assert [trust_snapshot(side.base) for side in (py, rs)] == before
+                def normalized_snapshot(side):
+                    return {name: (mode, uid, links, side.normalize(content.decode()) if isinstance(content, bytes) else side.normalize(content) if isinstance(content, str) else content)
+                            for name, (mode, uid, links, content) in trust_snapshot(side.base).items()}
+                assert normalized_snapshot(py) == normalized_snapshot(rs), (target, phase, action)
+    for target in ("cursor", "claude"):
+        py = Side("python", base / f"trust-pending-{target}-python", target)
+        rs = Side("rust", base / f"trust-pending-{target}-rust", target)
+        for side in (py, rs):
+            journal = side.base / "home" / f".{target}" / ".agent-workbench-transaction.json"
+            journal.parent.mkdir(parents=True)
+            journal.write_text('{}')
+        snapshots = [trust_snapshot(side.base) for side in (py, rs)]
+        compare("trust pending journal", py, rs, py.command("trust"), rs.command("trust"))
+        assert [trust_snapshot(side.base) for side in (py, rs)] == snapshots
+    side = Side("rust", base / "trust-cli-rejection", "cursor", initialize=False)
+    for action, args in (("trust", ("--component", "hooks")),
+                         ("trust", ("--component", "mcp", "--trust", token)),
+                         ("install", ("--component", "hooks")),
+                         ("install", ("--component", "hooks", "--trust", token)),
+                         ("install", ("--component", "mcp", "--trust", token))):
+        result = side.command(action, *args)
+        assert result.returncode == 2, result
+        assert trust_snapshot(side.base) == rejection_before, "unsupported activation mutated fixtures"
+    print("trust CLI: six-target skills exits/output/typed snapshots match; activation remains fail-closed")
+
+
+def trust_snapshot(base: Path):
+    """Never follow fixture symlinks or open FIFOs; ignore only driver outputs."""
+    result = {}
+    for parent, directories, files in os.walk(base, followlinks=False):
+        for name in directories + files:
+            path = Path(parent) / name
+            if path.name in {"proof-results.json", "inspection-results.json"}:
+                continue
+            info = path.lstat()
+            content = path.read_bytes() if stat.S_ISREG(info.st_mode) else (os.readlink(path) if stat.S_ISLNK(info.st_mode) else None)
+            result[str(path.relative_to(base))] = (info.st_mode, info.st_uid, info.st_nlink, content)
+    return result
+
+
+def bundle_rows(base: Path) -> None:
+    """D3 inert snapshot dependency; no activation lifecycle is exercised."""
+    if str(REPOSITORY) not in sys.path:
+        sys.path.insert(0, str(REPOSITORY))
+    from agent_workbench import bundles
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    for mask in (0o022, 0o077):
+        case = base / f"snapshot-{mask:o}"
+        case.mkdir()
+        source = case / "source"
+        source.mkdir()
+        source.chmod(0o751)
+        (source / "empty").mkdir()
+        (source / "empty").chmod(0o711)
+        for name, content, mode in (("run", b"#!/bin/sh\n\x00\xff", 0o751), ("é😀", b"raw\r\n", 0o640),
+                                    ("\ue000", b"unicode sorting", 0o644), ("\n\x7f", b"controls", 0o640)):
+            (source / name).write_bytes(content)
+            (source / name).chmod(mode)
+        tree = bundles.source_tree(source)
+        rows.append(dict(source=str(source), umask=mask))
+        expected.append(tree.digest)
+    (base / "rows.json").write_text(json.dumps(rows))
+    before = trust_snapshot(base)
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "bundle_parity_tests::differential_bundles", "--", "--ignored", "--exact"],
+                 {"AW_BUNDLE_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "results.json").read_text())
+    assert actual == expected, f"bundle snapshot mismatch: {actual!r} != {expected!r}"
+    after = trust_snapshot(base)
+    after.pop("results.json", None)
+    assert after == before, "snapshot mutated fixture"
+    print(f"bundle parity: {len(rows)} inert snapshot rows match (D5 lifecycle not covered)")
+
+
+def bundle_snapshot(base: Path):
+    """Typed lstat snapshot: presence, kind, exact mode/bytes, lexical links."""
+    result: dict[str, tuple[str, int, bytes | str | None]] = {".": ("directory", stat.S_IMODE(base.lstat().st_mode), None)}
+    for parent, directories, files in os.walk(base, followlinks=False):
+        for name in directories + files:
+            path = Path(parent) / name
+            info = path.lstat()
+            kind = ("file" if stat.S_ISREG(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode)
+                    else "symlink" if stat.S_ISLNK(info.st_mode) else "fifo" if stat.S_ISFIFO(info.st_mode) else "special")
+            data = path.read_bytes() if kind == "file" else os.readlink(path) if kind == "symlink" else None
+            result[str(path.relative_to(base))] = (kind, stat.S_IMODE(info.st_mode), data)
+    return result
+
+
+def bundle_publication_rows(base: Path) -> None:
+    from types import SimpleNamespace
+    from typing import cast
+    from agent_workbench import bundles
+    from agent_workbench.installation import (DestinationSnapshot, InstallOperation, InstallPlan, OperationKind,
+                                              _DestinationRoot, _validate_install_source)
+    from agent_workbench.model import ComponentKind, DirectoryCopy
+    base.mkdir(parents=True)
+    rows, expected, pairs = [], [], []
+    for mask in (0o022, 0o077):
+        for scenario in ("create", "keep", "conflict", "conflict-symlink", "cleanup", "mode-change", "byte-change",
+                         "source-change", "source-mode", "symlink", "fifo", "special-file", "special-directory", "ancestor-symlink",
+                         "detached", "during-read", "snapshot"):
+            roots = [base / f"{mask:o}-{scenario}-{side}" for side in ("python", "rust")]
+            for case in roots:
+                case.mkdir()
+                (case / "source").mkdir()
+                (case / "source").chmod(0o751)
+                (case / "source/nested").mkdir()
+                (case / "source/nested").chmod(0o755)
+                (case / "source/locked").mkdir()
+                (case / "source/locked").chmod(0o555)
+                (case / "source/nested/run").write_bytes(b"#!/bin/sh\n\x00\xff")
+                (case / "source/nested/run").chmod(0o751)
+                fixture_mask = os.umask(mask)
+                try:
+                    (case / "source/default-mode").write_bytes(b"umask-controlled source")
+                finally:
+                    os.umask(fixture_mask)
+                (case / "source/é😀").write_bytes(b"\x00raw\xff\r\n")
+                (case / "source/é😀").chmod(0o640)
+                (case / "destination").mkdir()
+                (case / "outside").mkdir()
+                (case / "outside/sentinel").write_bytes(b"untouched")
+            case = roots[0]
+            source, destination = case / "source", case / "destination"
+            planned = bundles.source_tree(source).digest
+            # These are deterministic plan/apply changes, never timing races.
+            for current in roots:
+                path = current / "source/nested/run"
+                if scenario == "source-change":
+                    path.write_bytes(b"changed after plan")
+                elif scenario == "source-mode":
+                    path.chmod(0o750)
+                elif scenario in ("symlink", "fifo"):
+                    path.unlink()
+                    if scenario == "symlink":
+                        path.symlink_to("../../outside/sentinel")
+                    else:
+                        os.mkfifo(path, 0o600)
+                elif scenario == "special-file":
+                    path.chmod(0o4751)
+                elif scenario == "special-directory":
+                    (current / "source/nested").chmod(0o1755)
+                elif scenario == "ancestor-symlink":
+                    (current / "alias").symlink_to("source", target_is_directory=True)
+                if scenario == "conflict":
+                    (current / "destination/bundle").mkdir()
+                    (current / "destination/bundle/foreign").write_bytes(b"foreign")
+                elif scenario == "conflict-symlink":
+                    (current / "destination/bundle").symlink_to("../outside", target_is_directory=True)
+            if scenario == "ancestor-symlink":
+                source = case / "alias/nested"
+            operation = InstallOperation(OperationKind.CREATE, "hook:pstack", destination / "bundle", source, "test",
+                                         component=ComponentKind.HOOKS, resource=DirectoryCopy(planned), expected_digest=planned)
+            info = destination.stat()
+            snapshot = DestinationSnapshot(destination, (info.st_dev, info.st_ino), destination, (info.st_dev, info.st_ino))
+            old_mask = os.umask(mask)
+            outcome = {"accepted": False, "same": None}
+            try:
+                with _DestinationRoot(snapshot, create=False) as root:
+                    if scenario == "during-read":
+                        from unittest.mock import patch
+                        original_fstat = os.fstat
+                        file_stats = 0
+                        target_inode = (source / "nested/run").stat().st_ino
+                        def changing_fstat(fd):
+                            nonlocal file_stats
+                            info = original_fstat(fd)
+                            if stat.S_ISREG(info.st_mode) and info.st_ino == target_inode:
+                                file_stats += 1
+                                if file_stats == 2:
+                                    (source / "nested/run").write_bytes(b"changed while reading")
+                                    return original_fstat(fd)
+                            return info
+                        with patch.object(bundles.os, "fstat", changing_fstat):
+                            tree = _validate_install_source(cast(InstallPlan, SimpleNamespace(repository=case)), operation)
+                    else:
+                        tree = _validate_install_source(cast(InstallPlan, SimpleNamespace(repository=case)), operation)
+                    if scenario == "snapshot":
+                        (source / "nested/run").write_bytes(b"changed after snapshot")
+                    if scenario == "detached":
+                        destination.rename(case / "detached")
+                        destination.symlink_to("outside", target_is_directory=True)
+                    root.create(operation, tree)
+                    outcome["accepted"] = True
+                    if scenario == "mode-change":
+                        (destination / "bundle/hooks/nested/run").chmod(0o750)
+                    elif scenario == "byte-change":
+                        (destination / "bundle/hooks/nested/run").write_bytes(b"foreign edit")
+                    outcome["same"] = root.same_resource(operation)
+                    if scenario == "keep":
+                        assert _validate_install_source(cast(InstallPlan, SimpleNamespace(repository=case)), operation) == tree
+                    if scenario in ("cleanup", "detached"):
+                        if scenario == "detached":
+                            try:
+                                root.verify()
+                            except FileExistsError:
+                                outcome["accepted"] = False
+                            else:
+                                raise AssertionError("detached root accepted")
+                        moved = root.quarantine(operation)
+                        root.discard(moved)
+            except (OSError, ValueError) as error:
+                if scenario == "during-read":
+                    assert str(error) == "bundle changed while reading", str(error)
+            finally:
+                os.umask(old_mask)
+            rejected = {"conflict", "conflict-symlink", "source-change", "source-mode", "symlink", "fifo",
+                        "special-file", "special-directory", "ancestor-symlink", "during-read", "detached"}
+            required = {"accepted": scenario not in rejected,
+                        "same": (True if scenario == "detached" else None) if scenario in rejected else scenario not in {"mode-change", "byte-change"}}
+            assert outcome == required, f"Python bundle oracle {scenario}: {outcome!r} != {required!r}"
+            rows.append(dict(base=str(roots[1]), scenario=scenario, umask=mask, digest=planned))
+            expected.append(outcome)
+            pairs.append(roots)
+    (base / "publication.json").write_text(json.dumps(rows))
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "bundle_parity_tests::differential_publication", "--", "--ignored", "--exact"],
+                 {"AW_BUNDLE_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "publication-results.json").read_text())
+    assert len(actual) == len(expected)
+    for row, py, rs, (python, rust) in zip(rows, expected, actual, pairs):
+        assert py == rs, f"bundle {row} outcome mismatch: {py!r} != {rs!r}"
+        assert bundle_snapshot(python) == bundle_snapshot(rust), f"bundle {row} typed filesystem mismatch: {bundle_snapshot(python)!r} != {bundle_snapshot(rust)!r}"
+    print(f"bundle publication parity: {len(rows)} source/destination/outside/detached byte/mode/type rows match (isolated D3, not D5)")
+
+
+def bundle_name_rows(base: Path) -> None:
+    """Synthetic inert rows cover POSIX surrogateescape even on APFS."""
+    from agent_workbench.bundles import Tree, TreeFile
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    for names in ((b"bad\xff",), (b"\x80", "\ue000".encode(), "😀".encode()),
+                  (b"\xc3\x28", b"\xed\xa0\x80", b"\xf0\x90\x80", b"a\n\x7f")):
+        rows.append([list(name) for name in names])
+        expected.append(Tree((("", 0o755),), tuple(TreeFile(os.fsdecode(name), 0o751, b"raw\x00\xff") for name in names)).digest)
+    (base / "names.json").write_text(json.dumps(rows))
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib",
+                  "bundle_parity_tests::differential_names", "--", "--ignored", "--exact"],
+                 {"AW_BUNDLE_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "name-results.json").read_text())
+    assert actual == expected, f"POSIX name digest mismatch: {actual!r} != {expected!r}"
+    print(f"bundle names: {len(rows)} Unicode/surrogateescape digest rows match")
+
+
+def shared_document_rows(base: Path) -> None:
+    """D4 pure planner oracle; exact bytes, operations and next slot state."""
+    from agent_workbench import shared_config as shared
+    from agent_workbench.model import ComponentKind as C
+    from agent_workbench.state import SlotState
+    from typing import Any
+    def slot(data):
+        return SlotState(data['key'], data['plugin'], C(data['component']), data['document'], data['slot'], data['digest'], data['trust'], data.get('trustProof'))
+    base.mkdir(parents=True)
+    value = {"command": "server", "args": [], "env": {"Z": "é", "A": "x"}}
+    state = SlotState("mcp:pstack:server", "pstack", C.MCP, "/config/mcp.json", "server", shared.digest(value), "aw-trust-v1:" + "a" * 64)
+    rows: list[dict[str, Any]] = [dict(component="mcp", target="cursor", path=state.document,
+                 content=' {"foreign": {"z": 1, "a": 2}, "mcpServers": {"unmanaged": {"command": "foreign"}}} \n',
+                 desired=[dict(state=state.as_dict(), value=value, granted=True)], owned={}, adopt=False)]
+    import copy
+    for phase in ('empty', 'matching', 'foreign', 'owned', 'drift', 'missing-owned', 'uninstall', 'uninstall-drift', 'duplicate', 'untrusted', 'replace'):
+        for adopt in (False, True):
+            row = copy.deepcopy(rows[0])
+            row['adopt'] = adopt
+            if phase == 'empty': row['content'] = None
+            else:
+                current = {} if phase == 'missing-owned' else {'server': value if phase not in ('foreign', 'drift', 'uninstall-drift') else {'command': 'foreign'}}
+                row['content'] = ' \t' + json.dumps({'z': {'b': 2, 'a': 1}, 'mcpServers': current, 'a': []}, ensure_ascii=False) + '\n\n'
+            if phase in ('owned', 'drift', 'missing-owned', 'uninstall', 'uninstall-drift', 'replace'):
+                row['owned'] = {state.key: state.as_dict()}
+            if phase.startswith('uninstall'): row['desired'] = []
+            if phase == 'duplicate': row['desired'] *= 2
+            if phase == 'untrusted': row['desired'][0]['granted'] = False
+            if phase == 'replace':
+                changed = {'args': ['changed'], 'command': 'new'}
+                row['desired'][0]['value'] = changed
+                row['desired'][0]['state']['digest'] = shared.digest(changed)
+            rows.append(row)
+    for target in ('cursor', 'claude'):
+        hook = {'command': 'sh /config/managed/pstack/hooks/run', 'timeout': 3}
+        if target == 'claude': hook = {'matcher': 'Bash', 'hooks': [{'type': 'command', **hook}, {'type': 'prompt', 'prompt': 'leave native'}]}
+        for phase in ('create', 'matching', 'owned', 'drift', 'missing', 'uninstall', 'ambiguous', 'duplicate', 'untrusted', 'replace'):
+            row = dict(component='hooks', target=target, path='/config/settings.json', desired=[], owned={}, adopt=False)
+            hs = SlotState('hooks:pstack:Stop:' + shared.digest(hook), 'pstack', C.HOOKS, row['path'], 'Stop:' + shared.digest(hook), shared.digest(hook), state.trust)
+            row['desired'] = [dict(state=hs.as_dict(), value=hook, granted=phase != 'untrusted')]
+            foreign = {'command': 'foreign'} if target == 'cursor' else {'hooks': [{'type': 'prompt', 'prompt': 'foreign'}]}
+            entries = [] if phase in ('create', 'missing') else [hook]
+            if phase == 'ambiguous': entries = [hook, hook]
+            if phase == 'drift': entries = [foreign]
+            row['content'] = ' ' + json.dumps({'z': {}, 'hooks': {'Stop': [foreign, *entries], 'Other': []}, 'a': 1}) + '\n'
+            if phase in ('owned', 'drift', 'missing', 'uninstall', 'replace'): row['owned'] = {hs.key: hs.as_dict()}
+            if phase == 'uninstall': row['desired'] = []
+            if phase == 'duplicate': row['desired'] *= 2
+            if phase == 'replace':
+                row['desired'][0]['value'] = foreign
+                row['desired'][0]['state']['digest'] = shared.digest(foreign)
+            rows.append(row)
+            adopted = copy.deepcopy(row)
+            adopted['adopt'] = True
+            rows.append(adopted)
+    for component, target, contents in (
+        ('mcp', 'cursor', ['{"mcpServers":null}', '{"mcpServers":{"a":[]}}']),
+        ('hooks', 'cursor', ['{"hooks":[]}', '{"hooks":{"Stop":[1]}}', '{"version":true}', '{"version":1.0}', '{"version":2}']),
+        ('hooks', 'claude', ['{"hooks":{"Stop":[{"command":"x"}]}}', '{"hooks":{"Stop":[{"hooks":null}]}}', '{"hooks":{"Stop":[{"hooks":[{}]}]}}', '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":""}]}]}}', '{"hooks":{"Stop":[{"hooks":[],"matcher":3}]}}', '{"hooks":{"Stop":[{}]}}', '{"hooks":{"":[]}}']),
+    ):
+        for content in contents:
+            row = copy.deepcopy(rows[0])
+            row.update(component=component, target=target, content=content)
+            rows.append(row)
+    for content in (None, ' {"z":1,"a":2} \n', '{"hooks":null}'):
+        row = copy.deepcopy(rows[0]); row.update(content=content, desired=[], owned={}); rows.append(row)
+    for number in (1e-7, 1e20, 1.0, -0.0, 1e-5, 1e16, 1e15, 1.2345678901234567, 10**40 + 1, -(10**40 + 1)):
+        for rewrite in (False, True):
+            row = copy.deepcopy(rows[0])
+            row['content'] = ' \t' + json.dumps({'z': number, 'mcpServers': {}, 'a': {'b': number, 'a': 'é'}}) + '\n\n'
+            if not rewrite:
+                row.update(desired=[], owned={})
+            rows.append(row)
+    # Trust rejection overrides collision, ambiguity, matching/adoption and keep.
+    for original in list(rows):
+        if original['desired']:
+            row = copy.deepcopy(original)
+            for item in row['desired']: item['granted'] = False
+            rows.append(row)
+    # Owned removals/conflicts sort by key, not source mapping insertion order.
+    for drift in (False, True):
+        row = copy.deepcopy(rows[0])
+        second = copy.deepcopy(state.as_dict())
+        second.update(key='mcp:pstack:aaa', slot='aaa')
+        row.update(owned={state.key: state.as_dict(), second['key']: second}, desired=[])
+        row['content'] = json.dumps({'mcpServers': {'server': value, 'aaa': {'command': 'drift'} if drift else value}, 'z': 1e-7})
+        rows.append(row)
+    for old_number, new_number in (
+        (True, 1), (1, 1.0), (0.0, -0.0),
+        (10**40, 10**40 + 1), (-(10**40), -(10**40 + 1)),
+        (2**200, float(2**200)), (float(2**200), 2**200),
+        (2**200 + 1, float(2**200)), (float(2**200), 2**200 + 1),
+        (-(2**200), -float(2**200)), (-(2**200 + 1), -float(2**200)),
+        (10**400, 10**400 + 1), (True, 10**400),
+    ):
+        row = copy.deepcopy(rows[0])
+        old_value = {'command': 'server', 'number': old_number}
+        new_value = {'command': 'server', 'number': new_number}
+        old_state = copy.deepcopy(state.as_dict()); old_state['digest'] = shared.digest(old_value)
+        new_state = copy.deepcopy(state.as_dict()); new_state['digest'] = shared.digest(new_value)
+        row.update(content=' ' + json.dumps({'mcpServers': {'server': old_value}}) + '\n',
+                   owned={state.key: old_state}, desired=[dict(state=new_state, value=new_value, granted=True)])
+        rows.append(row)
+    for encoding in ('utf-8-sig', 'utf-16', 'utf-16-be', 'utf-32', 'utf-32-be'):
+        for rewrite in (False, True):
+            row = copy.deepcopy(rows[0])
+            row['content_bytes'] = list(' {"z":1e-7,"mcpServers":{},"a":1e20}\n'.encode(encoding))
+            row['content'] = None
+            if not rewrite: row.update(desired=[], owned={})
+            rows.append(row)
+    expected = []
+    for row in rows:
+        desired = tuple(shared.DesiredSlot(slot(item["state"]), item["value"], Path("/source"), "b" * 64, item["granted"]) for item in row["desired"])
+        owned = {key: slot(item) for key, item in row["owned"].items()}
+        content = bytes(row['content_bytes']) if 'content_bytes' in row else row['content'].encode() if row['content'] is not None else None
+        before = shared.DocumentSnapshot(Path(row["path"]), content, None)
+        try:
+            plan, slots = shared.plan_document(before, C(row["component"]), desired, owned, row["adopt"], row["target"])
+        except ValueError as error:
+            expected.append({'error': str(error)})
+            continue
+        expected.append(dict(removed=list(plan.removed) if plan.removed is not None else None,
+                             after=list(plan.after) if plan.after is not None else None,
+                             operations=[item.as_dict() for item in plan.operations],
+                             operations_json=json.dumps([item.as_dict() for item in plan.operations], ensure_ascii=False, separators=(',', ':')),
+                             slots={key: item.as_dict() for key, item in slots.items()}))
+    import random, struct, math
+    rng = random.Random(42)
+    numbers = [1e-7, 1e20, 1.0, -0.0, 1e-5, 1e16, 1e15, 1.2345678901234567,
+               10**40 + 1, -(10**40 + 1), 2**200, 10**400, -(10**400)]
+    for _ in range(256):
+        number = struct.unpack('!d', rng.randbytes(8))[0]
+        if math.isfinite(number): numbers.append(number)
+    for number in numbers:
+        value = {'z': number, 'a': ['é', number]}
+        rows.append(dict(mode='encode', value=value))
+        expected.append(dict(encoded=shared.encode(value).decode(), digest=shared.digest(value)))
+    (base / "rows.json").write_text(json.dumps(rows))
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib", "shared_document_parity_tests::differential_shared_document", "--", "--ignored", "--exact"], {"AW_SHARED_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "results.json").read_text())
+    mismatches = [(i, e, a) for i, (e, a) in enumerate(zip(expected, actual)) if e != a]
+    assert len(actual) == len(expected)
+    assert not mismatches, f"shared document mismatches ({len(mismatches)}): {mismatches[:1]!r}"
+    print(f"shared document parity: {len(rows)} exact plan rows match (private D4 driver)")
+
+
+def shared_ownership_rows(base: Path) -> None:
+    from agent_workbench import shared_config as shared
+    from agent_workbench.state import SlotState
+    from agent_workbench.model import ComponentKind as C
+    from agent_workbench.installation import OperationKind as Op
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    item = SlotState('mcp:p:server', 'p', C.MCP, '/config/mcp.json', 'server', 'b' * 64, 'aw-trust-v1:' + 'a' * 64)
+    other = SlotState('mcp:p:other', 'p', C.MCP, '/config/mcp.json', 'other', 'c' * 64, item.trust)
+    for scenario in ('new', 'same', 'other-profile', 'remove', 'missing-authority', 'wrong-digest', 'retain-other', 'multiple-owned', 'multiple-conflicts', 'partial-rejection', 'float-version'):
+        records = {}
+        if scenario not in ('new', 'missing-authority'):
+            records[shared.slot_identity(item)] = {'owner': '/other.json' if scenario == 'other-profile' else '/owner.json', 'digest': 'd' * 64 if scenario == 'wrong-digest' else item.digest}
+        if scenario == 'retain-other': records[shared.slot_identity(other)] = {'owner': '/other.json', 'digest': other.digest}
+        content = None if scenario == 'new' else ' ' + json.dumps({'version': 1, 'slots': records}) + '\n'
+        previous = {item.key: item} if scenario in ('same', 'remove', 'missing-authority', 'wrong-digest') else {}
+        desired = {} if scenario == 'remove' else {item.key: item}
+        operation = shared.SlotOperation(Op.ADOPT, item.key, Path(item.document), item.component, item.slot, 'adopt matching unmanaged slot', None, item.trust)
+        operations = (operation,)
+        if scenario in ('multiple-owned', 'multiple-conflicts', 'partial-rejection'):
+            previous = {other.key: other, item.key: item} if scenario != 'partial-rejection' else {}
+            desired = {item.key: item, other.key: other}
+            records = {shared.slot_identity(other): {'owner': '/other.json' if scenario == 'partial-rejection' else '/owner.json', 'digest': other.digest},
+                       shared.slot_identity(item): {'owner': '/owner.json', 'digest': item.digest}}
+            if scenario == 'multiple-conflicts': records = {}
+            content = ' ' + json.dumps({'slots': records, 'version': 1}) + '\n'
+            operations += (shared.SlotOperation(Op.CONFLICT, other.key, Path(other.document), other.component, other.slot, 'trust required', 'TRUST_REQUIRED', other.trust, True),)
+        if scenario == 'float-version':
+            content = ' {"slots": {}, "version": 1.0}\n'
+        before = shared.DocumentSnapshot(Path('/ledger.json'), content.encode() if content else None, None)
+        document = shared.DocumentPlan(shared.DocumentSnapshot(Path(item.document), None, None), None, None, operations)
+        documents, ledger = shared.plan_ownership(Path('/owner.json'), (document,), previous, desired, before)
+        expected.append(dict(removed=list(ledger.removed) if ledger.removed is not None else None, after=list(ledger.after) if ledger.after is not None else None,
+                             operations=[o.as_dict() for o in documents[0].operations], conflicts=[o.as_dict() for o in shared.ownership_conflicts(before, Path('/owner.json'), previous)],
+                             operations_json=json.dumps([o.as_dict() for o in documents[0].operations], ensure_ascii=False, separators=(',', ':')),
+                             conflicts_json=json.dumps([o.as_dict() for o in shared.ownership_conflicts(before, Path('/owner.json'), previous)], ensure_ascii=False, separators=(',', ':'))))
+        rows.append(dict(mode='ownership', content=content, file='/owner.json', previous=[s.as_dict() for s in previous.values()], desired=[s.as_dict() for s in desired.values()], operations=[o.as_dict() for o in operations]))
+    (base / 'rows.json').write_text(json.dumps(rows))
+    result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'shared_document_parity_tests::differential_shared_document', '--', '--ignored', '--exact'], {'AW_SHARED_BASE': str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / 'results.json').read_text())
+    assert actual == expected, f'ownership mismatch: {[(i,e,a) for i,(e,a) in enumerate(zip(expected,actual)) if e != a][:1]!r}'
+    print(f'shared ownership parity: {len(rows)} multi-profile ledger rows match')
+
+
+def shared_snapshot_rows(base: Path) -> None:
+    from agent_workbench import shared_config as shared
+    from unittest.mock import patch
+    base.mkdir(parents=True)
+    def readonly_snapshot(case):
+        typed = bundle_snapshot(case)
+        metadata = {}
+        for name in typed:
+            info = (case / name).lstat()
+            metadata[name] = (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+                              info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        return typed, metadata
+    rows, expected, before_rust = [], [], {}
+    for scenario in ('regular', 'absent', 'missing-parent', 'symlink', 'parent-symlink', 'fifo', 'directory', 'during-read', 'ledger', 'ledger-bool', 'ledger-bad-key', 'ledger-bad-record', 'utf8-bom', 'utf16', 'utf16be', 'utf32', 'utf32be', 'invalid-utf8'):
+        case = base / scenario; case.mkdir()
+        path = case / 'document.json'
+        content = ' {"z": 1, "a":2}\n'
+        ledger = scenario.startswith('ledger')
+        if ledger:
+            path = case / '.agent-workbench-owners.json'
+            data = {'version': True if scenario == 'ledger-bool' else 1, 'slots': {}}
+            if scenario == 'ledger-bad-key': data['slots']['BAD'] = {'owner': '/owner', 'digest': 'a' * 64}
+            if scenario == 'ledger-bad-record': data['slots']['a' * 64] = {'owner': '/owner', 'digest': 'BAD'}
+            content = json.dumps(data)
+        if scenario == 'missing-parent': path = case / 'absent/document.json'
+        elif scenario == 'directory': path.mkdir()
+        elif scenario == 'fifo': os.mkfifo(path)
+        elif scenario != 'absent': path.write_text(content)
+        if scenario == 'symlink': path.rename(case / 'real'); path.symlink_to('real')
+        if scenario == 'parent-symlink':
+            (case / 'alias').symlink_to(case, target_is_directory=True); path = case / 'alias/document.json'
+        if scenario in ('utf8-bom', 'utf16', 'utf16be', 'utf32', 'utf32be', 'invalid-utf8'):
+            raw = {'utf8-bom': content.encode('utf-8-sig'), 'utf16': content.encode('utf-16'),
+                   'utf16be': b'\xfe\xff' + content.encode('utf-16-be'), 'utf32': content.encode('utf-32'),
+                   'utf32be': b'\x00\x00\xfe\xff' + content.encode('utf-32-be'), 'invalid-utf8': b'{"bad":"\xff"}'}[scenario]
+            path.write_bytes(raw)
+        rust_path = path
+        before_python = readonly_snapshot(case)
+        calls = 0
+        original = os.fstat
+        def fstat(fd):
+            nonlocal calls
+            info = original(fd)
+            if stat.S_ISREG(info.st_mode):
+                calls += 1
+                if calls == 2: path.write_text('{"changed":true}'); return original(fd)
+            return info
+        try:
+            with patch.object(shared.os, 'fstat', fstat if scenario == 'during-read' else original):
+                result = shared.ownership_snapshot(case) if ledger else shared.snapshot(path)
+            expected.append({'accepted': True, 'content': list(result.content) if result.content is not None else None, 'revision': result.revision is not None})
+        except (OSError, ValueError) as error:
+            expected.append({'accepted': False, 'error_class': 'ValueError' if isinstance(error, ValueError) else 'OSError'})
+        if scenario == 'during-read':
+            assert path.read_bytes() == b'{"changed":true}'
+            path.write_text(content)
+        else:
+            assert readonly_snapshot(case) == before_python, ('Python snapshot mutated fixture', scenario)
+        before_rust[scenario] = readonly_snapshot(case)
+        rows.append(dict(mode='snapshot', path=str(rust_path), scenario=scenario, ledger=ledger))
+    (base / 'rows.json').write_text(json.dumps(rows))
+    result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'shared_document_parity_tests::differential_shared_document', '--', '--ignored', '--exact'], {'AW_SHARED_BASE': str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / 'results.json').read_text())
+    assert actual == expected, f'snapshot mismatch: {[(r,e,a) for r,e,a in zip(rows,expected,actual) if e != a][:1]!r}'
+    for scenario, before in before_rust.items():
+        case = base / scenario
+        if scenario == 'during-read':
+            after = readonly_snapshot(case)
+            assert (case / 'document.json').read_bytes() == b'{"changed":true}'
+            # Only the explicitly injected adversarial write is permitted.
+            for index in (0, 1):
+                assert {k:v for k,v in before[index].items() if k != 'document.json'} == {k:v for k,v in after[index].items() if k != 'document.json'}
+        else:
+            assert readonly_snapshot(case) == before, ('Rust snapshot mutated fixture', scenario)
+    print(f'shared snapshot parity: {len(rows)} nofollow/read-drift/ledger validation rows match')
+
+
+def shared_reference_rows(base: Path) -> None:
+    from agent_workbench.shared_config import hook_document_references_bundle
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    bundle = Path('/config/managed/pstack')
+    commands = [str(bundle) + '/hooks/run', './managed/pstack/hooks/run', 'managed/pstack/hooks/run', 'config/managed/pstack/hooks/run', 'xmanaged/pstack/run', '/other/managed/pstack/run', str(bundle) + '-other/run', "sh '/config/managed/pstack/hooks/run'", 'sh /config/managed/p\\stack/hooks/run', 'echo "unterminated /config/managed/pstack/hooks/run', 'echo /config/managed/pstack; next', 'echo /config/managed/pstackX', 'nothing']
+    for command in commands:
+        for nested in (False, True):
+            entry = {'hooks': [{'type': 'command', 'command': command}]} if nested else {'command': command}
+            content = json.dumps({'hooks': {'Stop': [entry]}})
+            expected.append(hook_document_references_bundle(content.encode(), bundle))
+            rows.append(dict(mode='reference', content=content, bundle=str(bundle)))
+    for content in (None, '{"hooks":null}', '{"hooks":{"Stop":{}}}', '{"hooks":{"Stop":[1]}}', '{"hooks":{"Stop":[{"hooks":[1,{}, {"command":3}]}]}}', '{"hooks":{"Stop":[{"command":"/config/managed/pstack/run","hooks":false}]}}', '{"hooks":{"Stop":[{"command":"/config/managed/pstack/run"},1]}}', '{"hooks":{"Stop":[1,{"command":"/config/managed/pstack/run"}]}}'):
+        try:
+            expected.append(hook_document_references_bundle(content.encode() if content is not None else None, bundle))
+        except ValueError as error:
+            expected.append({'error': str(error)})
+        rows.append(dict(mode='reference', content=content, bundle=str(bundle)))
+    for encoding in ('utf-8-sig', 'utf-16', 'utf-16-be', 'utf-32', 'utf-32-be'):
+        content = json.dumps({'hooks': {'Stop': [{'command': '/config/managed/pstack/run'}]}}).encode(encoding)
+        expected.append(hook_document_references_bundle(content, bundle))
+        rows.append(dict(mode='reference', content=None, content_bytes=list(content), bundle=str(bundle)))
+    (base / 'rows.json').write_text(json.dumps(rows))
+    result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'shared_document_parity_tests::differential_shared_document', '--', '--ignored', '--exact'], {'AW_SHARED_BASE': str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / 'results.json').read_text())
+    assert actual == expected, f'bundle reference mismatch: {[(r,e,a) for r,e,a in zip(rows,expected,actual) if e != a][:1]!r}'
+    print(f'shared hook references: {len(rows)} native/foreign bundle removal guards match')
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -941,6 +2027,19 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
+            shared_document_rows(base / "shared-documents")
+            shared_ownership_rows(base / "shared-ownership")
+            shared_snapshot_rows(base / "shared-snapshots")
+            shared_reference_rows(base / "shared-references")
+            bundle_rows(base / "bundles")
+            bundle_name_rows(base / "bundle-names")
+            bundle_publication_rows(base / "bundle-publication")
+            trust_contract_rows(base / "trust")
+            trust_proof_rows(base / "trust-proofs")
+            trust_inspection_rows(base / "trust-inspection")
+            trust_cli_fail_closed(base)
+            state_wire_rows(base / "state-wire")
+            state_v4_fail_closed(base)
             for target in TARGETS:
                 default_destination(base, target)
                 explicit_destination_expansion(base, target)
