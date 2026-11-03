@@ -12,6 +12,9 @@ mod bundle_parity_tests;
 mod bundles;
 mod lifecycle;
 mod resource;
+mod shared_document;
+#[cfg(test)]
+mod shared_document_parity_tests;
 mod state;
 mod trust;
 

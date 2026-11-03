@@ -4,7 +4,7 @@ mod parity_tests;
 use super::resource::PathResource;
 use super::{ComponentKind, Result};
 mod decode;
-mod wire;
+pub(crate) mod wire;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,7 +40,7 @@ pub(super) struct State {
     pub slots: BTreeMap<String, Slot>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Slot {
     #[serde(skip_serializing_if = "Option::is_none")]

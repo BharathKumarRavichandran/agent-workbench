@@ -3,15 +3,61 @@ use super::*;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use std::fmt;
 
-#[derive(Debug)]
-pub(super) enum Wire {
+#[derive(Clone, Debug)]
+pub(crate) enum Wire {
     Object(Vec<(String, Wire)>),
     Array(Vec<Wire>),
     Scalar(Value),
 }
 
+impl Serialize for Wire {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Scalar(value) => value.serialize(serializer),
+            Self::Array(values) => values.serialize(serializer),
+            Self::Object(fields) => {
+                let mut map = serializer.serialize_map(Some(fields.len()))?;
+                for (key, value) in fields {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
 impl Wire {
-    pub(super) fn get(&self, key: &str) -> &Self {
+    pub(crate) fn value(&self) -> Value {
+        serde_json::to_value(self).expect("JSON wire")
+    }
+    pub(crate) fn set(&mut self, key: &str, value: Wire) {
+        if let Self::Object(fields) = self {
+            if let Some((_, prior)) = fields.iter_mut().find(|(name, _)| name == key) {
+                *prior = value;
+            } else {
+                fields.push((key.to_owned(), value));
+            }
+        }
+    }
+    pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Wire> {
+        if let Self::Object(fields) = self {
+            fields
+                .iter_mut()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value)
+        } else {
+            None
+        }
+    }
+    pub(crate) fn remove(&mut self, key: &str) {
+        if let Self::Object(fields) = self {
+            fields.retain(|(name, _)| name != key);
+        }
+    }
+    pub(crate) fn get(&self, key: &str) -> &Self {
         if let Self::Object(fields) = self {
             if let Some((_, value)) = fields.iter().find(|(name, _)| name == key) {
                 return value;
@@ -19,22 +65,22 @@ impl Wire {
         }
         &Self::Scalar(Value::Null)
     }
-    pub(super) fn has(&self, key: &str) -> bool {
+    pub(crate) fn has(&self, key: &str) -> bool {
         matches!(self, Self::Object(fields) if fields.iter().any(|(name, _)| name == key))
     }
-    pub(super) fn string(&self) -> Option<&str> {
+    pub(crate) fn string(&self) -> Option<&str> {
         match self {
             Self::Scalar(Value::String(value)) => Some(value),
             _ => None,
         }
     }
-    pub(super) fn object(&self, location: &str) -> Result<&[(String, Wire)]> {
+    pub(crate) fn object(&self, location: &str) -> Result<&[(String, Wire)]> {
         match self {
             Self::Object(fields) => Ok(fields),
             _ => Err(format!("{location} must be an object")),
         }
     }
-    pub(super) fn repr(&self) -> String {
+    pub(crate) fn repr(&self) -> String {
         match self {
             Self::Scalar(Value::Null) => "None".into(),
             Self::Scalar(Value::Bool(value)) => if *value { "True" } else { "False" }.into(),
@@ -56,7 +102,7 @@ impl Wire {
     }
 }
 
-pub(super) fn repr(value: &str) -> String {
+pub(crate) fn repr(value: &str) -> String {
     let quote = if value.contains('\'') && !value.contains('"') {
         '"'
     } else {
@@ -87,7 +133,38 @@ impl<'de> Deserialize<'de> for Wire {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        deserializer.deserialize_any(WireVisitor)
+        use serde::de::Error;
+        use serde::Deserializer;
+        // Decode real containers explicitly: arbitrary_precision's synthetic
+        // number map must never be mistaken for a source JSON object.
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let text = raw.get();
+        let mut decoder = serde_json::Deserializer::from_str(text);
+        match text.as_bytes()[0] {
+            b'{' => decoder
+                .deserialize_map(WireVisitor)
+                .map_err(D::Error::custom),
+            b'[' => decoder
+                .deserialize_seq(WireVisitor)
+                .map_err(D::Error::custom),
+            _ => {
+                let mut value: Value = serde_json::from_str(text).map_err(D::Error::custom)?;
+                if let Value::Number(number) = &value {
+                    if text.contains(['.', 'e', 'E']) {
+                        let float = number
+                            .as_f64()
+                            .ok_or_else(|| D::Error::custom("non-finite JSON number"))?;
+                        value = Value::Number(
+                            serde_json::Number::from_f64(float)
+                                .ok_or_else(|| D::Error::custom("non-finite JSON number"))?,
+                        );
+                    } else if text == "-0" {
+                        value = Value::Number(0.into());
+                    }
+                }
+                Ok(Wire::Scalar(value))
+            }
+        }
     }
 }
 struct WireVisitor;
@@ -142,7 +219,7 @@ impl<'de> Visitor<'de> for WireVisitor {
     }
 }
 
-pub(super) fn parse(text: &str) -> Result<Wire> {
+pub(crate) fn parse(text: &str) -> Result<Wire> {
     serde_json::from_str(text).map_err(|error| {
         let message = error.to_string();
         if message.starts_with("duplicate JSON key: ") {

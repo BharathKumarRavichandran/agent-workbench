@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+if str(REPOSITORY) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY))
 RUST = REPOSITORY / "rust" / "target" / "debug" / "agent-workbench-rs"
 TARGETS = ("agents", "claude", "codex", "cursor", "grok", "hermes")
 
@@ -1717,6 +1719,306 @@ def bundle_name_rows(base: Path) -> None:
     print(f"bundle names: {len(rows)} Unicode/surrogateescape digest rows match")
 
 
+def shared_document_rows(base: Path) -> None:
+    """D4 pure planner oracle; exact bytes, operations and next slot state."""
+    from agent_workbench import shared_config as shared
+    from agent_workbench.model import ComponentKind as C
+    from agent_workbench.state import SlotState
+    from typing import Any
+    def slot(data):
+        return SlotState(data['key'], data['plugin'], C(data['component']), data['document'], data['slot'], data['digest'], data['trust'], data.get('trustProof'))
+    base.mkdir(parents=True)
+    value = {"command": "server", "args": [], "env": {"Z": "é", "A": "x"}}
+    state = SlotState("mcp:pstack:server", "pstack", C.MCP, "/config/mcp.json", "server", shared.digest(value), "aw-trust-v1:" + "a" * 64)
+    rows: list[dict[str, Any]] = [dict(component="mcp", target="cursor", path=state.document,
+                 content=' {"foreign": {"z": 1, "a": 2}, "mcpServers": {"unmanaged": {"command": "foreign"}}} \n',
+                 desired=[dict(state=state.as_dict(), value=value, granted=True)], owned={}, adopt=False)]
+    import copy
+    for phase in ('empty', 'matching', 'foreign', 'owned', 'drift', 'missing-owned', 'uninstall', 'uninstall-drift', 'duplicate', 'untrusted', 'replace'):
+        for adopt in (False, True):
+            row = copy.deepcopy(rows[0])
+            row['adopt'] = adopt
+            if phase == 'empty': row['content'] = None
+            else:
+                current = {} if phase == 'missing-owned' else {'server': value if phase not in ('foreign', 'drift', 'uninstall-drift') else {'command': 'foreign'}}
+                row['content'] = ' \t' + json.dumps({'z': {'b': 2, 'a': 1}, 'mcpServers': current, 'a': []}, ensure_ascii=False) + '\n\n'
+            if phase in ('owned', 'drift', 'missing-owned', 'uninstall', 'uninstall-drift', 'replace'):
+                row['owned'] = {state.key: state.as_dict()}
+            if phase.startswith('uninstall'): row['desired'] = []
+            if phase == 'duplicate': row['desired'] *= 2
+            if phase == 'untrusted': row['desired'][0]['granted'] = False
+            if phase == 'replace':
+                changed = {'args': ['changed'], 'command': 'new'}
+                row['desired'][0]['value'] = changed
+                row['desired'][0]['state']['digest'] = shared.digest(changed)
+            rows.append(row)
+    for target in ('cursor', 'claude'):
+        hook = {'command': 'sh /config/managed/pstack/hooks/run', 'timeout': 3}
+        if target == 'claude': hook = {'matcher': 'Bash', 'hooks': [{'type': 'command', **hook}, {'type': 'prompt', 'prompt': 'leave native'}]}
+        for phase in ('create', 'matching', 'owned', 'drift', 'missing', 'uninstall', 'ambiguous', 'duplicate', 'untrusted', 'replace'):
+            row = dict(component='hooks', target=target, path='/config/settings.json', desired=[], owned={}, adopt=False)
+            hs = SlotState('hooks:pstack:Stop:' + shared.digest(hook), 'pstack', C.HOOKS, row['path'], 'Stop:' + shared.digest(hook), shared.digest(hook), state.trust)
+            row['desired'] = [dict(state=hs.as_dict(), value=hook, granted=phase != 'untrusted')]
+            foreign = {'command': 'foreign'} if target == 'cursor' else {'hooks': [{'type': 'prompt', 'prompt': 'foreign'}]}
+            entries = [] if phase in ('create', 'missing') else [hook]
+            if phase == 'ambiguous': entries = [hook, hook]
+            if phase == 'drift': entries = [foreign]
+            row['content'] = ' ' + json.dumps({'z': {}, 'hooks': {'Stop': [foreign, *entries], 'Other': []}, 'a': 1}) + '\n'
+            if phase in ('owned', 'drift', 'missing', 'uninstall', 'replace'): row['owned'] = {hs.key: hs.as_dict()}
+            if phase == 'uninstall': row['desired'] = []
+            if phase == 'duplicate': row['desired'] *= 2
+            if phase == 'replace':
+                row['desired'][0]['value'] = foreign
+                row['desired'][0]['state']['digest'] = shared.digest(foreign)
+            rows.append(row)
+            adopted = copy.deepcopy(row)
+            adopted['adopt'] = True
+            rows.append(adopted)
+    for component, target, contents in (
+        ('mcp', 'cursor', ['{"mcpServers":null}', '{"mcpServers":{"a":[]}}']),
+        ('hooks', 'cursor', ['{"hooks":[]}', '{"hooks":{"Stop":[1]}}', '{"version":true}', '{"version":1.0}', '{"version":2}']),
+        ('hooks', 'claude', ['{"hooks":{"Stop":[{"command":"x"}]}}', '{"hooks":{"Stop":[{"hooks":null}]}}', '{"hooks":{"Stop":[{"hooks":[{}]}]}}', '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":""}]}]}}', '{"hooks":{"Stop":[{"hooks":[],"matcher":3}]}}', '{"hooks":{"Stop":[{}]}}', '{"hooks":{"":[]}}']),
+    ):
+        for content in contents:
+            row = copy.deepcopy(rows[0])
+            row.update(component=component, target=target, content=content)
+            rows.append(row)
+    for content in (None, ' {"z":1,"a":2} \n', '{"hooks":null}'):
+        row = copy.deepcopy(rows[0]); row.update(content=content, desired=[], owned={}); rows.append(row)
+    for number in (1e-7, 1e20, 1.0, -0.0, 1e-5, 1e16, 1e15, 1.2345678901234567, 10**40 + 1, -(10**40 + 1)):
+        for rewrite in (False, True):
+            row = copy.deepcopy(rows[0])
+            row['content'] = ' \t' + json.dumps({'z': number, 'mcpServers': {}, 'a': {'b': number, 'a': 'é'}}) + '\n\n'
+            if not rewrite:
+                row.update(desired=[], owned={})
+            rows.append(row)
+    # Trust rejection overrides collision, ambiguity, matching/adoption and keep.
+    for original in list(rows):
+        if original['desired']:
+            row = copy.deepcopy(original)
+            for item in row['desired']: item['granted'] = False
+            rows.append(row)
+    # Owned removals/conflicts sort by key, not source mapping insertion order.
+    for drift in (False, True):
+        row = copy.deepcopy(rows[0])
+        second = copy.deepcopy(state.as_dict())
+        second.update(key='mcp:pstack:aaa', slot='aaa')
+        row.update(owned={state.key: state.as_dict(), second['key']: second}, desired=[])
+        row['content'] = json.dumps({'mcpServers': {'server': value, 'aaa': {'command': 'drift'} if drift else value}, 'z': 1e-7})
+        rows.append(row)
+    for old_number, new_number in (
+        (True, 1), (1, 1.0), (0.0, -0.0),
+        (10**40, 10**40 + 1), (-(10**40), -(10**40 + 1)),
+        (2**200, float(2**200)), (float(2**200), 2**200),
+        (2**200 + 1, float(2**200)), (float(2**200), 2**200 + 1),
+        (-(2**200), -float(2**200)), (-(2**200 + 1), -float(2**200)),
+        (10**400, 10**400 + 1), (True, 10**400),
+    ):
+        row = copy.deepcopy(rows[0])
+        old_value = {'command': 'server', 'number': old_number}
+        new_value = {'command': 'server', 'number': new_number}
+        old_state = copy.deepcopy(state.as_dict()); old_state['digest'] = shared.digest(old_value)
+        new_state = copy.deepcopy(state.as_dict()); new_state['digest'] = shared.digest(new_value)
+        row.update(content=' ' + json.dumps({'mcpServers': {'server': old_value}}) + '\n',
+                   owned={state.key: old_state}, desired=[dict(state=new_state, value=new_value, granted=True)])
+        rows.append(row)
+    for encoding in ('utf-8-sig', 'utf-16', 'utf-16-be', 'utf-32', 'utf-32-be'):
+        for rewrite in (False, True):
+            row = copy.deepcopy(rows[0])
+            row['content_bytes'] = list(' {"z":1e-7,"mcpServers":{},"a":1e20}\n'.encode(encoding))
+            row['content'] = None
+            if not rewrite: row.update(desired=[], owned={})
+            rows.append(row)
+    expected = []
+    for row in rows:
+        desired = tuple(shared.DesiredSlot(slot(item["state"]), item["value"], Path("/source"), "b" * 64, item["granted"]) for item in row["desired"])
+        owned = {key: slot(item) for key, item in row["owned"].items()}
+        content = bytes(row['content_bytes']) if 'content_bytes' in row else row['content'].encode() if row['content'] is not None else None
+        before = shared.DocumentSnapshot(Path(row["path"]), content, None)
+        try:
+            plan, slots = shared.plan_document(before, C(row["component"]), desired, owned, row["adopt"], row["target"])
+        except ValueError as error:
+            expected.append({'error': str(error)})
+            continue
+        expected.append(dict(removed=list(plan.removed) if plan.removed is not None else None,
+                             after=list(plan.after) if plan.after is not None else None,
+                             operations=[item.as_dict() for item in plan.operations],
+                             operations_json=json.dumps([item.as_dict() for item in plan.operations], ensure_ascii=False, separators=(',', ':')),
+                             slots={key: item.as_dict() for key, item in slots.items()}))
+    import random, struct, math
+    rng = random.Random(42)
+    numbers = [1e-7, 1e20, 1.0, -0.0, 1e-5, 1e16, 1e15, 1.2345678901234567,
+               10**40 + 1, -(10**40 + 1), 2**200, 10**400, -(10**400)]
+    for _ in range(256):
+        number = struct.unpack('!d', rng.randbytes(8))[0]
+        if math.isfinite(number): numbers.append(number)
+    for number in numbers:
+        value = {'z': number, 'a': ['é', number]}
+        rows.append(dict(mode='encode', value=value))
+        expected.append(dict(encoded=shared.encode(value).decode(), digest=shared.digest(value)))
+    (base / "rows.json").write_text(json.dumps(rows))
+    result = run(["cargo", "test", "--quiet", "--manifest-path", "rust/Cargo.toml", "--lib", "shared_document_parity_tests::differential_shared_document", "--", "--ignored", "--exact"], {"AW_SHARED_BASE": str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / "results.json").read_text())
+    mismatches = [(i, e, a) for i, (e, a) in enumerate(zip(expected, actual)) if e != a]
+    assert len(actual) == len(expected)
+    assert not mismatches, f"shared document mismatches ({len(mismatches)}): {mismatches[:1]!r}"
+    print(f"shared document parity: {len(rows)} exact plan rows match (private D4 driver)")
+
+
+def shared_ownership_rows(base: Path) -> None:
+    from agent_workbench import shared_config as shared
+    from agent_workbench.state import SlotState
+    from agent_workbench.model import ComponentKind as C
+    from agent_workbench.installation import OperationKind as Op
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    item = SlotState('mcp:p:server', 'p', C.MCP, '/config/mcp.json', 'server', 'b' * 64, 'aw-trust-v1:' + 'a' * 64)
+    other = SlotState('mcp:p:other', 'p', C.MCP, '/config/mcp.json', 'other', 'c' * 64, item.trust)
+    for scenario in ('new', 'same', 'other-profile', 'remove', 'missing-authority', 'wrong-digest', 'retain-other', 'multiple-owned', 'multiple-conflicts', 'partial-rejection', 'float-version'):
+        records = {}
+        if scenario not in ('new', 'missing-authority'):
+            records[shared.slot_identity(item)] = {'owner': '/other.json' if scenario == 'other-profile' else '/owner.json', 'digest': 'd' * 64 if scenario == 'wrong-digest' else item.digest}
+        if scenario == 'retain-other': records[shared.slot_identity(other)] = {'owner': '/other.json', 'digest': other.digest}
+        content = None if scenario == 'new' else ' ' + json.dumps({'version': 1, 'slots': records}) + '\n'
+        previous = {item.key: item} if scenario in ('same', 'remove', 'missing-authority', 'wrong-digest') else {}
+        desired = {} if scenario == 'remove' else {item.key: item}
+        operation = shared.SlotOperation(Op.ADOPT, item.key, Path(item.document), item.component, item.slot, 'adopt matching unmanaged slot', None, item.trust)
+        operations = (operation,)
+        if scenario in ('multiple-owned', 'multiple-conflicts', 'partial-rejection'):
+            previous = {other.key: other, item.key: item} if scenario != 'partial-rejection' else {}
+            desired = {item.key: item, other.key: other}
+            records = {shared.slot_identity(other): {'owner': '/other.json' if scenario == 'partial-rejection' else '/owner.json', 'digest': other.digest},
+                       shared.slot_identity(item): {'owner': '/owner.json', 'digest': item.digest}}
+            if scenario == 'multiple-conflicts': records = {}
+            content = ' ' + json.dumps({'slots': records, 'version': 1}) + '\n'
+            operations += (shared.SlotOperation(Op.CONFLICT, other.key, Path(other.document), other.component, other.slot, 'trust required', 'TRUST_REQUIRED', other.trust, True),)
+        if scenario == 'float-version':
+            content = ' {"slots": {}, "version": 1.0}\n'
+        before = shared.DocumentSnapshot(Path('/ledger.json'), content.encode() if content else None, None)
+        document = shared.DocumentPlan(shared.DocumentSnapshot(Path(item.document), None, None), None, None, operations)
+        documents, ledger = shared.plan_ownership(Path('/owner.json'), (document,), previous, desired, before)
+        expected.append(dict(removed=list(ledger.removed) if ledger.removed is not None else None, after=list(ledger.after) if ledger.after is not None else None,
+                             operations=[o.as_dict() for o in documents[0].operations], conflicts=[o.as_dict() for o in shared.ownership_conflicts(before, Path('/owner.json'), previous)],
+                             operations_json=json.dumps([o.as_dict() for o in documents[0].operations], ensure_ascii=False, separators=(',', ':')),
+                             conflicts_json=json.dumps([o.as_dict() for o in shared.ownership_conflicts(before, Path('/owner.json'), previous)], ensure_ascii=False, separators=(',', ':'))))
+        rows.append(dict(mode='ownership', content=content, file='/owner.json', previous=[s.as_dict() for s in previous.values()], desired=[s.as_dict() for s in desired.values()], operations=[o.as_dict() for o in operations]))
+    (base / 'rows.json').write_text(json.dumps(rows))
+    result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'shared_document_parity_tests::differential_shared_document', '--', '--ignored', '--exact'], {'AW_SHARED_BASE': str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / 'results.json').read_text())
+    assert actual == expected, f'ownership mismatch: {[(i,e,a) for i,(e,a) in enumerate(zip(expected,actual)) if e != a][:1]!r}'
+    print(f'shared ownership parity: {len(rows)} multi-profile ledger rows match')
+
+
+def shared_snapshot_rows(base: Path) -> None:
+    from agent_workbench import shared_config as shared
+    from unittest.mock import patch
+    base.mkdir(parents=True)
+    def readonly_snapshot(case):
+        typed = bundle_snapshot(case)
+        metadata = {}
+        for name in typed:
+            info = (case / name).lstat()
+            metadata[name] = (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+                              info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        return typed, metadata
+    rows, expected, before_rust = [], [], {}
+    for scenario in ('regular', 'absent', 'missing-parent', 'symlink', 'parent-symlink', 'fifo', 'directory', 'during-read', 'ledger', 'ledger-bool', 'ledger-bad-key', 'ledger-bad-record', 'utf8-bom', 'utf16', 'utf16be', 'utf32', 'utf32be', 'invalid-utf8'):
+        case = base / scenario; case.mkdir()
+        path = case / 'document.json'
+        content = ' {"z": 1, "a":2}\n'
+        ledger = scenario.startswith('ledger')
+        if ledger:
+            path = case / '.agent-workbench-owners.json'
+            data = {'version': True if scenario == 'ledger-bool' else 1, 'slots': {}}
+            if scenario == 'ledger-bad-key': data['slots']['BAD'] = {'owner': '/owner', 'digest': 'a' * 64}
+            if scenario == 'ledger-bad-record': data['slots']['a' * 64] = {'owner': '/owner', 'digest': 'BAD'}
+            content = json.dumps(data)
+        if scenario == 'missing-parent': path = case / 'absent/document.json'
+        elif scenario == 'directory': path.mkdir()
+        elif scenario == 'fifo': os.mkfifo(path)
+        elif scenario != 'absent': path.write_text(content)
+        if scenario == 'symlink': path.rename(case / 'real'); path.symlink_to('real')
+        if scenario == 'parent-symlink':
+            (case / 'alias').symlink_to(case, target_is_directory=True); path = case / 'alias/document.json'
+        if scenario in ('utf8-bom', 'utf16', 'utf16be', 'utf32', 'utf32be', 'invalid-utf8'):
+            raw = {'utf8-bom': content.encode('utf-8-sig'), 'utf16': content.encode('utf-16'),
+                   'utf16be': b'\xfe\xff' + content.encode('utf-16-be'), 'utf32': content.encode('utf-32'),
+                   'utf32be': b'\x00\x00\xfe\xff' + content.encode('utf-32-be'), 'invalid-utf8': b'{"bad":"\xff"}'}[scenario]
+            path.write_bytes(raw)
+        rust_path = path
+        before_python = readonly_snapshot(case)
+        calls = 0
+        original = os.fstat
+        def fstat(fd):
+            nonlocal calls
+            info = original(fd)
+            if stat.S_ISREG(info.st_mode):
+                calls += 1
+                if calls == 2: path.write_text('{"changed":true}'); return original(fd)
+            return info
+        try:
+            with patch.object(shared.os, 'fstat', fstat if scenario == 'during-read' else original):
+                result = shared.ownership_snapshot(case) if ledger else shared.snapshot(path)
+            expected.append({'accepted': True, 'content': list(result.content) if result.content is not None else None, 'revision': result.revision is not None})
+        except (OSError, ValueError) as error:
+            expected.append({'accepted': False, 'error_class': 'ValueError' if isinstance(error, ValueError) else 'OSError'})
+        if scenario == 'during-read':
+            assert path.read_bytes() == b'{"changed":true}'
+            path.write_text(content)
+        else:
+            assert readonly_snapshot(case) == before_python, ('Python snapshot mutated fixture', scenario)
+        before_rust[scenario] = readonly_snapshot(case)
+        rows.append(dict(mode='snapshot', path=str(rust_path), scenario=scenario, ledger=ledger))
+    (base / 'rows.json').write_text(json.dumps(rows))
+    result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'shared_document_parity_tests::differential_shared_document', '--', '--ignored', '--exact'], {'AW_SHARED_BASE': str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / 'results.json').read_text())
+    assert actual == expected, f'snapshot mismatch: {[(r,e,a) for r,e,a in zip(rows,expected,actual) if e != a][:1]!r}'
+    for scenario, before in before_rust.items():
+        case = base / scenario
+        if scenario == 'during-read':
+            after = readonly_snapshot(case)
+            assert (case / 'document.json').read_bytes() == b'{"changed":true}'
+            # Only the explicitly injected adversarial write is permitted.
+            for index in (0, 1):
+                assert {k:v for k,v in before[index].items() if k != 'document.json'} == {k:v for k,v in after[index].items() if k != 'document.json'}
+        else:
+            assert readonly_snapshot(case) == before, ('Rust snapshot mutated fixture', scenario)
+    print(f'shared snapshot parity: {len(rows)} nofollow/read-drift/ledger validation rows match')
+
+
+def shared_reference_rows(base: Path) -> None:
+    from agent_workbench.shared_config import hook_document_references_bundle
+    base.mkdir(parents=True)
+    rows, expected = [], []
+    bundle = Path('/config/managed/pstack')
+    commands = [str(bundle) + '/hooks/run', './managed/pstack/hooks/run', 'managed/pstack/hooks/run', 'config/managed/pstack/hooks/run', 'xmanaged/pstack/run', '/other/managed/pstack/run', str(bundle) + '-other/run', "sh '/config/managed/pstack/hooks/run'", 'sh /config/managed/p\\stack/hooks/run', 'echo "unterminated /config/managed/pstack/hooks/run', 'echo /config/managed/pstack; next', 'echo /config/managed/pstackX', 'nothing']
+    for command in commands:
+        for nested in (False, True):
+            entry = {'hooks': [{'type': 'command', 'command': command}]} if nested else {'command': command}
+            content = json.dumps({'hooks': {'Stop': [entry]}})
+            expected.append(hook_document_references_bundle(content.encode(), bundle))
+            rows.append(dict(mode='reference', content=content, bundle=str(bundle)))
+    for content in (None, '{"hooks":null}', '{"hooks":{"Stop":{}}}', '{"hooks":{"Stop":[1]}}', '{"hooks":{"Stop":[{"hooks":[1,{}, {"command":3}]}]}}', '{"hooks":{"Stop":[{"command":"/config/managed/pstack/run","hooks":false}]}}', '{"hooks":{"Stop":[{"command":"/config/managed/pstack/run"},1]}}', '{"hooks":{"Stop":[1,{"command":"/config/managed/pstack/run"}]}}'):
+        try:
+            expected.append(hook_document_references_bundle(content.encode() if content is not None else None, bundle))
+        except ValueError as error:
+            expected.append({'error': str(error)})
+        rows.append(dict(mode='reference', content=content, bundle=str(bundle)))
+    for encoding in ('utf-8-sig', 'utf-16', 'utf-16-be', 'utf-32', 'utf-32-be'):
+        content = json.dumps({'hooks': {'Stop': [{'command': '/config/managed/pstack/run'}]}}).encode(encoding)
+        expected.append(hook_document_references_bundle(content, bundle))
+        rows.append(dict(mode='reference', content=None, content_bytes=list(content), bundle=str(bundle)))
+    (base / 'rows.json').write_text(json.dumps(rows))
+    result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'shared_document_parity_tests::differential_shared_document', '--', '--ignored', '--exact'], {'AW_SHARED_BASE': str(base)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / 'results.json').read_text())
+    assert actual == expected, f'bundle reference mismatch: {[(r,e,a) for r,e,a in zip(rows,expected,actual) if e != a][:1]!r}'
+    print(f'shared hook references: {len(rows)} native/foreign bundle removal guards match')
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -1725,6 +2027,10 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
+            shared_document_rows(base / "shared-documents")
+            shared_ownership_rows(base / "shared-ownership")
+            shared_snapshot_rows(base / "shared-snapshots")
+            shared_reference_rows(base / "shared-references")
             bundle_rows(base / "bundles")
             bundle_name_rows(base / "bundle-names")
             bundle_publication_rows(base / "bundle-publication")

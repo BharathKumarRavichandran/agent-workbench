@@ -281,7 +281,7 @@ fn path_text(path: &Path) -> Result<String> {
 /// Python's compact ensure_ascii=True JSON, including surrogate pairs. Value
 /// object maps are sorted (serde_json without preserve_order), while arrays keep
 /// order. Tokens use arrays; persisted proofs use sorted-key objects.
-fn ascii_json(value: &serde_json::Value) -> Result<Vec<u8>> {
+pub(crate) fn ascii_json(value: &serde_json::Value) -> Result<Vec<u8>> {
     use std::fmt::Write;
     let compact = serde_json::to_string(value).map_err(|e| e.to_string())?;
     let mut output = String::new();
