@@ -3,7 +3,8 @@
 Python production is the frozen executable specification, apart from the
 explicitly authorized [E1/E2](PARITY_EXCEPTIONS.md) transaction safety exceptions.
 D5 is complete; its primitive/plan-fed evidence is retained, not substituted for
-public activation planning. Claude activation remains fail-closed until D7.
+public activation planning. D7 adds a closed Claude-native policy after D6's
+exact-SHA Ubuntu success; unsupported activation targets remain fail-closed.
 
 ## Implementation boundary
 
@@ -69,6 +70,49 @@ parity, and 188 Python tests. The independent review reproduced validation-order
 drift; the parent reproduced it, added eight paired combined-defect rows and
 corrected inventory-before-state while retaining recovery precedence. Focused
 independent correction recheck passed, including late compiler/payload validation
-and recovery-precedence probes. Exact-commit Ubuntu verification is
-required after the D6 commit and before beginning D7. Local results do not imply
-Ubuntu success. D8's full execution/network tripwires remain a separate unit.
+and recovery-precedence probes. D6 committed as
+`7075849d3a23c080f1874646469ee72b806c3900`; all Ubuntu jobs passed for that exact
+SHA in [run 41791075323](https://github.com/BharathKumarRavichandran/agent-workbench/actions/runs/41791075323)
+before D7 began. D8 remains a separately gated unit.
+
+# D7 — Claude-native trusted activation
+
+A closed `Policy::{Cursor, Claude}` selects native representations, hook document
+names and plugin variables. Claude uses nested matcher groups/handlers in
+`.claude/settings.json`; only command handlers are compiled, while prompts,
+unknown native handler types and foreign fields are preserved as data. Cursor
+hook JSON is never translated into Claude settings. Claude project MCP uses
+`<project>/.mcp.json`; user MCP is rejected with `PROJECT_ROOT_REQUIRED`.
+Both the project directory and `.claude` config directory are bound in root
+snapshots and authenticated recovery, preserving multi-parent authority.
+
+The shared public fixture/replay harness now runs both closed target policies at
+identical lexical paths, keeping native JSON and target-specific layout in the
+fixture boundary rather than normalizing output. Cursor's full D6 matrix remains
+mandatory. The previous dependency-era v4 rejection is replaced by paired public
+v4 plan/status/trust/install/uninstall coverage for Cursor and Claude; unsupported
+Codex activation still fails closed.
+
+| Claude acceptance edge | Evidence invoked by the full parity gate |
+| --- | --- |
+| Mixed/hooks-only/project-MCP-only/user-hooks/shell-command lifecycle | `check_claude_activation_parity.py`: 45 paired public rows |
+| Same selection, trust, byte/mode/state, preservation, ownership handoff, narrowing, overrides, malformed input and uninstall contracts as Cursor | `check_claude_activation_edges.py`: target-native fixtures through shared matrix |
+| Independent public plans interrupted at durable journal / before-state boundaries, install and uninstall | `check_claude_activation_recovery.py`: 4 paired scenarios; authenticated intent, read-only trust refusal, public status recovery, retry/uninstall |
+| Native prompt-only/empty groups/unknown handler preservation, multiple event/group order, malformed handlers/matchers, wrong version/mixed shape, missing local script, user-MCP rejection and profile-selected components/root | `check_claude_native_contract.py`: 63 paired public rows |
+| Multiple source-order hook events/groups and reverse-name MCP servers retain ownership-ledger insertion order | Shared `multi-event-order` full lifecycle regression for **both** Cursor and Claude |
+| Existing D5 boundaries, E1/E2 and six-target skills/copied paths | Unchanged full gate |
+
+Initial D7 RED was real public parser rejection versus Python's untrusted native
+operations. The first native mixed tracer reached nine-row GREEN before matrix
+expansion. Multiple groups then exposed a real ledger-byte mismatch despite
+identical public output: sorted next-state slot storage had been reused for
+ordered ledger planning. Ledger desired order now follows source document/slot
+order separately from sorted state serialization. A Claude-specific missing
+bare-script reference also reached RED and was fixed without widening Cursor's
+validation. Both are permanent public differential regressions.
+
+All five mandatory D7 local macOS gates pass, including the full parity matrix
+and 188 Python tests. Focused independent D7 review passed with no blocking
+security or logic findings, including additional paired native-command,
+cross-target-grant and recorded-document probes. Exact-SHA Ubuntu verification
+is mandatory before D8 begins.

@@ -142,18 +142,19 @@ pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {
     }
 
     let authorized = authorized_roots(cli.target, &destination, project_root.as_deref())?;
-    if cli.target == SkillsTarget::Cursor && cli.action != Action::Trust {
-        crate::activation::recover(&state_file, &authorized)?;
+    let policy = crate::activation::Policy::for_target(cli.target);
+    if let Some(policy) = policy.filter(|_| cli.action != Action::Trust) {
+        crate::activation::recover(&state_file, &authorized, policy)?;
     }
-    if cli.target == SkillsTarget::Cursor && cli.action != Action::Uninstall {
-        crate::activation::inspect_requested(&repository, &catalog, &profile, &requested)?;
+    if let Some(policy) = policy.filter(|_| cli.action != Action::Uninstall) {
+        crate::activation::inspect_requested(policy, &repository, &catalog, &profile, &requested)?;
     }
     let previous = state::load(&state_file)?;
-    // Non-Cursor executable lifecycle remains closed until D7.
+    // Executable lifecycle remains closed for targets without a native policy.
     // Do not classify, remove, downgrade, or silently drop recorded slots/evidence.
     if previous
         .as_ref()
-        .is_some_and(|state| state.schema_version == 4 && cli.target != SkillsTarget::Cursor)
+        .is_some_and(|state| state.schema_version == 4 && policy.is_none())
     {
         return Err("v4 executable lifecycle is not supported by Rust yet".into());
     }
@@ -171,16 +172,17 @@ pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {
             return Err("recorded destination root differs from requested destination; pass the same explicit --destination used for installation".into());
         }
         authorize_recorded_roots(previous, &authorized)?;
-        if cli.target == SkillsTarget::Cursor {
+        if let Some(policy) = policy {
             for slot in previous.slots.values() {
                 let expected = match slot.component.as_str() {
-                    "hooks" => authorized
-                        .get(&ComponentKind::Hooks)
-                        .and_then(|p| p.parent())
-                        .map(|p| p.join("hooks.json")),
-                    "mcp" => authorized
-                        .get(&ComponentKind::Mcp)
-                        .map(|p| p.join("mcp.json")),
+                    "hooks" => Some(crate::activation::document(
+                        &authorized,
+                        ComponentKind::Hooks,
+                        policy,
+                    )),
+                    "mcp" if authorized.contains_key(&ComponentKind::Mcp) => Some(
+                        crate::activation::document(&authorized, ComponentKind::Mcp, policy),
+                    ),
                     _ => None,
                 };
                 if expected.as_deref() != Some(Path::new(&slot.document)) {
@@ -271,8 +273,9 @@ pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {
             &authorized,
         )?
     };
-    if cli.target == SkillsTarget::Cursor && cli.action != Action::Uninstall {
+    if let Some(policy) = policy.filter(|_| cli.action != Action::Uninstall) {
         projection_conflicts.extend(crate::activation::hook_entries(
+            policy,
             &repository,
             &catalog,
             &profile,
@@ -358,8 +361,20 @@ pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {
         entries: next_entries,
         destination_roots,
     };
+    let document_parents: Vec<_> = if cli.target == SkillsTarget::Claude {
+        authorized
+            .get(&ComponentKind::Hooks)
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain(project_root.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let roots = authorized
         .values()
+        .chain(document_parents.iter())
         .map(|path| Ok((path.clone(), snapshot_root(path)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
     Ok(Plan {
@@ -668,6 +683,8 @@ fn authorized_roots(
     );
     if target == SkillsTarget::Cursor {
         roots.insert(ComponentKind::Mcp, home_base);
+    } else if let Some(project) = project_root {
+        roots.insert(ComponentKind::Mcp, project.to_path_buf());
     }
     Ok(roots)
 }

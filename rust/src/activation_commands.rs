@@ -1,4 +1,4 @@
-//! Inert POSIX shell token inspection and Cursor managed-reference compilation.
+//! Inert POSIX shell token inspection and native managed-reference compilation.
 use super::*;
 
 pub(super) fn split(text: &str) -> Result<Vec<String>> {
@@ -87,12 +87,21 @@ fn word(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
-pub(super) fn compile(text: &str, files: &[String], destination: &Path) -> Result<String> {
-    const VARIABLE: &str = "${CURSOR_PLUGIN_ROOT}";
+pub(super) fn compile(
+    text: &str,
+    files: &[String],
+    destination: &Path,
+    policy: Policy,
+) -> Result<String> {
+    let variable = policy.variable();
     if text.is_empty() {
         return Err("hook command must be a non-empty string".into());
     }
-    if text.contains("${CLAUDE_PLUGIN_ROOT}") {
+    if text.contains(if policy.cursor() {
+        "${CLAUDE_PLUGIN_ROOT}"
+    } else {
+        "${CURSOR_PLUGIN_ROOT}"
+    }) {
         return Err("target-incompatible plugin-root variable".into());
     }
     let mut declared: Vec<_> = files
@@ -102,10 +111,19 @@ pub(super) fn compile(text: &str, files: &[String], destination: &Path) -> Resul
         .collect();
     declared.sort_by_key(|name| std::cmp::Reverse(name.chars().count()));
     for token in split(text)? {
+        if !policy.cursor()
+            && !token.contains('/')
+            && !declared.contains(&token.as_str())
+            && [".sh", ".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".ps1"]
+                .iter()
+                .any(|suffix| token.ends_with(suffix))
+        {
+            return Err("hook unresolved local file reference escapes copied bundle".into());
+        }
         if token.contains('/')
             && !declared.contains(&token.as_str())
             && !token.contains("://")
-            && !["./", "../", "hooks/", VARIABLE, "/"]
+            && !["./", "../", "hooks/", variable, "/"]
                 .iter()
                 .any(|p| token.starts_with(p))
         {
@@ -132,8 +150,8 @@ pub(super) fn compile(text: &str, files: &[String], destination: &Path) -> Resul
             .chars()
             .next_back()
             .is_none_or(|c| !word(c) && c != '/');
-        let length = if let Some(suffix) = tail.strip_prefix(VARIABLE) {
-            VARIABLE.len()
+        let length = if let Some(suffix) = tail.strip_prefix(variable) {
+            variable.len()
                 + if suffix.starts_with('/') {
                     suffix
                         .chars()
@@ -166,8 +184,8 @@ pub(super) fn compile(text: &str, files: &[String], destination: &Path) -> Resul
             continue;
         }
         let value = &tail[..length];
-        let relative = if value.starts_with(VARIABLE) {
-            value.get(VARIABLE.len() + 1..).unwrap_or("").to_owned()
+        let relative = if value.starts_with(variable) {
+            value.get(variable.len() + 1..).unwrap_or("").to_owned()
         } else if value.starts_with("./hooks/") || value.starts_with("hooks/") {
             value.strip_prefix("./").unwrap_or(value).into()
         } else {
@@ -190,7 +208,7 @@ pub(super) fn compile(text: &str, files: &[String], destination: &Path) -> Resul
         ));
         index += length;
     }
-    if output.contains(VARIABLE) {
+    if output.contains(variable) {
         return Err("unresolved local plugin-root reference".into());
     }
     Ok(output)

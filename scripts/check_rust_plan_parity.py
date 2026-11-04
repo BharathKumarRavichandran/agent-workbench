@@ -1172,25 +1172,29 @@ def state_wire_rows(base: Path) -> None:
     print(f"state wire parity: {len(expected)} strict v2/v3/v4 cases match")
 
 
-def state_v4_fail_closed(base: Path) -> None:
-    side = Side("rust", base / "v4-fail-closed", "claude")
-    seed_v2(side)
-    state = v2_state(side)
-    state.update(schemaVersion=4, slots={}, destinationRoots={"skills": str(side.destination)})
-    entries = state["entries"]
-    assert isinstance(entries, dict)
-    entry = entries["skill:example"]
-    assert isinstance(entry, dict)
-    entry.update(component="skills", resourceKind="directory-symlink", sourceRepository=str(side.root))
-    side.state_file.write_text(json.dumps(state), encoding="utf-8")
-    before = side.state_file.read_bytes()
-    target = os.readlink(side.destination / "example")
-    for action in ("plan", "status", "trust", "install", "uninstall"):
-        result = side.command(action)
-        assert result.returncode == 2 and "v4 executable lifecycle is not supported" in result.stderr, result
-        assert side.state_file.read_bytes() == before
-        assert os.readlink(side.destination / "example") == target
-    print("state v4 lifecycle: plan/status/install/uninstall fail closed without mutation")
+def state_v4_public_lifecycle(base: Path) -> None:
+    for target in ('cursor', 'claude'):
+        py, rs = pair(base, 'v4-public-lifecycle', target)
+        for side in (py, rs):
+            seed_v2(side)
+            state = v2_state(side)
+            state.update(schemaVersion=4, slots={}, destinationRoots={'skills': str(side.destination)})
+            entries = state['entries']
+            assert isinstance(entries, dict)
+            entry = entries['skill:example']
+            assert isinstance(entry, dict)
+            entry.update(component='skills', resourceKind='directory-symlink', sourceRepository=str(side.root))
+            side.state_file.write_text(json.dumps(state), encoding='utf-8')
+        for action in ('plan', 'status', 'trust', 'install', 'uninstall'):
+            before = [trust_snapshot(side.base) for side in (py, rs)]
+            compare(f'v4 {target} {action}', py, rs, py.command(action), rs.command(action))
+            if action in ('plan', 'status', 'trust'):
+                assert before == [trust_snapshot(side.base) for side in (py, rs)]
+            if py.state_file.exists():
+                compare_state(f'v4 {target} {action}', py, rs)
+            else:
+                assert not rs.state_file.exists()
+    print('state v4 public lifecycle: Cursor/Claude plan/status/trust/install/uninstall output, state bytes/modes and read-only inspection match')
 
 
 def trust_contract_rows(base: Path) -> None:
@@ -1449,8 +1453,8 @@ def trust_inspection_rows(base: Path) -> None:
     print(f"trust inspection parity: {len(rows)} dependency-bound pending-journal cases match without writes")
 
 
-def trust_cli_fail_closed(base: Path) -> None:
-    side = Side("rust", base / "trust-cli-rejection", "claude")
+def trust_cli_contract(base: Path) -> None:
+    side = Side("rust", base / "trust-cli-rejection", "codex")
     rejection_before = trust_snapshot(side.base)
     token = "aw-trust-v1:" + "a" * 64
     # "trust" is read-only planning on non-executable resources; grants are
@@ -1485,7 +1489,7 @@ def trust_cli_fail_closed(base: Path) -> None:
         snapshots = [trust_snapshot(side.base) for side in (py, rs)]
         compare("trust pending journal", py, rs, py.command("trust"), rs.command("trust"))
         assert [trust_snapshot(side.base) for side in (py, rs)] == snapshots
-    side = Side("rust", base / "trust-cli-rejection", "claude", initialize=False)
+    side = Side("rust", base / "trust-cli-rejection", "codex", initialize=False)
     for action, args in (("trust", ("--component", "hooks")),
                          ("trust", ("--component", "mcp", "--trust", token)),
                          ("install", ("--component", "hooks")),
@@ -1494,7 +1498,7 @@ def trust_cli_fail_closed(base: Path) -> None:
         result = side.command(action, *args)
         assert result.returncode == 2, result
         assert trust_snapshot(side.base) == rejection_before, "unsupported activation mutated fixtures"
-    print("trust CLI: six-target skills exits/output/typed snapshots match; Claude activation remains fail-closed")
+    print("trust CLI: six-target skills exits/output/typed snapshots match; unsupported Codex activation remains fail-closed")
 
 
 def trust_snapshot(base: Path):
@@ -2589,7 +2593,9 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
             for script in ("check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
-                           "check_cursor_activation_recovery.py"):
+                           "check_cursor_activation_recovery.py", "check_claude_activation_parity.py",
+                           "check_claude_activation_edges.py", "check_claude_activation_recovery.py",
+                           "check_claude_native_contract.py"):
                 activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
                 assert activation.returncode == 0, activation.stdout + activation.stderr
                 print(activation.stdout.strip())
@@ -2637,9 +2643,9 @@ def main() -> int:
             trust_contract_rows(base / "trust")
             trust_proof_rows(base / "trust-proofs")
             trust_inspection_rows(base / "trust-inspection")
-            trust_cli_fail_closed(base)
+            trust_cli_contract(base)
             state_wire_rows(base / "state-wire")
-            state_v4_fail_closed(base)
+            state_v4_public_lifecycle(base)
             for target in TARGETS:
                 default_destination(base, target)
                 explicit_destination_expansion(base, target)

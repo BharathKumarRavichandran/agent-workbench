@@ -340,7 +340,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         }
     }
     let target = SkillsTarget::parse(&target.ok_or("--target is required")?)?;
-    if profile != "pstack" && target != SkillsTarget::Cursor {
+    if profile != "pstack" && activation::Policy::for_target(target).is_none() {
         return Err(format!(
             "unsupported profile for Rust parity unit: {profile}"
         ));
@@ -364,8 +364,12 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
                     "agents" => Ok(ComponentKind::Agents),
                     "rules" => Ok(ComponentKind::Rules),
                     "commands" => Ok(ComponentKind::Commands),
-                    "hooks" if target == SkillsTarget::Cursor => Ok(ComponentKind::Hooks),
-                    "mcp" if target == SkillsTarget::Cursor => Ok(ComponentKind::Mcp),
+                    "hooks" if activation::Policy::for_target(target).is_some() => {
+                        Ok(ComponentKind::Hooks)
+                    }
+                    "mcp" if activation::Policy::for_target(target).is_some() => {
+                        Ok(ComponentKind::Mcp)
+                    }
                     _ => Err("Rust parity unit supports only path components".into()),
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -989,7 +993,7 @@ pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
         });
     }
     let cli = parse_cli(args)?;
-    if cli.target == SkillsTarget::Cursor {
+    if activation::Policy::for_target(cli.target).is_some() {
         return activation::run(&cli);
     }
     let (operations, conflicts) = lifecycle::run(&cli)?;

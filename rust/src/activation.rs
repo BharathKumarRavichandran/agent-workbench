@@ -1,4 +1,4 @@
-//! Cursor executable lifecycle: content-bound grants and D5 transactions.
+//! Native Cursor/Claude activation: content-bound grants and D5 transactions.
 use crate::{
     bundles,
     lifecycle::{self, Action},
@@ -16,6 +16,49 @@ mod commands;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+/// Closed native activation formats. No cross-target hook translation.
+#[derive(Clone, Copy)]
+pub(super) enum Policy {
+    Cursor,
+    Claude,
+}
+impl Policy {
+    pub(super) fn for_target(target: SkillsTarget) -> Option<Self> {
+        match target {
+            SkillsTarget::Cursor => Some(Self::Cursor),
+            SkillsTarget::Claude => Some(Self::Claude),
+            _ => None,
+        }
+    }
+    fn id(self) -> &'static str {
+        match self {
+            Self::Cursor => "cursor",
+            Self::Claude => "claude",
+        }
+    }
+    fn cursor(self) -> bool {
+        matches!(self, Self::Cursor)
+    }
+    fn hooks_file(self) -> &'static str {
+        match self {
+            Self::Cursor => "hooks.json",
+            Self::Claude => "settings.json",
+        }
+    }
+    fn mcp_file(self) -> &'static str {
+        match self {
+            Self::Cursor => "mcp.json",
+            Self::Claude => ".mcp.json",
+        }
+    }
+    fn variable(self) -> &'static str {
+        match self {
+            Self::Cursor => "${CURSOR_PLUGIN_ROOT}",
+            Self::Claude => "${CLAUDE_PLUGIN_ROOT}",
+        }
+    }
+}
+
 fn error(e: Error) -> String {
     match e {
         Error::Invalid(s) => s,
@@ -28,9 +71,14 @@ fn roots_wire(roots: &BTreeMap<ComponentKind, PathBuf>) -> BTreeMap<String, Path
         .map(|(c, p)| (c.as_str().into(), p.clone()))
         .collect()
 }
-pub(super) fn recover(file: &Path, roots: &BTreeMap<ComponentKind, PathBuf>) -> Result<()> {
-    let request = recovery::RecoveryRequest::new(file.to_path_buf(), "cursor", roots_wire(roots))
-        .map_err(error)?;
+pub(super) fn recover(
+    file: &Path,
+    roots: &BTreeMap<ComponentKind, PathBuf>,
+    policy: Policy,
+) -> Result<()> {
+    let request =
+        recovery::RecoveryRequest::new(file.to_path_buf(), policy.id(), roots_wire(roots))
+            .map_err(error)?;
     recovery::recover(&request, |_| Ok(())).map_err(error)
 }
 fn selected<'a>(
@@ -146,7 +194,12 @@ fn classify_hooks(data: &Wire, alias: &str) -> Result<bool> {
     }
     Ok(cursor)
 }
-fn hook_source(repository: &Path, plugin: &Plugin, source: &Source) -> Result<Option<PathBuf>> {
+fn hook_source(
+    repository: &Path,
+    plugin: &Plugin,
+    source: &Source,
+    policy: Policy,
+) -> Result<Option<PathBuf>> {
     let mut exact = Vec::new();
     for alias in ["hooks", "cursor-hooks", "claude-hooks"] {
         let Some(path) = artifact(repository, plugin, source, alias)? else {
@@ -163,7 +216,7 @@ fn hook_source(repository: &Path, plugin: &Plugin, source: &Source) -> Result<Op
                 path.join("hooks.json").display()
             ));
         }
-        if classify_hooks(&data, alias)? {
+        if classify_hooks(&data, alias)? == policy.cursor() {
             exact.push(path);
         }
     }
@@ -173,6 +226,7 @@ fn hook_source(repository: &Path, plugin: &Plugin, source: &Source) -> Result<Op
     Ok(exact.pop())
 }
 pub(super) fn hook_entries(
+    policy: Policy,
     repository: &Path,
     catalog: &Catalog,
     profile: &Profile,
@@ -185,7 +239,7 @@ pub(super) fn hook_entries(
         return Ok(conflicts);
     }
     for (plugin, source) in selected(catalog, profile) {
-        if let Some(path) = hook_source(repository, plugin, source)? {
+        if let Some(path) = hook_source(repository, plugin, source, policy)? {
             let tree = bundles::source_tree(&path).map_err(|e| e.to_string())?;
             let digest = tree.digest().map_err(|e| e.to_string())?;
             let key = format!("hook:{}", plugin.id);
@@ -236,7 +290,12 @@ pub(super) fn hook_entries(
                     key: "component:hooks".into(),
                     destination: roots[&ComponentKind::Hooks].to_string_lossy().into_owned(),
                     source: String::new(),
-                    reason: "cursor does not support claude-hook-bundle".into(),
+                    reason: if policy.cursor() {
+                        "cursor does not support claude-hook-bundle"
+                    } else {
+                        "claude does not support hook-bundle"
+                    }
+                    .into(),
                     component: "hooks",
                     resource: PathResource::DirectorySymlink,
                     diagnostic: Some("REPRESENTATION_UNSUPPORTED".into()),
@@ -250,36 +309,21 @@ pub(super) fn hook_entries(
     }
     Ok(conflicts)
 }
-fn document(roots: &BTreeMap<ComponentKind, PathBuf>, component: ComponentKind) -> PathBuf {
+pub(super) fn document(
+    roots: &BTreeMap<ComponentKind, PathBuf>,
+    component: ComponentKind,
+    policy: Policy,
+) -> PathBuf {
     match component {
-        ComponentKind::Hooks => roots[&component].parent().unwrap().join("hooks.json"),
-        ComponentKind::Mcp => roots[&component].join("mcp.json"),
+        ComponentKind::Hooks => roots[&component]
+            .parent()
+            .unwrap()
+            .join(policy.hooks_file()),
+        ComponentKind::Mcp => roots[&component].join(policy.mcp_file()),
         _ => unreachable!(),
     }
 }
-fn token(
-    plugin: &Plugin,
-    source: &Source,
-    component: ComponentKind,
-    path: &Path,
-    repository: &Path,
-    artifact: &Path,
-    digest: &str,
-) -> Result<String> {
-    trust::Grant {
-        plugin,
-        source,
-        component,
-        target: "cursor",
-        document: path,
-        repository,
-        artifact: Some(artifact),
-        fallback: None,
-        digest,
-    }
-    .token()
-}
-fn compile(tree: &bundles::Tree, destination: &Path) -> Result<Wire> {
+fn compile(tree: &bundles::Tree, destination: &Path, policy: Policy) -> Result<Wire> {
     let (_, files) = tree.to_journal();
     let content = &files
         .iter()
@@ -292,16 +336,29 @@ fn compile(tree: &bundles::Tree, destination: &Path) -> Result<Wire> {
         for (_, entries) in events {
             if let Wire::Array(entries) = entries {
                 for entry in entries {
-                    let command = entry
-                        .get("command")
-                        .string()
-                        .ok_or("incompatible hook representation")?;
-                    let paths: Vec<_> = files
-                        .iter()
-                        .map(|(path, _, _)| path.to_string_lossy().into_owned())
-                        .collect();
-                    let rewritten = commands::compile(command, &paths, destination)?;
-                    entry.set("command", Wire::Scalar(serde_json::json!(rewritten)));
+                    let handlers = if policy.cursor() {
+                        std::slice::from_mut(entry)
+                    } else {
+                        let Some(Wire::Array(handlers)) = entry.get_mut("hooks") else {
+                            return Err("incompatible hook representation".into());
+                        };
+                        handlers.as_mut_slice()
+                    };
+                    for entry in handlers {
+                        if !policy.cursor() && entry.get("type").string() != Some("command") {
+                            continue;
+                        }
+                        let command = entry
+                            .get("command")
+                            .string()
+                            .ok_or("incompatible hook representation")?;
+                        let paths: Vec<_> = files
+                            .iter()
+                            .map(|(path, _, _)| path.to_string_lossy().into_owned())
+                            .collect();
+                        let rewritten = commands::compile(command, &paths, destination, policy)?;
+                        entry.set("command", Wire::Scalar(serde_json::json!(rewritten)));
+                    }
                 }
             }
         }
@@ -373,6 +430,7 @@ fn validate_mcp_inventory(data: &Wire, artifact: &Path) -> Result<()> {
     Ok(())
 }
 pub(super) fn inspect_requested(
+    policy: Policy,
     repository: &Path,
     catalog: &Catalog,
     profile: &Profile,
@@ -382,7 +440,7 @@ pub(super) fn inspect_requested(
         for component in requested {
             match component {
                 ComponentKind::Hooks => {
-                    hook_source(repository, plugin, source)?;
+                    hook_source(repository, plugin, source, policy)?;
                 }
                 ComponentKind::Mcp => {
                     if let Some(path) = artifact(repository, plugin, source, "mcp")? {
@@ -466,6 +524,7 @@ fn run_inner(
     cli: &Cli,
     boundary: impl FnMut(tx::ApplyBoundary) -> std::io::Result<()>,
 ) -> Result<CommandOutput> {
+    let policy = Policy::for_target(cli.target).ok_or("unsupported activation target")?;
     let mut plan = lifecycle::reconcile(cli)?;
     let catalog = decode_catalog(&plan.repository.join("catalog/plugins.json"))?;
     let profile = decode_profile(
@@ -492,6 +551,7 @@ fn run_inner(
     let mut operations = Vec::new();
     let mut sources = Vec::new();
     let mut slots = BTreeMap::new();
+    let mut ordered_slots = Vec::new();
     for component in [ComponentKind::Hooks, ComponentKind::Mcp] {
         if !plan.authorized.contains_key(&component) {
             continue;
@@ -509,7 +569,7 @@ fn run_inner(
         if authority_conflicts.is_empty() && !wanted && owned.is_empty() && !has_bundle {
             continue;
         }
-        let path = document(&plan.authorized, component);
+        let path = document(&plan.authorized, component, policy);
         let before = snapshot(&path)?;
         if !authority_conflicts.is_empty() {
             operations.extend(
@@ -534,7 +594,7 @@ fn run_inner(
         if wanted {
             for (plugin, source) in selected(&catalog, &profile) {
                 let artifact = if component == ComponentKind::Hooks {
-                    hook_source(&plan.repository, plugin, source)?
+                    hook_source(&plan.repository, plugin, source, policy)?
                 } else {
                     artifact(&plan.repository, plugin, source, "mcp")?
                 };
@@ -543,7 +603,8 @@ fn run_inner(
                 };
                 let (digest, values) = if component == ComponentKind::Hooks {
                     let tree = bundles::source_tree(&artifact).map_err(|e| e.to_string())?;
-                    let hooks = compile(&tree, &plan.authorized[&component].join(&plugin.id))?;
+                    let hooks =
+                        compile(&tree, &plan.authorized[&component].join(&plugin.id), policy)?;
                     let mut values = Vec::new();
                     for (event, entries) in hooks.object("hooks")? {
                         let Wire::Array(entries) = entries else {
@@ -565,15 +626,18 @@ fn run_inner(
                     }
                     (format!("{:x}", Sha256::digest(&content)), values)
                 };
-                let token = token(
+                let token = trust::Grant {
                     plugin,
                     source,
                     component,
-                    &path,
-                    &plan.repository,
-                    &artifact,
-                    &digest,
-                )?;
+                    target: policy.id(),
+                    document: &path,
+                    repository: &plan.repository,
+                    artifact: Some(&artifact),
+                    fallback: None,
+                    digest: &digest,
+                }
+                .token()?;
                 let bundle_key = format!("hook:{}", plugin.id);
                 let bundle = plan
                     .previous
@@ -638,9 +702,15 @@ fn run_inner(
             &desired,
             &owned,
             cli.adopt,
-            "cursor",
+            policy.id(),
         )?;
         operations.extend(result.operations);
+        ordered_slots.extend(
+            desired
+                .iter()
+                .filter_map(|item| result.slots.get(&item.state.key))
+                .cloned(),
+        );
         slots.extend(result.slots);
         documents.push(tx::PlannedDocument {
             before: image(before),
@@ -649,9 +719,13 @@ fn run_inner(
         });
     }
     if !documents.is_empty() {
-        let desired: Vec<_> = slots.values().cloned().collect();
-        let ownership =
-            docs::ownership::plan(ledger.content.as_deref(), &file, &old, &desired, operations)?;
+        let ownership = docs::ownership::plan(
+            ledger.content.as_deref(),
+            &file,
+            &old,
+            &ordered_slots,
+            operations,
+        )?;
         operations = ownership.operations;
         documents.push(tx::PlannedDocument {
             before: image(ledger),
@@ -672,7 +746,7 @@ fn run_inner(
         {
             if let Some(doc) = documents
                 .iter()
-                .find(|d| d.before.path == document(&plan.authorized, ComponentKind::Hooks))
+                .find(|d| d.before.path == document(&plan.authorized, ComponentKind::Hooks, policy))
             {
                 if docs::references::references_bundle(
                     doc.after.as_deref(),
@@ -704,7 +778,7 @@ fn run_inner(
             });
         }
         let request = tx::ApplyRequest {
-            target: "cursor".into(),
+            target: policy.id().into(),
             repository: plan.repository.clone(),
             roots: roots_wire(&plan.authorized),
             state_before: image(snapshot(&plan.state_file)?),

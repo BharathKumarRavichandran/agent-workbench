@@ -38,7 +38,7 @@ def readonly_identity(root):
             for p in root.rglob('*') for s in [p.lstat()]}
 
 
-def prepare(base, case='mixed'):
+def prepare(base, case='mixed', target='cursor'):
     root = base / 'fixture'
     if root.exists(): shutil.rmtree(root)
     root.mkdir()
@@ -50,22 +50,27 @@ def prepare(base, case='mixed'):
     source = fixture.root / 'plugins/sample/hooks/stop.sh'
     source.write_text('#!/bin/sh\ntouch "' + str(root / 'PAYLOAD_EXECUTED') + '"\n')
     source.chmod(0o751)
-    if case == 'shell-hook':
+    if target == 'claude':
+        command = 'sh ./hooks/stop.sh --hello' if case == 'shell-hook' else 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/stop.sh" --hello'
+        (source.parent / 'hooks.json').write_text(json.dumps({'hooks': {'Stop': [
+            {'matcher': '*', 'hooks': [{'type': 'command', 'command': command, 'timeout': 20},
+                                     {'type': 'prompt', 'prompt': 'An inert prompt', 'model': 'preserve'}]}]}}))
+    elif case == 'shell-hook':
         (source.parent / 'hooks.json').write_text(json.dumps({
             'version': 1, 'hooks': {'stop': [{'command': 'sh ./hooks/stop.sh --hello', 'loop_limit': None}]}}))
-    file = root / 'state/agent-workbench/test-marketplace/pstack/cursor.json'
+    file = root / f'state/agent-workbench/test-marketplace/pstack/{target}.json'
     file.parent.mkdir(parents=True)
     key = file.with_name('.' + file.name + '.transaction-key')
     key.write_bytes(bytes(range(32))); key.chmod(0o600)
     return root, fixture.root
 
 
-def lifecycle(base, case='mixed'):
+def lifecycle(base, case='mixed', target='cursor'):
     expected = []
     for engine in ('python', 'rust'):
-        root, repository = prepare(base, case)
+        root, repository = prepare(base, case, target)
         tokens = []
-        components = ['hooks'] if case in {'hooks-only', 'shell-hook'} else ['mcp'] if case == 'mcp-only' else ['hooks', 'mcp']
+        components = ['hooks'] if case in {'hooks-only', 'shell-hook'} or (target == 'claude' and case == 'user') else ['mcp'] if case == 'mcp-only' else ['hooks', 'mcp']
         env = dict(os.environ, HOME=str(root / 'home'), XDG_STATE_HOME=str(root / 'state'),
                    PYTHONDONTWRITEBYTECODE='1',
                    HERMES_HOME=str(root / 'home/hermes'), CODEX_HOME=str(root / 'home/codex'))
@@ -77,7 +82,7 @@ def lifecycle(base, case='mixed'):
         for index, (label, action, granted) in enumerate(actions):
             prefix = [sys.executable, '-m', 'agent_workbench'] if engine == 'python' else [str(RUST)]
             command = prefix + ['--root', str(repository), '--profile', 'pstack', action,
-                '--target','cursor','--state-dir',str(root / 'state'),'--json']
+                '--target',target,'--state-dir',str(root / 'state'),'--json']
             if case != 'user': command += ['--project-root', str(root / 'project')]
             if action != 'uninstall':
                 for component in components: command += ['--component', component]

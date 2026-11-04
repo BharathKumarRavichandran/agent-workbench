@@ -21,7 +21,7 @@ from agent_workbench import cli, installation, shared_config
 
 def interrupt(base, runner, phase, uninstall):
     args = ['--root', str(runner.repository), '--profile', 'pstack',
-            'uninstall' if uninstall else 'install', '--target', 'cursor',
+            'uninstall' if uninstall else 'install', '--target', runner.target,
             '--project-root', str(runner.root / 'project'), '--state-dir', str(runner.root / 'state'), '--json']
     if not uninstall:
         for component in ('skills', 'agents', 'hooks', 'mcp'):
@@ -61,12 +61,12 @@ def interrupt(base, runner, phase, uninstall):
         else:
             raise AssertionError('oracle interruption not reached')
         assert hit
-    journal = runner.root / 'project/.cursor/.agent-workbench-transaction.json'
+    journal = runner.hook_config.parent / '.agent-workbench-transaction.json'
     assert journal.exists() and journal.stat().st_mode & 0o777 == 0o600
     return observe(runner.root)
 
 
-def main():
+def main(target='cursor'):
     assert os.environ.get('TMPDIR'), 'explicit scratch TMPDIR required'
     rows = 0
     with tempfile.TemporaryDirectory(prefix='cursor-public-recovery-', dir=os.environ['TMPDIR']) as raw:
@@ -75,8 +75,8 @@ def main():
             for phase in ('journal', 'before-state'):
                 expected = None
                 for engine in ('python', 'rust'):
-                    root, repository = prepare(base)
-                    r = Replay(root, repository, engine)
+                    root, repository = prepare(base, target=target)
+                    r = Replay(root, repository, engine, target=target)
                     r.snapshotter = observe
                     if uninstall:
                         r.install(('skills', 'agents', 'hooks', 'mcp'))
@@ -88,7 +88,7 @@ def main():
                     assert failed == pending
                     result = r.call('status', ('skills', 'agents', 'hooks', 'mcp'))
                     assert result.returncode == (0 if uninstall else 1), result
-                    assert not (root / 'project/.cursor/.agent-workbench-transaction.json').exists()
+                    assert not (r.hook_config.parent / '.agent-workbench-transaction.json').exists()
                     r.install(('skills', 'agents', 'hooks', 'mcp'))
                     result = r.call('uninstall')
                     assert result.returncode == 0, result
@@ -102,8 +102,8 @@ def main():
                         assert observed[2] == expected[2], (phase, uninstall, 'public recovery/retry output or bytes differ')
                     shutil.rmtree(root)
                 rows += 1
-                print(f'Public Cursor recovery passed: uninstall={uninstall} phase={phase}', flush=True)
-    print(f'Cursor public recovery: {rows} paired independently planned interruptions, trust refusal, status recovery, retry and uninstall passed')
+                print(f'Public {target} recovery passed: uninstall={uninstall} phase={phase}', flush=True)
+    print(f'{target} public recovery: {rows} paired independently planned interruptions, trust refusal, status recovery, retry and uninstall passed')
 
 
 if __name__ == '__main__':
