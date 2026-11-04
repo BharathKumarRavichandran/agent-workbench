@@ -22,24 +22,26 @@ pub(super) enum Action {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Identity(u64, u64);
+pub(super) struct Identity(pub u64, pub u64);
 
 #[derive(Clone, Debug)]
-struct RootSnapshot {
-    path: PathBuf,
-    identity: Option<Identity>,
-    anchor: PathBuf,
-    anchor_identity: Identity,
+pub(super) struct RootSnapshot {
+    pub path: PathBuf,
+    pub identity: Option<Identity>,
+    pub anchor: PathBuf,
+    pub anchor_identity: Identity,
 }
 
 #[derive(Debug)]
 pub(super) struct Plan {
-    operations: Vec<Operation>,
-    previous: Option<State>,
-    next: State,
-    state_file: PathBuf,
-    repository: PathBuf,
-    roots: BTreeMap<PathBuf, RootSnapshot>,
+    pub operations: Vec<Operation>,
+    pub previous: Option<State>,
+    pub next: State,
+    pub state_file: PathBuf,
+    pub repository: PathBuf,
+    pub roots: BTreeMap<PathBuf, RootSnapshot>,
+    pub authorized: BTreeMap<ComponentKind, PathBuf>,
+    pub requested: Vec<ComponentKind>,
 }
 
 pub(super) fn run(cli: &Cli) -> Result<(Vec<Operation>, bool)> {
@@ -51,7 +53,7 @@ pub(super) fn run(cli: &Cli) -> Result<(Vec<Operation>, bool)> {
     Ok((plan.operations, conflicts))
 }
 
-fn reconcile(cli: &Cli) -> Result<Plan> {
+pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {
     let repository = canonicalize_existing(&cli.root, "repository root")?;
     let catalog = decode_catalog(&repository.join("catalog/plugins.json"))?;
     let profile_path = repository
@@ -84,6 +86,8 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
                 | ComponentKind::Agents
                 | ComponentKind::Rules
                 | ComponentKind::Commands
+                | ComponentKind::Hooks
+                | ComponentKind::Mcp
         )
     }) {
         return Err("Rust parity unit supports only path components".into());
@@ -136,16 +140,24 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
             }
         }
     }
+
+    let authorized = authorized_roots(cli.target, &destination, project_root.as_deref())?;
+    let policy = crate::activation::Policy::for_target(cli.target);
+    if let Some(policy) = policy.filter(|_| cli.action != Action::Trust) {
+        crate::activation::recover(&state_file, &authorized, policy)?;
+    }
+    if let Some(policy) = policy.filter(|_| cli.action != Action::Uninstall) {
+        crate::activation::inspect_requested(policy, &repository, &catalog, &profile, &requested)?;
+    }
     let previous = state::load(&state_file)?;
-    // v4 parsing is available, but executable planning/transactions are not ported.
+    // Executable lifecycle remains closed for targets without a native policy.
     // Do not classify, remove, downgrade, or silently drop recorded slots/evidence.
     if previous
         .as_ref()
-        .is_some_and(|state| state.schema_version == 4)
+        .is_some_and(|state| state.schema_version == 4 && policy.is_none())
     {
         return Err("v4 executable lifecycle is not supported by Rust yet".into());
     }
-    let authorized = authorized_roots(cli.target, &destination, project_root.as_deref())?;
     if let Some(previous) = &previous {
         if previous.marketplace != catalog.marketplace.id
             || previous.profile != profile.id
@@ -160,6 +172,24 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
             return Err("recorded destination root differs from requested destination; pass the same explicit --destination used for installation".into());
         }
         authorize_recorded_roots(previous, &authorized)?;
+        if let Some(policy) = policy {
+            for slot in previous.slots.values() {
+                let expected = match slot.component.as_str() {
+                    "hooks" => Some(crate::activation::document(
+                        &authorized,
+                        ComponentKind::Hooks,
+                        policy,
+                    )),
+                    "mcp" if authorized.contains_key(&ComponentKind::Mcp) => Some(
+                        crate::activation::document(&authorized, ComponentKind::Mcp, policy),
+                    ),
+                    _ => None,
+                };
+                if expected.as_deref() != Some(Path::new(&slot.document)) {
+                    return Err("recorded document differs from adapter-authorized path".into());
+                }
+            }
+        }
     }
 
     let mut projection_conflicts = Vec::new();
@@ -231,7 +261,7 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
                 .any(|op| op.component == component.as_str())
         })
         .collect();
-    let desired = if cli.action == Action::Uninstall {
+    let mut desired = if cli.action == Action::Uninstall {
         BTreeMap::new()
     } else {
         desired_entries(
@@ -243,6 +273,17 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
             &authorized,
         )?
     };
+    if let Some(policy) = policy.filter(|_| cli.action != Action::Uninstall) {
+        projection_conflicts.extend(crate::activation::hook_entries(
+            policy,
+            &repository,
+            &catalog,
+            &profile,
+            &accepted,
+            &authorized,
+            &mut desired,
+        )?);
+    }
     let owned = previous
         .as_ref()
         .map(|value| &value.entries)
@@ -253,6 +294,7 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
     let mut ordered_desired: Vec<_> = desired.iter().collect();
     ordered_desired.sort_by_key(|(key, entry)| {
         (
+            entry.component == ComponentKind::Hooks,
             catalog
                 .plugins
                 .iter()
@@ -319,8 +361,20 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         entries: next_entries,
         destination_roots,
     };
+    let document_parents: Vec<_> = if cli.target == SkillsTarget::Claude {
+        authorized
+            .get(&ComponentKind::Hooks)
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain(project_root.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let roots = authorized
         .values()
+        .chain(document_parents.iter())
         .map(|path| Ok((path.clone(), snapshot_root(path)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
     Ok(Plan {
@@ -330,6 +384,8 @@ fn reconcile(cli: &Cli) -> Result<Plan> {
         state_file,
         repository,
         roots,
+        authorized,
+        requested: accepted,
     })
 }
 
@@ -627,6 +683,8 @@ fn authorized_roots(
     );
     if target == SkillsTarget::Cursor {
         roots.insert(ComponentKind::Mcp, home_base);
+    } else if let Some(project) = project_root {
+        roots.insert(ComponentKind::Mcp, project.to_path_buf());
     }
     Ok(roots)
 }
@@ -733,7 +791,13 @@ fn matches_resource(destination: &Path, source: &Path, resource: &PathResource) 
         PathResource::FileCopy(digest) => {
             Ok(file_digest(destination)?.as_deref() == Some(digest.as_str()))
         }
-        PathResource::DirectoryCopy(_) => Ok(false),
+        PathResource::DirectoryCopy(digest) => Ok(destination
+            .parent()
+            .and_then(|parent| crate::bundles::open_directory(parent).ok())
+            .and_then(|parent| crate::bundles::read_tree(destination.file_name()?, &parent).ok())
+            .and_then(|tree| tree.digest().ok())
+            .as_deref()
+            == Some(digest.as_str())),
     }
 }
 
@@ -745,7 +809,7 @@ fn matches_owned(entry: &Entry) -> Result<bool> {
     )
 }
 
-fn read_regular(repository: &Path, path: &Path) -> Result<Vec<u8>> {
+pub(super) fn read_regular(repository: &Path, path: &Path) -> Result<Vec<u8>> {
     let relative = path
         .strip_prefix(repository)
         .map_err(|_| "copy source escapes checkout")?;
@@ -1390,7 +1454,7 @@ fn write_progress(plan: &Plan, entries: &BTreeMap<String, Entry>) -> Result<()> 
     state::write(&plan.state_file, &progress)
 }
 
-fn validate_source(repository: &Path, source: &Path) -> Result<()> {
+pub(crate) fn validate_source(repository: &Path, source: &Path) -> Result<()> {
     let relative = source
         .strip_prefix(repository)
         .map_err(|_| format!("skill source escapes checkout: {}", source.display()))?;
@@ -1409,7 +1473,7 @@ fn validate_source(repository: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
-fn relative_link(source: &Path, parent: &Path) -> Result<PathBuf> {
+pub(crate) fn relative_link(source: &Path, parent: &Path) -> Result<PathBuf> {
     let source_parts: Vec<_> = source.components().collect();
     let parent_parts: Vec<_> = parent.components().collect();
     let common = source_parts
@@ -1488,6 +1552,7 @@ mod race_tests {
                 project_root: None,
                 state_dir: self.state_root.clone(),
                 adopt: false,
+                trust: Vec::new(),
                 json: true,
                 action,
             }

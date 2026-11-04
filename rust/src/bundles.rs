@@ -115,7 +115,7 @@ fn quoted_name(points: &[u32]) -> String {
     text
 }
 
-fn names(fd: &impl AsFd) -> io::Result<Vec<OsString>> {
+fn names_unsorted(fd: &impl AsFd) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in rfs::Dir::read_from(fd)? {
         let entry = entry?;
@@ -124,6 +124,11 @@ fn names(fd: &impl AsFd) -> io::Result<Vec<OsString>> {
             names.push(OsString::from_vec(bytes.to_vec()));
         }
     }
+    Ok(names)
+}
+
+fn names(fd: &impl AsFd) -> io::Result<Vec<OsString>> {
+    let mut names = names_unsorted(fd)?;
     names.sort_by_cached_key(|name| python_name(name));
     Ok(names)
 }
@@ -237,7 +242,68 @@ pub(super) fn source_tree(source: &Path) -> io::Result<Tree> {
     })
 }
 
+fn validate_journal_path(path: &Path, mode: u32) -> io::Result<()> {
+    let text = path.as_os_str().as_bytes();
+    if mode > 0o777
+        || path.is_absolute()
+        || text.contains(&b'\\')
+        || text.contains(&0)
+        || text.split(|b| *b == b'/').any(|s| s == b"..")
+    {
+        return Err(invalid("unsafe journal bundle record"));
+    }
+    Ok(())
+}
+
 impl Tree {
+    /// Journal handoff only: authentication and destination authority remain the caller's job.
+    pub(crate) fn from_journal(
+        directories: Vec<(PathBuf, u32)>,
+        files: Vec<(PathBuf, u32, Vec<u8>)>,
+    ) -> io::Result<Self> {
+        // Match Python's inert decoder: lexical safety is checked here, but
+        // duplicate aliases and absent parents fail at exclusive publication,
+        // leaving the same private partial stage for a subsequent recovery.
+        for (path, mode) in &directories {
+            validate_journal_path(path, *mode)?;
+        }
+        for (path, mode, _) in &files {
+            validate_journal_path(path, *mode)?;
+        }
+        Ok(Self {
+            directories,
+            files: files
+                .into_iter()
+                .map(|(path, mode, content)| TreeFile {
+                    path,
+                    mode,
+                    content,
+                })
+                .collect(),
+        })
+    }
+
+    /// Recovery retains partial staging evidence, unlike fresh installation.
+    pub(crate) fn write_journal_observed(
+        &self,
+        name: &str,
+        parent: &impl AsFd,
+        edge: &mut impl FnMut(TreeWriteEdge, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        write_tree_inner(name, parent, self, false, edge)
+    }
+
+    #[allow(clippy::type_complexity)] // Exact inert journal tuple handoff.
+    pub(crate) fn to_journal(&self) -> (Vec<(PathBuf, u32)>, Vec<(PathBuf, u32, Vec<u8>)>) {
+        (
+            self.directories.clone(),
+            self.files
+                .iter()
+                .map(|f| (f.path.clone(), f.mode, f.content.clone()))
+                .collect(),
+        )
+    }
+
     pub(super) fn validate_source(source: &Path, expected: &str) -> io::Result<Self> {
         let tree = source_tree(source)?;
         if tree.digest()? != expected {
@@ -284,6 +350,38 @@ pub(super) fn tree_digest(name: &str, parent: &impl AsFd) -> Option<String> {
 /// Root and children remain private until exact modes and bytes have been fsynced.
 /// The immutable snapshot, not a live checkout, is the only input to publication.
 pub(super) fn write_tree(name: &str, parent: &impl AsFd, tree: &Tree) -> io::Result<()> {
+    write_tree_observed(name, parent, tree, &mut |_, _| Ok(()))
+}
+
+/// Invoked immediately before each actual persistence syscall. Paths are relative
+/// to the staged root (empty for the root itself); callback failure follows the
+/// same cleanup/retention protocol as a syscall failure, never a CLI fault flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeWriteEdge {
+    FileWrite,
+    FileChmod,
+    FileSync,
+    DirectoryChmod,
+    DirectorySync,
+    RootSync,
+}
+
+pub(crate) fn write_tree_observed(
+    name: &str,
+    parent: &impl AsFd,
+    tree: &Tree,
+    edge: &mut impl FnMut(TreeWriteEdge, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    write_tree_inner(name, parent, tree, true, edge)
+}
+
+fn write_tree_inner(
+    name: &str,
+    parent: &impl AsFd,
+    tree: &Tree,
+    cleanup: bool,
+    edge: &mut impl FnMut(TreeWriteEdge, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     rfs::mkdirat(parent, name, Mode::from_raw_mode(0o700))?;
     let result = (|| {
         let fd = directory_at(parent, name)?;
@@ -308,9 +406,12 @@ pub(super) fn write_tree(name: &str, parent: &impl AsFd, tree: &Tree) -> io::Res
                 Mode::from_raw_mode(0o600),
             )?;
             let mut handle = File::from(out);
+            edge(TreeWriteEdge::FileWrite, &item.path)?;
             handle.write_all(&item.content)?;
             handle.flush()?;
+            edge(TreeWriteEdge::FileChmod, &item.path)?;
             rfs::fchmod(&handle, Mode::from_raw_mode(item.mode as _))?;
+            edge(TreeWriteEdge::FileSync, &item.path)?;
             handle.sync_all()?;
         }
         for (path, mode) in tree.directories.iter().rev() {
@@ -322,31 +423,45 @@ pub(super) fn write_tree(name: &str, parent: &impl AsFd, tree: &Tree) -> io::Res
                     path
                 },
             )?;
+            edge(TreeWriteEdge::DirectoryChmod, path)?;
             rfs::fchmod(&child, Mode::from_raw_mode(*mode as _))?;
+            edge(TreeWriteEdge::DirectorySync, path)?;
             rfs::fsync(&child)?;
         }
+        edge(TreeWriteEdge::RootSync, Path::new(""))?;
         rfs::fsync(&fd)?;
         Ok(())
     })();
-    if result.is_err() {
+    if cleanup && result.is_err() {
         delete_tree(name, parent)?;
     }
     result
 }
 
 pub(super) fn delete_tree(name: impl AsRef<OsStr>, parent: &impl AsFd) -> io::Result<()> {
+    delete_tree_observed(name, parent, &mut || Ok(()))
+}
+
+pub(super) fn delete_tree_observed(
+    name: impl AsRef<OsStr>,
+    parent: &impl AsFd,
+    deleted_file: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     let name = name.as_ref();
     let fd = directory_at(parent, name)?;
     rfs::fchmod(
         &fd,
         Mode::from_raw_mode((rfs::fstat(&fd)?.st_mode & 0o7777) | 0o700),
     )?;
-    for child in names(&fd)? {
+    // Python delete_tree uses os.listdir's native directory order. Sorting here
+    // changes which authenticated partial evidence survives an interruption.
+    for child in names_unsorted(&fd)? {
         let info = rfs::statat(&fd, child.as_os_str(), rfs::AtFlags::SYMLINK_NOFOLLOW)?;
         if rfs::FileType::from_raw_mode(info.st_mode).is_dir() {
-            delete_tree(&child, &fd)?;
+            delete_tree_observed(&child, &fd, deleted_file)?;
         } else {
             rfs::unlinkat(&fd, child.as_os_str(), rfs::AtFlags::empty())?;
+            deleted_file()?;
         }
     }
     drop(fd);
@@ -355,18 +470,18 @@ pub(super) fn delete_tree(name: impl AsRef<OsStr>, parent: &impl AsFd) -> io::Re
 }
 
 pub(super) fn rename_new(
-    source: &str,
+    source: impl AsRef<OsStr>,
     parent: &impl AsFd,
-    destination: &str,
+    destination: impl AsRef<OsStr>,
     destination_parent: &impl AsFd,
 ) -> io::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         rfs::renameat_with(
             parent,
-            source,
+            source.as_ref(),
             destination_parent,
-            destination,
+            destination.as_ref(),
             rfs::RenameFlags::NOREPLACE,
         )?;
         Ok(())

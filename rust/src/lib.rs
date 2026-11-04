@@ -7,6 +7,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+mod activation;
+#[cfg(test)]
+mod activation_parity_tests;
 #[cfg(test)]
 mod bundle_parity_tests;
 mod bundles;
@@ -16,6 +19,9 @@ mod shared_document;
 #[cfg(test)]
 mod shared_document_parity_tests;
 mod state;
+mod transaction;
+#[cfg(test)]
+mod transaction_parity_tests;
 mod trust;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -218,6 +224,7 @@ pub struct Cli {
     pub project_root: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub adopt: bool,
+    pub trust: Vec<String>,
     pub json: bool,
     action: lifecycle::Action,
 }
@@ -299,6 +306,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
     let mut project_root = None;
     let mut state_dir = default_state_dir()?;
     let mut adopt = false;
+    let mut trust = Vec::new();
     let mut json = false;
     let mut components = Vec::new();
     while let Some(option) = args.next() {
@@ -324,7 +332,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
                 // Path-only resources never consume activation grants. Keep
                 // Python's repeatable opaque-token parsing; executable selections
                 // remain rejected below, rather than accepting unused authority.
-                let _ = args.next().ok_or("--trust requires a value")?;
+                trust.push(args.next().ok_or("--trust requires a value")?);
             }
             "--adopt" if action != lifecycle::Action::Uninstall => adopt = true,
             "--json" => json = true,
@@ -332,7 +340,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         }
     }
     let target = SkillsTarget::parse(&target.ok_or("--target is required")?)?;
-    if profile != "pstack" {
+    if profile != "pstack" && activation::Policy::for_target(target).is_none() {
         return Err(format!(
             "unsupported profile for Rust parity unit: {profile}"
         ));
@@ -340,7 +348,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
     if components.iter().any(|component| {
         !matches!(
             component.as_str(),
-            "skills" | "agents" | "rules" | "commands"
+            "skills" | "agents" | "rules" | "commands" | "hooks" | "mcp"
         )
     }) {
         return Err("Rust parity unit supports only path components".into());
@@ -356,6 +364,12 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
                     "agents" => Ok(ComponentKind::Agents),
                     "rules" => Ok(ComponentKind::Rules),
                     "commands" => Ok(ComponentKind::Commands),
+                    "hooks" if activation::Policy::for_target(target).is_some() => {
+                        Ok(ComponentKind::Hooks)
+                    }
+                    "mcp" if activation::Policy::for_target(target).is_some() => {
+                        Ok(ComponentKind::Mcp)
+                    }
                     _ => Err("Rust parity unit supports only path components".into()),
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -373,6 +387,7 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         project_root,
         state_dir,
         adopt,
+        trust,
         json,
         action,
     })
@@ -978,6 +993,9 @@ pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
         });
     }
     let cli = parse_cli(args)?;
+    if activation::Policy::for_target(cli.target).is_some() {
+        return activation::run(&cli);
+    }
     let (operations, conflicts) = lifecycle::run(&cli)?;
     Ok(CommandOutput {
         stdout: operations_json(&operations)? + "\n",

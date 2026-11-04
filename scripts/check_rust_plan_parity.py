@@ -1172,25 +1172,29 @@ def state_wire_rows(base: Path) -> None:
     print(f"state wire parity: {len(expected)} strict v2/v3/v4 cases match")
 
 
-def state_v4_fail_closed(base: Path) -> None:
-    side = Side("rust", base / "v4-fail-closed", "cursor")
-    seed_v2(side)
-    state = v2_state(side)
-    state.update(schemaVersion=4, slots={}, destinationRoots={"skills": str(side.destination)})
-    entries = state["entries"]
-    assert isinstance(entries, dict)
-    entry = entries["skill:example"]
-    assert isinstance(entry, dict)
-    entry.update(component="skills", resourceKind="directory-symlink", sourceRepository=str(side.root))
-    side.state_file.write_text(json.dumps(state), encoding="utf-8")
-    before = side.state_file.read_bytes()
-    target = os.readlink(side.destination / "example")
-    for action in ("plan", "status", "trust", "install", "uninstall"):
-        result = side.command(action)
-        assert result.returncode == 2 and "v4 executable lifecycle is not supported" in result.stderr, result
-        assert side.state_file.read_bytes() == before
-        assert os.readlink(side.destination / "example") == target
-    print("state v4 lifecycle: plan/status/install/uninstall fail closed without mutation")
+def state_v4_public_lifecycle(base: Path) -> None:
+    for target in ('cursor', 'claude'):
+        py, rs = pair(base, 'v4-public-lifecycle', target)
+        for side in (py, rs):
+            seed_v2(side)
+            state = v2_state(side)
+            state.update(schemaVersion=4, slots={}, destinationRoots={'skills': str(side.destination)})
+            entries = state['entries']
+            assert isinstance(entries, dict)
+            entry = entries['skill:example']
+            assert isinstance(entry, dict)
+            entry.update(component='skills', resourceKind='directory-symlink', sourceRepository=str(side.root))
+            side.state_file.write_text(json.dumps(state), encoding='utf-8')
+        for action in ('plan', 'status', 'trust', 'install', 'uninstall'):
+            before = [trust_snapshot(side.base) for side in (py, rs)]
+            compare(f'v4 {target} {action}', py, rs, py.command(action), rs.command(action))
+            if action in ('plan', 'status', 'trust'):
+                assert before == [trust_snapshot(side.base) for side in (py, rs)]
+            if py.state_file.exists():
+                compare_state(f'v4 {target} {action}', py, rs)
+            else:
+                assert not rs.state_file.exists()
+    print('state v4 public lifecycle: Cursor/Claude plan/status/trust/install/uninstall output, state bytes/modes and read-only inspection match')
 
 
 def trust_contract_rows(base: Path) -> None:
@@ -1449,8 +1453,8 @@ def trust_inspection_rows(base: Path) -> None:
     print(f"trust inspection parity: {len(rows)} dependency-bound pending-journal cases match without writes")
 
 
-def trust_cli_fail_closed(base: Path) -> None:
-    side = Side("rust", base / "trust-cli-rejection", "cursor")
+def trust_cli_contract(base: Path) -> None:
+    side = Side("rust", base / "trust-cli-rejection", "codex")
     rejection_before = trust_snapshot(side.base)
     token = "aw-trust-v1:" + "a" * 64
     # "trust" is read-only planning on non-executable resources; grants are
@@ -1485,7 +1489,7 @@ def trust_cli_fail_closed(base: Path) -> None:
         snapshots = [trust_snapshot(side.base) for side in (py, rs)]
         compare("trust pending journal", py, rs, py.command("trust"), rs.command("trust"))
         assert [trust_snapshot(side.base) for side in (py, rs)] == snapshots
-    side = Side("rust", base / "trust-cli-rejection", "cursor", initialize=False)
+    side = Side("rust", base / "trust-cli-rejection", "codex", initialize=False)
     for action, args in (("trust", ("--component", "hooks")),
                          ("trust", ("--component", "mcp", "--trust", token)),
                          ("install", ("--component", "hooks")),
@@ -1494,7 +1498,7 @@ def trust_cli_fail_closed(base: Path) -> None:
         result = side.command(action, *args)
         assert result.returncode == 2, result
         assert trust_snapshot(side.base) == rejection_before, "unsupported activation mutated fixtures"
-    print("trust CLI: six-target skills exits/output/typed snapshots match; activation remains fail-closed")
+    print("trust CLI: six-target skills exits/output/typed snapshots match; unsupported Codex activation remains fail-closed")
 
 
 def trust_snapshot(base: Path):
@@ -2019,6 +2023,567 @@ def shared_reference_rows(base: Path) -> None:
     print(f'shared hook references: {len(rows)} native/foreign bundle removal guards match')
 
 
+def transaction_publication_rows(base: Path) -> None:
+    """D5 primitive tracer; not evidence for activation apply/recover."""
+    from agent_workbench import shared_config as shared, bundles
+    from unittest.mock import patch
+    base.mkdir(parents=True)
+    rows, expected, pairs = [], [], []
+    scenarios = ('replace', 'create', 'remove', 'stale', 'before-capture',
+                 'before-publish', 'fail-file-sync', 'fail-parent-sync', 'fail-capture-sync',
+                 'fail-evidence-sync', 'fail-cleanup-sync', 'fail-entry-delete', 'fail-quarantine-remove')
+    for scenario in scenarios:
+        pair = []
+        for implementation in ('python', 'rust'):
+            case = base / scenario / implementation
+            case.mkdir(parents=True)
+            path = case / 'document.json'
+            if scenario != 'create':
+                path.write_bytes(b'{"before":true}\n'); path.chmod(0o640)
+            pair.append(case)
+        py, rs = pair
+        path = py / 'document.json'
+        snapshot = shared.snapshot(path)
+        if scenario == 'stale': path.write_bytes(b'{"foreign":true}\n')
+        parent = bundles.open_directory(py)
+        rename, sync = bundles.rename_new, os.fsync
+        def rename_new(source, destination, fd, destination_fd=None):
+            if scenario == 'before-capture' and source == 'document.json':
+                path.write_bytes(b'{"foreign":true}\n')
+            if scenario == 'before-publish' and source == 'new':
+                path.write_bytes(b'{"foreign":true}\n')
+            return rename(source, destination, fd, destination_fd)
+        sync_count = 0
+        def fsync(fd):
+            nonlocal sync_count
+            sync_count += 1
+            failure = {'fail-capture-sync': 1, 'fail-evidence-sync': 2,
+                       'fail-file-sync': 3, 'fail-parent-sync': 4, 'fail-cleanup-sync': 5}.get(scenario)
+            if sync_count == failure:
+                raise OSError('injected sync failure')
+            return sync(fd)
+        unlink, rmdir = os.unlink, os.rmdir
+        def unlink_entry(name, *args, **kwargs):
+            if scenario == 'fail-entry-delete' and name == 'entry':
+                raise OSError('injected evidence deletion failure')
+            return unlink(name, *args, **kwargs)
+        def rmdir_quarantine(name, *args, **kwargs):
+            if scenario == 'fail-quarantine-remove' and name == 'q':
+                raise OSError('injected quarantine removal failure')
+            return rmdir(name, *args, **kwargs)
+        try:
+            with patch.object(bundles, 'rename_new', rename_new), patch.object(shared.os, 'fsync', fsync), patch.object(shared.os, 'unlink', unlink_entry), patch.object(shared.os, 'rmdir', rmdir_quarantine):
+                value = shared.compare_replace_document(snapshot, None if scenario == 'remove' else b'{"after":true}\n', parent, 'q')
+            expected.append({'accepted': True, 'content': list(value.content) if value.content is not None else None})
+        except (OSError, ValueError) as error:
+            expected.append({'accepted': False, 'error_class': 'ValueError' if isinstance(error, ValueError) else 'OSError'})
+        finally:
+            os.close(parent)
+        rows.append({'case': str(rs), 'scenario': scenario})
+        pairs.append(pair)
+    (base / 'rows.json').write_text(json.dumps(rows))
+    result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'transaction_parity_tests::differential_publication', '--', '--ignored', '--exact'], {'AW_TRANSACTION_BASE': str(base)}, umask=0o022)
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads((base / 'results.json').read_text())
+    assert actual == expected, f'publication results mismatch: {[(r,e,a) for r,e,a in zip(rows,expected,actual) if e != a]!r}'
+    for row, (py, rs) in zip(rows, pairs):
+        assert bundle_snapshot(py) == bundle_snapshot(rs), (row, bundle_snapshot(py), bundle_snapshot(rs))
+    print(f'transaction publication parity: {len(rows)} capture/stale/noreplace/fsync rows match')
+
+
+def transaction_journal_rows(base: Path) -> None:
+    """Authenticate a real interrupted Python lifecycle, not fabricated plan data."""
+    from agent_workbench import shared_config as shared, transactions, installation
+    from unittest.mock import patch
+    sys.path.insert(0, str(REPOSITORY / 'tests'))
+    from test_activation import ActivationTests
+    base.mkdir(parents=True)
+    fixture = ActivationTests()
+    fixture.setUp()
+    try:
+        plan = fixture.trusted()
+        original = shared.replace_document
+        def interrupt(path, content, fd):
+            original(path, content, fd)
+            if path.name == '.agent-workbench-transaction.json':
+                raise KeyboardInterrupt('durable journal before first activation mutation')
+        with patch.object(shared, 'replace_document', interrupt):
+            try: installation.apply_plan(plan)
+            except KeyboardInterrupt: pass
+            else: raise AssertionError('interruption not reached')
+        journal = fixture.hook_config.parent / '.agent-workbench-transaction.json'
+        saved = journal.read_bytes()
+        record = json.loads(saved)
+        rows, expected = [], []
+        variants = [('valid', saved, plan.state_file),
+                    ('reformatted', json.dumps(record, sort_keys=True).encode(), plan.state_file),
+                    ('wrong-profile', saved, plan.state_file.with_name('other.json')),
+                    ('duplicate', b'{"version":1,' + saved[1:], plan.state_file)]
+        for field in record:
+            changed = dict(record)
+            changed[field] = 'tampered'
+            variants.append(('tampered-' + field, shared.encode(changed), plan.state_file))
+        for label, content, file in variants:
+            try:
+                transactions._journal_record(content, file)
+                expected.append({'accepted': True})
+            except (OSError, ValueError):
+                expected.append({'accepted': False, 'error_class': 'ValueError'})
+            rows.append({'mode': 'journal', 'label': label, 'content': list(content), 'file': str(file)})
+        before = bundle_snapshot(fixture.base)
+        (base / 'rows.json').write_text(json.dumps(rows))
+        result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'transaction_parity_tests::differential_publication', '--', '--ignored', '--exact'], {'AW_TRANSACTION_BASE': str(base)})
+        assert result.returncode == 0, result.stdout + result.stderr
+        actual = json.loads((base / 'results.json').read_text())
+        assert actual == expected, f'journal mismatch: {[(r["label"],e,a) for r,e,a in zip(rows,expected,actual) if e != a]!r}'
+        assert bundle_snapshot(fixture.base) == before, 'authentication must be read-only'
+        # Exercise the real Python recovery entry point after the durable split.
+        roots = {component: Path(root) for component, root in plan.next_state.destination_roots.items()}
+        with installation._state_lock(plan.state_file), transactions._document_lock(journal.parent, False):
+            transactions._recover_locked(plan.state_file, roots)
+        assert not journal.exists() and not fixture.bundle.exists() and not fixture.hook_config.exists()
+        print(f'transaction journal authentication: {len(rows)} actual plan/apply-interrupt/tamper rows match (Python recovery only)')
+    finally:
+        fixture.doCleanups()
+
+
+def transaction_recovery_rows(base: Path) -> None:
+    """Real interrupted install/uninstall recovery at pinned identical lexical roots."""
+    from agent_workbench import transactions, installation, shared_config as shared
+    from agent_workbench.model import ComponentKind as C
+    from unittest.mock import patch
+    import hashlib
+    sys.path.insert(0, str(REPOSITORY / 'tests'))
+    from test_activation import ActivationTests
+    base.mkdir(parents=True)
+    scenarios = ('success', 'prior-state', 'foreign-document', 'foreign-state',
+                 'prefix', 'bad-prefix', 'captured', 'state-captured', 'symlink-evidence',
+                 'foreign-evidence', 'parent-swap', 'late-state', 'late-document',
+                 'interrupt-deactivate', 'interrupt-restore', 'interrupt-state', 'interrupt-cleanup',
+                 'interrupt-prepare-sync', 'interrupt-prepare-publish', 'unauthenticated',
+                 'document-outside', 'parent-outside', 'missing-parent', 'quarantine-invalid',
+                 'base64-invalid', 'state-lock-held', 'document-lock-held', 'reauthenticate', 'late-parent-swap')
+    from test_claude_activation import ClaudeActivationTests
+    jobs = [('cursor', False, scenario) for scenario in scenarios]
+    managed_scenarios = ('install', 'uninstall', 'interrupt-deactivate', 'interrupt-restore',
+                         'interrupt-state', 'interrupt-cleanup', 'unknown-fields', 'base64-alias',
+                         'legacy-parents', 'foreign-path', 'resource-parent-swap',
+                         'interrupt-path', 'late-capture', 'resource-quarantine', 'staged-partial',
+                         'state-parent-swap', 'parent-swap', 'late-parent-swap', 'late-state',
+                         'unauthenticated', 'reauthenticate')
+    jobs += [(target, True, scenario) for target in ('cursor', 'claude') for scenario in managed_scenarios]
+    for target, managed, scenario in jobs:
+        fixture = (ActivationTests if target == 'cursor' else ClaudeActivationTests)(); fixture.setUp()
+        held = None
+        try:
+            # A real previous install supplies nonempty prior ownership + documents.
+            if scenario in ('prior-state', 'interrupt-restore', 'captured', 'interrupt-prepare-sync', 'interrupt-prepare-publish'):
+                installation.apply_plan(fixture.trusted((C.MCP,)))
+                source = fixture.fixture.root / 'plugins/sample/mcp.json'
+                source.write_text(source.read_text().replace('https://', 'https://changed.'))
+                # Not all fixtures use HTTP servers; change the selected JSON slot.
+                data = json.loads(source.read_text())
+                slot = next(iter(data['mcpServers'].values()))
+                slot['env'] = {'TRACER': 'new-value'}
+                source.write_text(json.dumps(data))
+            components = (C.HOOKS, C.MCP) if managed else (C.MCP,)
+            if scenario in ('uninstall', 'interrupt-restore', 'resource-quarantine', 'staged-partial') and managed:
+                installation.apply_plan(fixture.trusted(components))
+                plan = fixture.uninstall()
+            else:
+                plan = fixture.trusted(components)
+            unlink = os.unlink
+            def interrupt(name, *args, **kwargs):
+                if name == '.agent-workbench-transaction.json':
+                    raise KeyboardInterrupt('after documents, ledger and ownership publication')
+                return unlink(name, *args, **kwargs)
+            with patch.object(transactions.os, 'unlink', interrupt):
+                try:
+                    (installation.apply_uninstall if managed and scenario in ('uninstall', 'interrupt-restore', 'resource-quarantine', 'staged-partial') else installation.apply_plan)(plan)
+                except KeyboardInterrupt: pass
+                else: raise AssertionError('real apply interruption not reached')
+            roots = {c: Path(p) for c, p in plan.next_state.destination_roots.items()}
+            journal = transactions._journal_path(roots, target)
+            record = json.loads(journal.read_bytes())
+            assert bool(record['paths']) == managed
+            item = next(item for item in record['documents'] if item['path'] == str(fixture.mcp_config))
+            document = fixture.mcp_config
+            if scenario in ('unknown-fields', 'base64-alias', 'legacy-parents'):
+                import base64, hmac
+                if scenario == 'unknown-fields':
+                    record['foreign'] = {'safe': True}; item['extra'] = 7
+                if scenario == 'legacy-parents': record.pop('parents')
+
+                if scenario == 'base64-alias':
+                    # Python validate=True accepts nonzero unused padding bits.
+                    alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+                    image = item['after']
+                    if not image.endswith('='):
+                        raw = base64.b64decode(image) + b' '
+                        image = base64.b64encode(raw).decode()
+                        document.write_bytes(raw)
+                    index = -3 if image.endswith('==') else -2
+                    image = image[:index] + alphabet[alphabet.index(image[index]) + 1] + image[index + 1:]
+                    assert base64.b64decode(image, validate=True) == document.read_bytes()
+                    item['after'] = image
+                record.pop('mac')
+                record['mac'] = hmac.new(transactions._journal_key(plan.state_file), transactions._canonical(record), hashlib.sha256).hexdigest()
+                journal.write_bytes(shared.encode(record))
+            if scenario == 'foreign-path': (fixture.bundle / 'stop.sh').write_bytes(b'foreign-resource')
+            if scenario == 'resource-parent-swap':
+                root = fixture.bundle.parent; root.rename(root.with_name('detached-resource')); root.mkdir()
+                (root / 'foreign').write_bytes(b'outside lock')
+            if scenario == 'state-parent-swap':
+                root = plan.state_file.parent; detached = root.with_name('detached-state')
+                root.rename(detached); root.mkdir()
+                for p in detached.iterdir():
+                    if p.is_file():
+                        (root / p.name).write_bytes(p.read_bytes()); (root / p.name).chmod(p.stat().st_mode & 0o777)
+            if scenario in ('resource-quarantine', 'staged-partial'):
+                resource_item = record['paths'][0]
+                root = Path(resource_item['path']).parent
+                q = resource_item['quarantine']
+                fd_resource = transactions.bundles.open_directory(root)
+                try:
+                    if scenario == 'resource-quarantine':
+                        (root / q).mkdir(mode=0o700)
+                        qfd = transactions.bundles.open_directory(root / q)
+                        try: transactions.bundles.write_tree('entry', qfd, transactions._tree(resource_item['before']['tree']))
+                        finally: os.close(qfd)
+                        next(p for p in (root / q / 'entry').rglob('*') if p.is_file()).unlink()
+                    else:
+                        transactions.bundles.write_tree(q + '-rollback-tree', fd_resource, transactions._tree(resource_item['before']['tree']))
+                        next(p for p in (root / (q + '-rollback-tree')).rglob('*') if p.is_file()).unlink()
+                finally: os.close(fd_resource)
+            if scenario == 'foreign-document': document.write_bytes(b'{"foreign":true}\n')
+            if scenario == 'foreign-state': plan.state_file.write_bytes(b'{"foreign":true}\n')
+            if scenario in ('prefix', 'bad-prefix', 'captured', 'foreign-evidence', 'symlink-evidence', 'interrupt-prepare-sync', 'interrupt-prepare-publish'):
+                q = document.parent / (item['quarantine'] + '-activate'); q.mkdir(mode=0o700)
+                if scenario in ('captured', 'interrupt-prepare-sync', 'interrupt-prepare-publish'): document.rename(q / 'entry')
+                elif scenario == 'foreign-evidence': (q / 'foreign').write_bytes(b'keep')
+                elif scenario == 'symlink-evidence': (q / 'new').symlink_to(plan.state_file)
+                else: (q / 'new').write_bytes(b'BAD' if scenario == 'bad-prefix' else document.read_bytes()[:7])
+            if scenario == 'state-captured':
+                q = plan.state_file.parent / ('.agent-workbench-document-' + hashlib.sha256(str(plan.state_file).encode()).hexdigest()[:16] + '-activate')
+                q.mkdir(mode=0o700); plan.state_file.rename(q / 'entry')
+            if scenario == 'parent-swap':
+                config = journal.parent
+                detached = config.with_name('detached')
+                config.rename(detached); config.mkdir()
+                for p in detached.iterdir():
+                    if p.is_file(): (config / p.name).write_bytes(p.read_bytes()); (config / p.name).chmod(p.stat().st_mode & 0o777)
+            if scenario == 'unauthenticated':
+                record['mac'] = '0' * 64; journal.write_bytes(shared.encode(record))
+                # Authentication must not create either missing lock file.
+                for lock in (journal.parent / '.agent-workbench.lock', plan.state_file.with_name('.' + plan.state_file.name + '.lock')):
+                    lock.unlink(missing_ok=True)
+            if scenario in ('document-outside', 'parent-outside', 'missing-parent', 'quarantine-invalid', 'base64-invalid'):
+                import hmac
+                if scenario == 'document-outside': item['path'] = str(fixture.base / 'outside.json')
+                if scenario == 'parent-outside':
+                    info = fixture.base.stat(); record['parents'][str(fixture.base)] = [info.st_dev, info.st_ino]
+                if scenario == 'missing-parent': record['parents'].pop(str(plan.state_file.parent))
+                if scenario == 'quarantine-invalid': item['quarantine'] = '../foreign'
+                if scenario == 'base64-invalid': item['before'] = '!'
+                record.pop('mac')
+                record['mac'] = hmac.new(transactions._journal_key(plan.state_file), transactions._canonical(record), hashlib.sha256).hexdigest()
+                journal.write_bytes(shared.encode(record))
+            held = None
+            if scenario in ('state-lock-held', 'document-lock-held'):
+                import fcntl
+                lock = plan.state_file.with_name('.' + plan.state_file.name + '.lock') if scenario == 'state-lock-held' else journal.parent / '.agent-workbench.lock'
+                held = os.open(lock, os.O_RDWR); fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            initial = bundle_snapshot(fixture.base)
+            initial_dirs = {p: p.stat().st_mode & 0o777 for p in fixture.base.rglob('*') if p.is_dir()}
+            saved_files = {p: (p.read_bytes(), p.stat().st_mode & 0o777) for p in fixture.base.rglob('*') if p.is_file() and not p.is_symlink()}
+            saved_links = {p: os.readlink(p) for p in fixture.base.rglob('*') if p.is_symlink()}
+            original_compare, original_prepare, original_sync, original_rename = shared.compare_replace_document, transactions._prepare_document_recovery, os.fsync, transactions.bundles.rename_new
+            hit = False
+            def compare(current, content, fd, quarantine):
+                nonlocal hit
+                value = original_compare(current, content, fd, quarantine)
+                if not hit and ((scenario == 'interrupt-deactivate' and quarantine.endswith('-recover-remove')) or (scenario == 'interrupt-restore' and quarantine.endswith('-recover-before'))):
+                    hit = True; raise OSError('interrupted after durable document recovery publication')
+                if not hit and scenario == 'late-state':
+                    hit = True; plan.state_file.write_bytes(b'{"foreign":true}\n')
+                return value
+            def prepare(item, current, fd):
+                nonlocal hit
+                if not hit and scenario == 'late-document':
+                    hit = True; current.path.write_bytes(b'{"foreign":true}\n')
+                if not hit and scenario == 'interrupt-state' and current.path == plan.state_file:
+                    hit = True; raise OSError('interrupted before ownership restoration')
+                return original_prepare(item, current, fd)
+            def fsync(fd):
+                nonlocal hit
+                if not hit and scenario == 'interrupt-prepare-sync' and os.fstat(fd).st_mode & 0o170000 == 0o100000:
+                    hit = True; raise OSError('interrupted recovery staging fsync')
+                return original_sync(fd)
+            def rename(source, destination, fd, destination_fd=None):
+                nonlocal hit
+                if not hit and scenario == 'late-capture' and source == fixture.bundle.name:
+                    hit = True; (fixture.bundle / 'stop.sh').write_bytes(b'foreign-resource')
+                if not hit and scenario == 'interrupt-prepare-publish' and source == 'recovery':
+                    hit = True; raise OSError('interrupted recovery publication')
+                return original_rename(source, destination, fd, destination_fd)
+            from contextlib import contextmanager
+            original_lock = transactions._document_lock
+            original_snapshot = shared.snapshot
+            def snapshot(path, fd=None):
+                nonlocal hit
+                value = original_snapshot(path, fd)
+                if not hit and scenario == 'late-parent-swap' and str(path) == record['documents'][-1]['path']:
+                    hit = True
+                    config = journal.parent; config.rename(config.with_name('detached'))
+                    config.mkdir(); (config / 'foreign').write_bytes(b'outside lock')
+                return value
+            @contextmanager
+            def document_lock(*args, **kwargs):
+                with original_lock(*args, **kwargs):
+                    if scenario == 'reauthenticate':
+                        changed = json.loads(journal.read_bytes()); changed['mac'] = '0' * 64
+                        journal.write_bytes(shared.encode(changed))
+                    yield
+            def cleanup(name, *args, **kwargs):
+                nonlocal hit
+                if not hit and scenario == 'interrupt-cleanup' and name == journal.name:
+                    hit = True; raise OSError('interrupted final journal cleanup')
+                return unlink(name, *args, **kwargs)
+            def python_recover():
+                try:
+                    transactions.recover(plan.state_file, roots, target)
+                    return {'accepted': True}
+                except (OSError, ValueError) as error:
+                    return {'accepted': False, 'error_class': 'ValueError' if isinstance(error, ValueError) else 'FileExistsError' if isinstance(error, FileExistsError) else 'OSError'}
+            original_restore = transactions._restore_path
+            def restore(*args, **kwargs):
+                nonlocal hit
+                value = original_restore(*args, **kwargs)
+                if not hit and scenario == 'interrupt-path':
+                    hit = True; raise OSError('interrupted after path restoration')
+                return value
+            with patch.object(transactions, '_restore_path', restore), patch.object(transactions.os, 'unlink', cleanup), patch.object(shared, 'snapshot', snapshot), patch.object(transactions, '_document_lock', document_lock), patch.object(shared, 'compare_replace_document', compare), patch.object(transactions, '_prepare_document_recovery', prepare), patch.object(transactions.os, 'fsync', fsync), patch.object(transactions.bundles, 'rename_new', rename):
+                expected = python_recover()
+            py_snapshot = bundle_snapshot(fixture.base)
+            retry_expected = retry_snapshot = None
+            if scenario.startswith('interrupt-'):
+                assert hit and expected == {'accepted': False, 'error_class': 'OSError'}, (scenario, expected)
+                retry_expected = python_recover(); assert retry_expected == {'accepted': True}
+                retry_snapshot = bundle_snapshot(fixture.base)
+            # Restore files only: authenticated parent identities remain unchanged.
+            if scenario == 'late-parent-swap':
+                assert hit and not expected['accepted'], (target, managed, expected)
+                config = journal.parent; (config / 'foreign').unlink(); config.rmdir()
+                config.with_name('detached').rename(config)
+            for p in sorted(fixture.base.rglob('*'), key=lambda p: len(p.parts), reverse=True):
+                if held is not None and p == lock: continue
+                if p.is_symlink() or p.is_file(): p.unlink()
+                elif p.is_dir() and p not in initial_dirs: p.rmdir()
+            for p in sorted(initial_dirs, key=lambda p: len(p.parts)):
+                if not p.exists(): p.mkdir(mode=initial_dirs[p])
+                p.chmod(initial_dirs[p])
+            for p, (content, mode) in saved_files.items(): p.write_bytes(content); p.chmod(mode)
+            for p, link_target in saved_links.items(): p.symlink_to(link_target)
+            assert bundle_snapshot(fixture.base) == initial
+            row = {'mode': 'recover', 'file': str(plan.state_file), 'document': str(document), 'target': target, 'roots': {c.value: str(p) for c,p in roots.items()}, 'scenario': scenario,
+                   'resource': record['paths'][0]['path'] if managed else None, 'journal': str(journal)}
+            def rust_recover(row):
+                (base / 'rows.json').write_text(json.dumps([row]))
+                result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'transaction_parity_tests::differential_publication', '--', '--ignored', '--exact'], {'AW_TRANSACTION_BASE': str(base)})
+                assert result.returncode == 0, result.stdout + result.stderr
+                return json.loads((base / 'results.json').read_text())[0]
+            actual = rust_recover(row)
+            assert actual == expected, (scenario, expected, actual)
+            assert bundle_snapshot(fixture.base) == py_snapshot, (scenario, py_snapshot, bundle_snapshot(fixture.base))
+            if retry_expected is not None:
+                interrupted_dirs = {p: p.stat().st_mode & 0o777 for p in fixture.base.rglob('*') if p.is_dir()}
+                interrupted_files = {p: (p.read_bytes(), p.stat().st_mode & 0o777) for p in fixture.base.rglob('*') if p.is_file()}
+                # Python can consume Rust-interrupted recovery evidence (handoff).
+                assert python_recover() == retry_expected
+                assert bundle_snapshot(fixture.base) == retry_snapshot, (scenario, 'Rust -> Python retry')
+                # The same Rust-interrupted evidence must also be retryable by Rust.
+                for p in sorted(fixture.base.rglob('*'), key=lambda p: len(p.parts), reverse=True):
+                    if p.is_file(): p.unlink()
+                    elif p.is_dir() and p not in interrupted_dirs: p.rmdir()
+                for p, mode in sorted(interrupted_dirs.items(), key=lambda pair: len(pair[0].parts)):
+                    if not p.exists(): p.mkdir(mode=mode)
+                for p, (content, mode) in interrupted_files.items(): p.write_bytes(content); p.chmod(mode)
+                assert rust_recover(dict(row, scenario='success')) == retry_expected
+                assert bundle_snapshot(fixture.base) == retry_snapshot, (scenario, 'Rust -> Rust retry')
+            elif actual['accepted']:
+                assert not journal.exists()
+                assert rust_recover(dict(row, scenario='success')) == {'accepted': True}
+                if scenario == 'success' and not managed:
+                    import copy, hmac
+                    for gate in ('nonempty-paths', 'missing-image', 'duplicate-document', 'duplicate-quarantine', 'document-path-alias', 'parent-path-alias'):
+                        changed = copy.deepcopy(record); changed.pop('mac')
+                        if gate == 'nonempty-paths': changed['paths'] = [{'path': str(fixture.base / 'unimplemented-resource')}]
+
+                        if gate == 'missing-image': changed['documents'][0].pop('before')
+                        if gate == 'duplicate-document': changed['documents'].append(copy.deepcopy(changed['documents'][0]))
+                        if gate == 'duplicate-quarantine': changed['documents'][1]['quarantine'] = changed['documents'][0]['quarantine']
+                        if gate == 'document-path-alias':
+                            path = Path(changed['documents'][0]['path']); changed['documents'][0]['path'] = str(path.parent) + '/./' + path.name
+                        if gate == 'parent-path-alias':
+                            path = next(iter(changed['parents'])); changed['parents'][path + '/.'] = changed['parents'].pop(path)
+                        changed['mac'] = hmac.new(transactions._journal_key(plan.state_file), transactions._canonical(changed), hashlib.sha256).hexdigest()
+                        journal.write_bytes(shared.encode(changed))
+                        before_gate = bundle_snapshot(fixture.base)
+                        assert rust_recover(dict(row, scenario='success')) == {'accepted': False, 'error_class': 'ValueError'}, gate
+                        assert bundle_snapshot(fixture.base) == before_gate, (gate, 'rejected intent must not mutate')
+                    journal.unlink()
+        finally:
+            if held is not None: os.close(held)
+            fixture.doCleanups()
+    print(f'transaction recovery parity: {len(jobs)} real apply/document/path/ledger/state/evidence/retry rows match; Rust -> Python interrupted recovery handoff')
+
+
+def transaction_durable_rows(base: Path) -> None:
+    """Sequential replay at identical paths: no journal byte normalization."""
+    from agent_workbench import transactions, shared_config as shared, bundles
+    from unittest.mock import patch
+    import fcntl
+    base.mkdir(parents=True)
+    scenarios = [('key', s) for s in ('new', 'existing', 'public', 'short', 'symlink', 'hardlink', 'fifo', 'directory', 'key-create', 'key-chmod', 'key-entropy', 'key-write', 'key-sync', 'key-parent-sync')]
+    scenarios += [('write-journal', s) for s in ('success', 'stage-write', 'stage-sync', 'rename', 'parent-sync')]
+    scenarios += [('lock', s) for s in ('new', 'existing', 'symlink', 'fifo', 'directory', 'contended', 'missing-read', 'missing-create', 'root-swap')]
+    for mode, scenario in scenarios:
+        case = base / (mode + '-' + scenario)
+        case.mkdir()
+        file = case / 'state.json'
+        key = case / '.state.json.transaction-key'
+        config = case / 'config'
+        config.mkdir()
+        lock = config / '.agent-workbench.lock'
+        journal = config / '.agent-workbench-transaction.json'
+        # Use the adapter's actual lock name, not a guessed fixture token.
+        from agent_workbench.adapters.activation import ACTIVATION_POLICIES
+        lock = config / ACTIVATION_POLICIES['cursor'].lock_name
+        def setup():
+            if mode == 'key':
+                if scenario in ('existing', 'public', 'short', 'hardlink'):
+                    key.write_bytes(bytes(range(31 if scenario == 'short' else 32)))
+                    key.chmod(0o644 if scenario == 'public' else 0o600)
+                    if scenario == 'hardlink': os.link(key, case / 'other')
+                elif scenario == 'symlink': key.symlink_to('absent')
+                elif scenario == 'fifo': os.mkfifo(key)
+                elif scenario == 'directory': key.mkdir()
+            elif mode == 'write-journal':
+                key.write_bytes(bytes(range(32))); key.chmod(0o600)
+                journal.write_bytes(b'{"old":true}\n')
+            else:
+                if scenario in ('existing', 'contended'): lock.write_bytes(b'foreign lock bytes'); lock.chmod(0o644)
+                elif scenario == 'symlink': lock.symlink_to('absent')
+                elif scenario == 'fifo': os.mkfifo(lock)
+                elif scenario == 'directory': lock.mkdir()
+                elif scenario.startswith('missing-'): config.rmdir()
+        setup()
+        row: dict[str, object] = {'mode': mode, 'scenario': scenario, 'file': str(file), 'config': str(config), 'lock': lock.name}
+        record = {'version': 1, 'stateFile': str(file), 'parents': {str(config): [1, 2]}, 'stateBefore': None, 'stateAfter': None, 'documents': [], 'paths': []}
+        row['record_json'] = list(shared.encode(record))
+        held = None
+        if scenario == 'contended':
+            held = os.open(lock, os.O_RDWR); fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        real_sync, real_write, real_replace = os.fsync, os.write, os.replace
+        sync_count = 0
+        def sync(fd):
+            nonlocal sync_count
+            sync_count += 1
+            fail = {'key-sync': 1, 'key-parent-sync': 2, 'stage-sync': 1, 'parent-sync': 2}.get(scenario)
+            if sync_count == fail: raise OSError('injected sync failure')
+            return real_sync(fd)
+        try:
+            with patch.object(os, 'fsync', sync), patch.object(os, 'urandom', lambda n: bytes(range(n))):
+                if mode == 'key':
+                    # Buffered key write failure is injected at fdopen, before writing.
+                    original_fdopen = os.fdopen
+                    def fdopen(fd, *args, **kwargs):
+                        if scenario == 'key-write':
+                            os.close(fd); raise OSError('injected write failure')
+                        return original_fdopen(fd, *args, **kwargs)
+                    original_open = os.open
+                    hit = False
+                    def key_open(name, flags, *args, **kwargs):
+                        nonlocal hit
+                        if scenario == 'key-create' and flags & os.O_EXCL:
+                            hit = True
+                            raise OSError('injected exclusive create failure')
+                        return original_open(name, flags, *args, **kwargs)
+                    original_fchmod = os.fchmod
+                    def key_chmod(fd, mode):
+                        nonlocal hit
+                        if scenario == 'key-chmod':
+                            hit = True
+                            raise OSError('injected chmod failure')
+                        return original_fchmod(fd, mode)
+                    def entropy(n):
+                        nonlocal hit
+                        if scenario == 'key-entropy':
+                            hit = True
+                            raise OSError('injected entropy failure')
+                        return bytes(range(n))
+                    with patch.object(os, 'fdopen', fdopen), patch.object(os, 'open', key_open), patch.object(os, 'fchmod', key_chmod), patch.object(os, 'urandom', entropy):
+                        transactions._journal_key(file, True)
+                elif mode == 'write-journal':
+                    import hmac, hashlib
+                    record['mac'] = hmac.new(transactions._journal_key(file, True), transactions._canonical(record), hashlib.sha256).hexdigest()
+                    def replace(*args, **kwargs):
+                        if scenario == 'rename': raise OSError('injected rename failure')
+                        return real_replace(*args, **kwargs)
+                    original_fdopen = os.fdopen
+                    def stage_fdopen(out, *args, **kwargs):
+                        if scenario == 'stage-write':
+                            os.close(out); raise OSError('injected journal write failure')
+                        return original_fdopen(out, *args, **kwargs)
+                    with patch.object(os, 'replace', replace), patch.object(os, 'fdopen', stage_fdopen):
+                        fd = bundles.open_directory(config)
+                        try: shared.replace_document(journal, shared.encode(record), fd)
+                        finally: os.close(fd)
+                    del record['mac']
+                else:
+                    with transactions._document_lock(config, scenario != 'missing-read'):
+                        if scenario == 'root-swap':
+                            config.rename(case / 'detached')
+                            config.mkdir()
+                            (config / 'foreign').write_bytes(b'outside lock')
+            expected = {'accepted': True}
+        except (OSError, ValueError) as error:
+            expected = {'accepted': False, 'error_class': 'FileExistsError' if isinstance(error, FileExistsError) else 'ValueError' if isinstance(error, ValueError) else 'OSError'}
+        if 'mac' in record: del record['mac']
+        py_snapshot = bundle_snapshot(case)
+        # New random authority bytes are explicitly nondeterministic; preserve length/mode/kind.
+        def normalize(snapshot):
+            if mode == 'key' and scenario in ('new', 'key-sync', 'key-parent-sync') and key.exists():
+                value = snapshot.get(key.name)
+                if value is not None:
+                    assert len(value[-1]) == 32, (mode, scenario, 'authority key must remain exactly 32 bytes', value)
+                    value = list(value); value[-1] = '<random-32-byte-key>'; snapshot[key.name] = tuple(value)
+            return snapshot
+        py_snapshot = normalize(py_snapshot)
+        # Restore input tree, preserving contention descriptor while its inode is live.
+        if mode == 'key':
+            if key.is_dir(): key.rmdir()
+            elif key.exists() or key.is_symlink(): key.unlink()
+            if (case / 'other').exists(): (case / 'other').unlink()
+            setup()
+        elif mode == 'write-journal': journal.write_bytes(b'{"old":true}\n')
+        elif scenario == 'new': lock.unlink()
+        elif scenario == 'missing-create': lock.unlink(); config.rmdir()
+        elif scenario == 'root-swap':
+            (config / 'foreign').unlink(); config.rmdir()
+            (case / 'detached').rename(config)
+            lock.unlink()
+        (base / 'rows.json').write_text(json.dumps([row]))
+        result = run(['cargo', 'test', '--quiet', '--manifest-path', 'rust/Cargo.toml', '--lib', 'transaction_parity_tests::differential_publication', '--', '--ignored', '--exact'], {'AW_TRANSACTION_BASE': str(base)})
+        if held is not None: os.close(held)
+        assert result.returncode == 0, result.stdout + result.stderr
+        actual = json.loads((base / 'results.json').read_text())[0]
+        assert actual == expected, (mode, scenario, expected, actual)
+        rs_snapshot = normalize(bundle_snapshot(case))
+        assert rs_snapshot == py_snapshot, (mode, scenario, py_snapshot, rs_snapshot)
+    print(f'transaction durability parity: {len(scenarios)} key/journal/lock rows; exact journal bytes and typed filesystem effects match')
+
+
 def main() -> int:
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
@@ -2027,6 +2592,47 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
+            for script in ("check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
+                           "check_cursor_activation_recovery.py", "check_claude_activation_parity.py",
+                           "check_claude_activation_edges.py", "check_claude_activation_recovery.py",
+                           "check_claude_native_contract.py", "check_activation_inertness.py"):
+                activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
+                assert activation.returncode == 0, activation.stdout + activation.stderr
+                print(activation.stdout.strip())
+            inherited_activation = run([sys.executable, str(REPOSITORY / "rust/src/activation_contract.py")])
+            assert inherited_activation.returncode == 0, inherited_activation.stdout + inherited_activation.stderr
+            print(inherited_activation.stdout.strip())
+            path_recovery = run([sys.executable, str(REPOSITORY / "rust/src/transaction/path_contract.py")])
+            assert path_recovery.returncode == 0, path_recovery.stdout + path_recovery.stderr
+            print(path_recovery.stdout.splitlines()[-1])
+            apply = run([sys.executable, str(REPOSITORY / "rust/src/transaction/apply_contract.py")])
+            assert apply.returncode == 0, apply.stdout + apply.stderr
+            print(apply.stdout.splitlines()[-1])
+            recovery_order = run([sys.executable, str(REPOSITORY / "rust/src/transaction/recovery_order_contract.py")])
+            assert recovery_order.returncode == 0, recovery_order.stdout + recovery_order.stderr
+            print(recovery_order.stdout.splitlines()[-1])
+            exception = run([sys.executable, str(REPOSITORY / "rust/src/transaction/state_parent_contract.py")])
+            assert exception.returncode == 0, exception.stdout + exception.stderr
+            print(exception.stdout.splitlines()[-1])
+            cleanup_exception = run([sys.executable, str(REPOSITORY / "rust/src/transaction/stage_cleanup_contract.py")])
+            assert cleanup_exception.returncode == 0, cleanup_exception.stdout + cleanup_exception.stderr
+            print(cleanup_exception.stdout.splitlines()[-1])
+            wire = run([sys.executable, str(REPOSITORY / "rust/src/transaction/wire_contract.py")])
+            assert wire.returncode == 0, wire.stdout + wire.stderr
+            print(wire.stdout.splitlines()[-1])
+            authority = run([sys.executable, str(REPOSITORY / "rust/src/transaction/authority_contract.py")])
+            assert authority.returncode == 0, authority.stdout + authority.stderr
+            print(authority.stdout.splitlines()[-1])
+            capture = run([sys.executable, str(REPOSITORY / "rust/src/transaction/capture_contract.py")])
+            assert capture.returncode == 0, capture.stdout + capture.stderr
+            print(capture.stdout.splitlines()[-1])
+            recovery_persistence = run([sys.executable, str(REPOSITORY / "rust/src/transaction/recovery_persistence_contract.py")])
+            assert recovery_persistence.returncode == 0, recovery_persistence.stdout + recovery_persistence.stderr
+            print(recovery_persistence.stdout.splitlines()[-1])
+            transaction_durable_rows(base / "transaction-durable")
+            transaction_publication_rows(base / "transaction-publication")
+            transaction_journal_rows(base / "transaction-journals")
+            transaction_recovery_rows(base / "transaction-recovery")
             shared_document_rows(base / "shared-documents")
             shared_ownership_rows(base / "shared-ownership")
             shared_snapshot_rows(base / "shared-snapshots")
@@ -2037,9 +2643,9 @@ def main() -> int:
             trust_contract_rows(base / "trust")
             trust_proof_rows(base / "trust-proofs")
             trust_inspection_rows(base / "trust-inspection")
-            trust_cli_fail_closed(base)
+            trust_cli_contract(base)
             state_wire_rows(base / "state-wire")
-            state_v4_fail_closed(base)
+            state_v4_public_lifecycle(base)
             for target in TARGETS:
                 default_destination(base, target)
                 explicit_destination_expansion(base, target)

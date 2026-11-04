@@ -35,6 +35,7 @@ fn differential_copy_race() {
         project_root: Some(project.clone()),
         state_dir: base.join("state"),
         adopt: false,
+        trust: Vec::new(),
         json: true,
         action: Action::Install,
     };

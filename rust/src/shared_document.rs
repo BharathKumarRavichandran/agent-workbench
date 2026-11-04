@@ -9,7 +9,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::json;
-mod json;
+pub(crate) mod json;
 pub(crate) mod ownership;
 pub(crate) mod references;
 pub(crate) mod snapshot;

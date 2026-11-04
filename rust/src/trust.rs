@@ -204,31 +204,44 @@ pub(super) fn slots_granted<'a>(
             }))
 }
 
-fn read_key(file: &Path) -> Result<[u8; 32]> {
+pub(crate) fn read_key(file: &Path) -> Result<[u8; 32]> {
+    read_key_checked(file).map_err(|error| match error {
+        crate::shared_document::snapshot::Error::Io(error) => error.to_string(),
+        crate::shared_document::snapshot::Error::Invalid(error) => error,
+    })
+}
+
+pub(crate) fn read_key_checked(
+    file: &Path,
+) -> std::result::Result<[u8; 32], crate::shared_document::snapshot::Error> {
+    use crate::shared_document::snapshot::Error;
     use rustix::fs::{self as rfs, Mode, OFlags};
     use std::io::Read;
     use std::path::Component;
-    let parent = file.parent().ok_or("state file has no parent")?;
+    let invalid = |message: &str| Error::Invalid(message.into());
+    let io_error = |error: rustix::io::Errno| Error::Io(std::io::Error::from(error));
+    let parent = file
+        .parent()
+        .ok_or_else(|| invalid("state file has no parent"))?;
     if !parent.is_absolute()
         || parent
             .components()
             .any(|part| matches!(part, Component::ParentDir))
     {
-        return Err("directory must be absolute and contained".into());
+        return Err(invalid("directory must be absolute and contained"));
     }
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
-    let mut directory = rfs::open("/", flags, Mode::empty()).map_err(|e| e.to_string())?;
+    let mut directory = rfs::open("/", flags, Mode::empty()).map_err(io_error)?;
     for part in parent.components() {
         if let Component::Normal(name) = part {
-            directory =
-                rfs::openat(&directory, name, flags, Mode::empty()).map_err(|e| e.to_string())?;
+            directory = rfs::openat(&directory, name, flags, Mode::empty()).map_err(io_error)?;
         }
     }
     let name = format!(
         ".{}.transaction-key",
         file.file_name()
             .and_then(|s| s.to_str())
-            .ok_or("state filename is not UTF-8")?
+            .ok_or_else(|| invalid("state filename is not UTF-8"))?
     );
     let fd = rfs::openat(
         &directory,
@@ -236,23 +249,24 @@ fn read_key(file: &Path) -> Result<[u8; 32]> {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
-    .map_err(|e| e.to_string())?;
-    let info = rfs::fstat(&fd).map_err(|e| e.to_string())?;
+    .map_err(io_error)?;
+    let info = rfs::fstat(&fd).map_err(io_error)?;
+    // Python fdopen rejects a directory before its explicit key validation.
+    if rfs::FileType::from_raw_mode(info.st_mode).is_dir() {
+        return Err(io_error(rustix::io::Errno::ISDIR));
+    }
     if !rfs::FileType::from_raw_mode(info.st_mode).is_file()
         || info.st_mode & 0o7777 != 0o600
         || info.st_uid != rustix::process::getuid().as_raw()
         || info.st_nlink != 1
         || info.st_size != 32
     {
-        return Err("unsafe private transaction key".into());
+        return Err(invalid("unsafe private transaction key"));
     }
     let mut key = Vec::new();
-    std::fs::File::from(fd)
-        .take(33)
-        .read_to_end(&mut key)
-        .map_err(|e| e.to_string())?;
+    std::fs::File::from(fd).take(33).read_to_end(&mut key)?;
     key.try_into()
-        .map_err(|_| "unsafe private transaction key".into())
+        .map_err(|_| invalid("unsafe private transaction key"))
 }
 
 fn path_text(path: &Path) -> Result<String> {

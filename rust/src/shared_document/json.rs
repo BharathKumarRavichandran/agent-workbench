@@ -108,9 +108,9 @@ fn render(value: &Wire, pretty: bool, depth: usize) -> Result<String> {
         }
     })
 }
-pub(super) fn pretty(value: &Wire) -> Result<String> {
+pub(crate) fn pretty(value: &Wire) -> Result<String> {
     Ok(render(value, true, 0)? + "\n")
 }
-pub(super) fn canonical(value: &Wire) -> Result<String> {
+pub(crate) fn canonical(value: &Wire) -> Result<String> {
     render(value, false, 0)
 }

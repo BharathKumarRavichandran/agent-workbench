@@ -159,6 +159,11 @@ pub(super) fn load(path: &Path) -> Result<Option<State>> {
     decode::decode(&value, path).map(Some)
 }
 
+pub(super) fn decode_snapshot(bytes: &[u8], path: &Path) -> Result<State> {
+    let value = crate::shared_document::parse_bytes(bytes)?;
+    decode::decode(&value, path)
+}
+
 pub(super) fn encode(state: &State) -> Result<String> {
     let repository = state
         .repository
