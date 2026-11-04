@@ -146,8 +146,58 @@ pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {
     if let Some(policy) = policy.filter(|_| cli.action != Action::Trust) {
         crate::activation::recover(&state_file, &authorized, policy)?;
     }
-    if let Some(policy) = policy.filter(|_| cli.action != Action::Uninstall) {
-        crate::activation::inspect_requested(policy, &repository, &catalog, &profile, &requested)?;
+    if cli.action != Action::Uninstall {
+        // Inventory validation precedes ownership-state authorization. Unsupported
+        // or unavailable projections must not inspect the rejected source bytes.
+        for plugin in catalog.plugins.iter().filter(|plugin| {
+            (profile.plugins.include == ["*"] || profile.plugins.include.contains(&plugin.id))
+                && !profile.plugins.exclude.contains(&plugin.id)
+        }) {
+            let selection = Profile {
+                schema: profile.schema.clone(),
+                schema_version: profile.schema_version,
+                id: profile.id.clone(),
+                plugins: PluginSelector {
+                    include: vec![plugin.id.clone()],
+                    exclude: Vec::new(),
+                },
+                targets: Vec::new(),
+            };
+            for component in &requested {
+                if !supports(cli.target, *component) || !authorized.contains_key(component) {
+                    continue;
+                }
+                if matches!(component, ComponentKind::Hooks | ComponentKind::Mcp) {
+                    if let Some(policy) = policy {
+                        crate::activation::inspect_requested(
+                            policy,
+                            &repository,
+                            &catalog,
+                            &selection,
+                            &[*component],
+                        )?;
+                    }
+                } else {
+                    let kind = match component {
+                        ComponentKind::Skills => "agent-skills",
+                        ComponentKind::Agents => "agents",
+                        ComponentKind::Rules => "rules",
+                        ComponentKind::Commands => "commands",
+                        _ => unreachable!(),
+                    };
+                    if let Some(artifact) = plugin.artifacts.get(kind) {
+                        let source = catalog
+                            .sources
+                            .iter()
+                            .find(|source| source.id == plugin.source)
+                            .ok_or("plugin references unknown source")?;
+                        let source_root = resolve_repo_path(&repository, &source.path)?;
+                        let path = canonicalize_missing(&source_root.join(&artifact.path))?;
+                        crate::artifacts::inspect(&repository, kind, &path)?;
+                    }
+                }
+            }
+        }
     }
     let previous = state::load(&state_file)?;
     // Executable lifecycle remains closed for targets without a native policy.
@@ -194,62 +244,28 @@ pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {
 
     let mut projection_conflicts = Vec::new();
     if cli.action != Action::Uninstall {
-        for component in &requested {
-            let supported = match cli.target {
-                SkillsTarget::Cursor => matches!(
-                    component,
-                    ComponentKind::Skills
-                        | ComponentKind::Agents
-                        | ComponentKind::Rules
-                        | ComponentKind::Hooks
-                        | ComponentKind::Mcp
-                ),
-                SkillsTarget::Claude => matches!(
-                    component,
-                    ComponentKind::Skills
-                        | ComponentKind::Agents
-                        | ComponentKind::Commands
-                        | ComponentKind::Hooks
-                        | ComponentKind::Mcp
-                ),
-                _ => *component == ComponentKind::Skills,
-            };
-            let rejection = if !supported {
-                Some((
-                    "COMPONENT_UNSUPPORTED",
-                    format!(
-                        "{target_id} does not support current {} format",
-                        component.as_str()
-                    ),
-                ))
-            } else if !authorized.contains_key(component) {
-                Some((
-                    "PROJECT_ROOT_REQUIRED",
-                    format!("{target_id} {} requires --project-root", component.as_str()),
-                ))
-            } else {
-                None
-            };
-            if let Some((code, reason)) = rejection {
-                projection_conflicts.push(Operation {
-                    kind: "conflict",
-                    key: format!("component:{}", component.as_str()),
-                    destination: authorized
-                        .get(component)
-                        .unwrap_or(&destination)
-                        .to_string_lossy()
-                        .into_owned(),
-                    source: String::new(),
-                    reason,
-                    component: component.as_str(),
-                    resource: PathResource::DirectorySymlink,
-                    diagnostic: Some(code.into()),
-                    trust_token: None,
-                    trust_required: false,
-                    expected_link: None,
-                    expected_digest: None,
-                });
-            }
+        let registered = crate::capabilities::RegisteredTarget::builtin(cli.target);
+        let (_, conflicts) = registered.project(&requested, &[], &authorized);
+        for conflict in conflicts {
+            let component = conflict.component;
+            projection_conflicts.push(Operation {
+                kind: "conflict",
+                key: format!("component:{}", component.as_str()),
+                destination: authorized
+                    .get(&component)
+                    .unwrap_or(&destination)
+                    .to_string_lossy()
+                    .into_owned(),
+                source: String::new(),
+                reason: conflict.reason,
+                component: component.as_str(),
+                resource: PathResource::DirectorySymlink,
+                diagnostic: Some(conflict.code.into()),
+                trust_token: None,
+                trust_required: false,
+                expected_link: None,
+                expected_digest: None,
+            });
         }
     }
     let accepted: Vec<_> = requested
@@ -389,6 +405,12 @@ pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {
     })
 }
 
+fn supports(target: SkillsTarget, component: ComponentKind) -> bool {
+    crate::capabilities::RegisteredTarget::builtin(target)
+        .capabilities
+        .contains_key(&component)
+}
+
 fn desired_entries(
     repository: &Path,
     catalog: &Catalog,
@@ -435,11 +457,11 @@ fn desired_entries(
             )
         })?;
         let source_root = resolve_repo_path(repository, &source.path)?;
-        if components.contains(&ComponentKind::Skills) {
-            let artifact = plugin
-                .artifacts
-                .get("agent-skills")
-                .ok_or_else(|| format!("plugin {} has no agent-skills artifact", plugin.id))?;
+        if let Some(artifact) = plugin
+            .artifacts
+            .get("agent-skills")
+            .filter(|_| components.contains(&ComponentKind::Skills))
+        {
             let artifact_root = resolve_repo_path(&source_root, &artifact.path)?;
             for (name, skill_root) in discover_skills(&artifact_root)? {
                 let key = format!("skill:{name}");
@@ -532,15 +554,19 @@ fn component_key_prefix(component: ComponentKind) -> &'static str {
     }
 }
 
-fn discover_files(
+pub(crate) fn discover_files(
     root: &Path,
     suffix: &str,
     component: ComponentKind,
 ) -> Result<Vec<(String, PathBuf)>> {
-    reject_symlink_tree(root)?;
+    crate::artifacts::validate_tree(root)?;
     let mut found = Vec::new();
-    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
+    let mut entries = fs::read_dir(root)
+        .map_err(|error| error.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
         let path = entry.path();
         let file_type = entry.file_type().map_err(|error| error.to_string())?;
         if file_type.is_symlink() || !file_type.is_file() {
@@ -574,7 +600,11 @@ fn validate_document(path: &Path, component: ComponentKind) -> Result<()> {
         .map(|index| index + 4)
         .ok_or_else(|| format!("frontmatter is not closed: {}", path.display()))?;
     let mut values = BTreeMap::new();
-    for line in text[4..closing].lines() {
+    // Match Python str.splitlines(), including Unicode and control separators.
+    for line in text[4..closing].split([
+        '\n', '\r', '\u{000b}', '\u{000c}', '\u{001c}', '\u{001d}', '\u{001e}', '\u{0085}',
+        '\u{2028}', '\u{2029}',
+    ]) {
         if let Some((key, value)) = line.split_once(':') {
             let value = value.trim().trim_matches(['\'', '"']);
             if !key.trim().is_empty() && !value.is_empty() {
@@ -592,12 +622,17 @@ fn validate_document(path: &Path, component: ComponentKind) -> Result<()> {
         stem
     };
     if !safe_filename(name) {
-        return Err("component name must be one safe filename component".into());
+        return Err(format!(
+            "component name must be one safe filename component: {}: {}",
+            path.display(),
+            crate::state::wire::repr(name)
+        ));
     }
     if component == ComponentKind::Agents && name != stem {
         return Err(format!(
-            "component name must match filename stem: {}",
-            path.display()
+            "component name must match filename stem: {}: {}",
+            path.display(),
+            crate::state::wire::repr(name)
         ));
     }
     if matches!(component, ComponentKind::Agents | ComponentKind::Rules)

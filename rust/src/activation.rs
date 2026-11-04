@@ -113,7 +113,7 @@ fn artifact(
         })
         .transpose()
 }
-fn classify_hooks(data: &Wire, alias: &str) -> Result<bool> {
+pub(crate) fn classify_hooks(data: &Wire, alias: &str) -> Result<bool> {
     let Wire::Object(events) = data.get("hooks") else {
         return Err("hooks.json requires a hooks object".into());
     };
@@ -205,18 +205,8 @@ fn hook_source(
         let Some(path) = artifact(repository, plugin, source, alias)? else {
             continue;
         };
-        bundles::source_tree(&path).map_err(|e| e.to_string())?;
-        let data = docs::parse_bytes(&lifecycle::read_regular(
-            repository,
-            &path.join("hooks.json"),
-        )?)?;
-        if !matches!(data.get("hooks"), Wire::Object(_)) {
-            return Err(format!(
-                "hooks.json requires a hooks object: {}",
-                path.join("hooks.json").display()
-            ));
-        }
-        if classify_hooks(&data, alias)? == policy.cursor() {
+        let inventory = crate::artifacts::inspect(repository, alias, &path)?;
+        if (inventory.representation == Some("hook-bundle")) == policy.cursor() {
             exact.push(path);
         }
     }
@@ -400,7 +390,7 @@ fn local_mcp_payload(value: &str, root: &Path) -> bool {
         }
     }
 }
-fn validate_mcp_inventory(data: &Wire, artifact: &Path) -> Result<()> {
+pub(crate) fn validate_mcp_inventory(data: &Wire, artifact: &Path) -> Result<()> {
     let Wire::Object(servers) = data.get("mcpServers") else {
         return Err(format!(
             "MCP document requires an mcpServers object: {}",
@@ -444,8 +434,7 @@ pub(super) fn inspect_requested(
                 }
                 ComponentKind::Mcp => {
                     if let Some(path) = artifact(repository, plugin, source, "mcp")? {
-                        let data = docs::parse_bytes(&lifecycle::read_regular(repository, &path)?)?;
-                        validate_mcp_inventory(&data, &path)?;
+                        crate::artifacts::inspect(repository, "mcp", &path)?;
                     }
                 }
                 _ => {}

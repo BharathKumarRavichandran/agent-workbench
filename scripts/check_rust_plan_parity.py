@@ -1496,7 +1496,7 @@ def trust_cli_contract(base: Path) -> None:
                          ("install", ("--component", "hooks", "--trust", token)),
                          ("install", ("--component", "mcp", "--trust", token))):
         result = side.command(action, *args)
-        assert result.returncode == 2, result
+        assert result.returncode == 1 and 'COMPONENT_UNSUPPORTED' in result.stdout, result
         assert trust_snapshot(side.base) == rejection_before, "unsupported activation mutated fixtures"
     print("trust CLI: six-target skills exits/output/typed snapshots match; unsupported Codex activation remains fail-closed")
 
@@ -2595,7 +2595,8 @@ def main() -> int:
             for script in ("check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
                            "check_cursor_activation_recovery.py", "check_claude_activation_parity.py",
                            "check_claude_activation_edges.py", "check_claude_activation_recovery.py",
-                           "check_claude_native_contract.py", "check_activation_inertness.py"):
+                           "check_claude_native_contract.py", "check_activation_inertness.py",
+                           "check_artifact_inspection_parity.py", "check_artifact_inventory.py"):
                 activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
                 assert activation.returncode == 0, activation.stdout + activation.stderr
                 print(activation.stdout.strip())

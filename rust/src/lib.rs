@@ -11,8 +11,12 @@ mod activation;
 #[cfg(test)]
 mod activation_parity_tests;
 #[cfg(test)]
+mod artifact_parity_tests;
+pub mod artifacts;
+#[cfg(test)]
 mod bundle_parity_tests;
 mod bundles;
+pub mod capabilities;
 mod lifecycle;
 mod resource;
 mod shared_document;
@@ -364,12 +368,8 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
                     "agents" => Ok(ComponentKind::Agents),
                     "rules" => Ok(ComponentKind::Rules),
                     "commands" => Ok(ComponentKind::Commands),
-                    "hooks" if activation::Policy::for_target(target).is_some() => {
-                        Ok(ComponentKind::Hooks)
-                    }
-                    "mcp" if activation::Policy::for_target(target).is_some() => {
-                        Ok(ComponentKind::Mcp)
-                    }
+                    "hooks" => Ok(ComponentKind::Hooks),
+                    "mcp" => Ok(ComponentKind::Mcp),
                     _ => Err("Rust parity unit supports only path components".into()),
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -698,7 +698,15 @@ fn reject_destination_root_symlink(path: &Path) -> Result<()> {
 }
 
 fn discover_skills(root: &Path) -> Result<Vec<(String, PathBuf)>> {
-    reject_symlink_tree(root)?;
+    if root.is_symlink() {
+        return Err(format!(
+            "skills root may not be a symlink: {}",
+            root.display()
+        ));
+    }
+    if !root.is_dir() {
+        return Err(format!("skills root does not exist: {}", root.display()));
+    }
     let mut directories = fs::read_dir(root)
         .map_err(|error| format!("skills root does not exist: {}: {error}", root.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -709,6 +717,12 @@ fn discover_skills(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         let metadata = entry
             .file_type()
             .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+        if metadata.is_symlink() {
+            return Err(format!(
+                "skill directory may not be a symlink: {}",
+                entry.path().display()
+            ));
+        }
         if !metadata.is_dir() {
             continue;
         }
@@ -723,6 +737,7 @@ fn discover_skills(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             }
             _ => continue,
         }
+        reject_symlink_tree(&entry.path())?;
         let name = parse_frontmatter(&skill_file)?;
         skills.push((name, canonicalize_existing(&entry.path(), "skill source")?));
     }
@@ -765,6 +780,7 @@ fn reject_symlink_tree(root: &Path) -> Result<()> {
 
 fn parse_frontmatter(path: &Path) -> Result<String> {
     let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
     if !text.starts_with("---\n") {
         return Err(format!(
             "skill frontmatter must start at byte zero: {}",
@@ -775,26 +791,32 @@ fn parse_frontmatter(path: &Path) -> Result<String> {
         .find("\n---\n")
         .map(|index| index + 4)
         .ok_or_else(|| format!("skill frontmatter is not closed: {}", path.display()))?;
+    let frontmatter = &text[4..closing];
     let mut name = None;
     let mut description = false;
-    for line in text[4..closing].lines() {
-        let Some((key, raw_value)) = line.split_once(':') else {
-            continue;
-        };
-        match key {
-            "name" if name.is_none() => {
-                let value = raw_value.trim().trim_matches(['\'', '"']);
-                if !value.is_empty() {
-                    name = Some(value.to_owned());
-                }
+    let mut offset = 0;
+    for line in frontmatter.split_inclusive('\n') {
+        // Python's anchored regular expressions allow \s to cross a newline;
+        // these are deliberately not YAML scalar semantics.
+        if name.is_none() && line.starts_with("name:") {
+            let remaining = frontmatter[offset + "name:".len()..].trim_start();
+            let value = remaining.split('\n').next().unwrap_or("").trim_end();
+            let value = value.strip_prefix(['\'', '"']).unwrap_or(value);
+            let value = value.strip_suffix(['\'', '"']).unwrap_or(value);
+            if !value.is_empty() && !value.contains(['\'', '"']) {
+                name = Some(value.trim().to_owned());
             }
-            "description" if !raw_value.is_empty() => description = true,
-            _ => {}
         }
+        if line.starts_with("description:") {
+            description |= frontmatter[offset + "description:".len()..]
+                .chars()
+                .any(|ch| ch != '\n');
+        }
+        offset += line.len();
     }
-    let name = name.filter(|value| safe_filename(value)).ok_or_else(|| {
+    let name = name.ok_or_else(|| {
         format!(
-            "skill frontmatter needs safe name and description: {}",
+            "skill frontmatter needs name and description: {}",
             path.display()
         )
     })?;
@@ -802,6 +824,13 @@ fn parse_frontmatter(path: &Path) -> Result<String> {
         return Err(format!(
             "skill frontmatter needs name and description: {}",
             path.display()
+        ));
+    }
+    if !safe_filename(&name) {
+        return Err(format!(
+            "skill name must be one safe filename component: {}: {}",
+            path.display(),
+            state::wire::repr(&name)
         ));
     }
     Ok(name)
