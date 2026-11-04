@@ -115,7 +115,7 @@ fn quoted_name(points: &[u32]) -> String {
     text
 }
 
-fn names(fd: &impl AsFd) -> io::Result<Vec<OsString>> {
+fn names_unsorted(fd: &impl AsFd) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in rfs::Dir::read_from(fd)? {
         let entry = entry?;
@@ -124,6 +124,11 @@ fn names(fd: &impl AsFd) -> io::Result<Vec<OsString>> {
             names.push(OsString::from_vec(bytes.to_vec()));
         }
     }
+    Ok(names)
+}
+
+fn names(fd: &impl AsFd) -> io::Result<Vec<OsString>> {
+    let mut names = names_unsorted(fd)?;
     names.sort_by_cached_key(|name| python_name(name));
     Ok(names)
 }
@@ -448,7 +453,9 @@ pub(super) fn delete_tree_observed(
         &fd,
         Mode::from_raw_mode((rfs::fstat(&fd)?.st_mode & 0o7777) | 0o700),
     )?;
-    for child in names(&fd)? {
+    // Python delete_tree uses os.listdir's native directory order. Sorting here
+    // changes which authenticated partial evidence survives an interruption.
+    for child in names_unsorted(&fd)? {
         let info = rfs::statat(&fd, child.as_os_str(), rfs::AtFlags::SYMLINK_NOFOLLOW)?;
         if rfs::FileType::from_raw_mode(info.st_mode).is_dir() {
             delete_tree_observed(&child, &fd, deleted_file)?;
