@@ -57,7 +57,7 @@ Convert the workbench to a standalone Rust CLI without extending product behavio
 - [x] Port resource/document locks, stale snapshots, atomic publication, durable authenticated journals, and retryable recovery.
 - [x] Port Cursor hooks and project MCP lifecycle with full Python/Rust operation, byte, mode, state, recovery, and uninstall parity.
 - [x] Port Claude hooks and project MCP lifecycle with the same parity requirements.
-- [ ] Prove planning, validation, status, and installation never execute hooks, start MCP servers, connect to networks, or grant trust implicitly.
+- [x] Prove planning, validation, status, and installation never execute hooks, start MCP servers, connect to networks, or grant trust implicitly.
 
 ### E. Remaining commands and generated artifacts
 

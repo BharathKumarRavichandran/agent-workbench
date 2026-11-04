@@ -2595,7 +2595,7 @@ def main() -> int:
             for script in ("check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
                            "check_cursor_activation_recovery.py", "check_claude_activation_parity.py",
                            "check_claude_activation_edges.py", "check_claude_activation_recovery.py",
-                           "check_claude_native_contract.py"):
+                           "check_claude_native_contract.py", "check_activation_inertness.py"):
                 activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
                 assert activation.returncode == 0, activation.stdout + activation.stderr
                 print(activation.stdout.strip())

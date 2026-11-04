@@ -21,6 +21,7 @@ class Replay:
         self.project = True
         self.extra = []
         self.snapshotter = snapshot
+        self.timeout: float | None = None
 
     def call(self, action, components=('hooks', 'mcp'), tokens=(), adopt=False):
         prefix = [sys.executable, '-m', 'agent_workbench'] if self.engine == 'python' else [str(RUST)]
@@ -40,7 +41,7 @@ class Replay:
                    PYTHONDONTWRITEBYTECODE='1', HERMES_HOME=str(self.root / 'home/hermes'),
                    CODEX_HOME=str(self.root / 'home/codex'))
         before = readonly_identity(self.root) if action == 'trust' else None
-        result = subprocess.run(command, cwd=REPO, env=env, text=True, capture_output=True, umask=0o022)
+        result = subprocess.run(command, cwd=REPO, env=env, text=True, capture_output=True, umask=0o022, timeout=self.timeout)
         if before is not None:
             assert before == readonly_identity(self.root), (self.engine, 'trust mutated fixture')
         assert not (self.root / 'PAYLOAD_EXECUTED').exists()
