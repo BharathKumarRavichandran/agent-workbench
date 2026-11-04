@@ -1390,7 +1390,7 @@ fn write_progress(plan: &Plan, entries: &BTreeMap<String, Entry>) -> Result<()> 
     state::write(&plan.state_file, &progress)
 }
 
-fn validate_source(repository: &Path, source: &Path) -> Result<()> {
+pub(crate) fn validate_source(repository: &Path, source: &Path) -> Result<()> {
     let relative = source
         .strip_prefix(repository)
         .map_err(|_| format!("skill source escapes checkout: {}", source.display()))?;
@@ -1409,7 +1409,7 @@ fn validate_source(repository: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
-fn relative_link(source: &Path, parent: &Path) -> Result<PathBuf> {
+pub(crate) fn relative_link(source: &Path, parent: &Path) -> Result<PathBuf> {
     let source_parts: Vec<_> = source.components().collect();
     let parent_parts: Vec<_> = parent.components().collect();
     let common = source_parts

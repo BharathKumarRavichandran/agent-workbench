@@ -16,6 +16,9 @@ mod shared_document;
 #[cfg(test)]
 mod shared_document_parity_tests;
 mod state;
+mod transaction;
+#[cfg(test)]
+mod transaction_parity_tests;
 mod trust;
 
 pub type Result<T> = std::result::Result<T, String>;

@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""Real Python InstallPlan/apply versus the private Rust transaction gate.
+
+Each engine runs at the SAME lexical fixture paths, rebuilt between executions.
+Only inode/timestamp snapshot fields are recaptured (never output-normalized).
+Seeded transaction key makes persisted state proofs byte-for-byte comparable.
+"""
+from __future__ import annotations
+import base64
+import fcntl
+import hashlib
+import hmac
+import re
+import json
+import os
+from pathlib import Path
+import shutil
+import secrets
+import stat
+import subprocess
+import sys
+import tempfile
+from unittest.mock import patch
+from contextlib import ExitStack
+
+REPO = Path(__file__).resolve().parents[3]
+sys.path[:0] = [str(REPO), str(REPO / 'tests')]
+from test_activation import ActivationTests
+from agent_workbench import installation, shared_config, transactions, bundles
+from agent_workbench.model import ComponentKind as C
+
+
+def image(value):
+    return None if value is None else list(value)
+
+
+def serialize(plan):
+    def snap(s):
+        return {'path': str(s.path), 'content': image(s.content), 'revision': s.revision}
+    roots = dict(plan.next_state.destination_roots)
+    if plan.previous_state: roots.update(plan.previous_state.destination_roots)
+    return {'target': str(plan.target), 'repository': str(plan.repository),
+            'roots': {str(k.value): str(v) for k, v in roots.items()},
+            'state_before': dict(snap(shared_config.snapshot(plan.state_file.resolve())), path=str(plan.state_file)),
+            'state_after': list(shared_config.encode(plan.next_state.as_dict())),
+            'conflicts': plan.has_conflicts, 'uninstall': False,
+            'root_snapshots': [dict(path=str(s.destination), identity=s.destination_identity,
+                anchor=str(s.destination_anchor), anchor_identity=s.destination_anchor_identity) for s in plan.roots],
+            'documents': [dict(before=snap(d.before), removed=image(d.removed), after=image(d.after)) for d in plan.documents],
+            'sources': [dict(path=str(s.source), digest=s.source_digest, tree=s.state.component is C.HOOKS) for s in plan.executable_sources],
+            'operations': [dict(kind=o.kind.value, path=str(o.destination), component=o.component.value,
+                resource=o.resource.kind, source=str(o.source) if o.source else None,
+                digest=getattr(o.resource, 'digest', None), expected_digest=o.expected_digest,
+                expected_link=str(o.expected_link) if o.expected_link else None) for o in plan.operations]}
+
+
+def observe(base):
+    try:
+        root = base.lstat()
+    except FileNotFoundError:
+        return [('.', 'missing', None, None)]
+    root_kind = 'link' if stat.S_ISLNK(root.st_mode) else ('dir' if stat.S_ISDIR(root.st_mode) else 'file')
+    root_content = os.readlink(base) if root_kind == 'link' else (base.read_bytes().hex() if root_kind == 'file' else None)
+    result = [('.', root_kind, stat.S_IMODE(root.st_mode), root_content)]
+    for p in sorted(base.rglob('*')):
+        s = p.lstat()
+        rel = str(p.relative_to(base))
+        if p.is_symlink(): result.append((rel, 'link', stat.S_IMODE(s.st_mode), os.readlink(p)))
+        elif p.is_dir(): result.append((rel, 'dir', stat.S_IMODE(s.st_mode), None))
+        else:
+            content = p.read_bytes().hex()
+            if p.name == '.agent-workbench-transaction.json':
+                record = json.loads(p.read_bytes())
+                assert p.read_bytes() == shared_config.encode(record), 'journal wire formatting drift'
+                mac = record.pop('mac')
+                assert hmac.compare_digest(mac, hmac.new(bytes(range(32)), transactions._canonical(record), hashlib.sha256).hexdigest())
+                # Only authenticated nondeterministic identities/quarantine names
+                # are normalized. Other files retain literal bytes and modes.
+                for path, identity in record['parents'].items():
+                    # A named swap deliberately detaches an authenticated
+                    # parent. Require its inode to remain in the observed tree,
+                    # not that the attacker's replacement has that identity.
+                    candidates = [Path(path), base, *base.rglob('*')]
+                    assert any(p.is_dir() and not p.is_symlink() and identity == [p.stat().st_dev, p.stat().st_ino] for p in candidates), path
+                    record['parents'][path] = ['device', 'inode']
+                for item in record['documents'] + record['paths']:
+                    item['quarantine'] = re.sub(r'[0-9a-f]{16}$', '<nonce>', item['quarantine'])
+                # Re-encode in observed insertion order: parsed mapping equality
+                # would silently accept a reordered journal wire contract.
+                content = shared_config.encode(record).hex()
+            result.append((rel, 'file', stat.S_IMODE(s.st_mode), content))
+    # Evidence names are generated by each engine, but only names bound by an
+    # authenticated journal may be normalized in filesystem observations.
+    aliases = {}
+    for journal in base.rglob('.agent-workbench-transaction.json'):
+        record = json.loads(journal.read_bytes())
+        mac = record.pop('mac')
+        assert hmac.compare_digest(mac, hmac.new(bytes(range(32)), transactions._canonical(record), hashlib.sha256).hexdigest())
+        for item in record['documents'] + record['paths']:
+            q = item['quarantine']
+            aliases[q] = re.sub(r'[0-9a-f]{16}$', '<nonce>', q)
+    for index, row in enumerate(result):
+        rel, kind, mode, content = row
+        for original, normalized in aliases.items():
+            rel = rel.replace(original, normalized)
+        result[index] = (rel, kind, mode, content)
+    return sorted(result)
+
+
+def run():
+    scenarios = ['mcp', 'hooks', 'resource-fail', 'keep', 'replace', 'uninstall', 'state-fail', 'source-stale', 'state-stale', 'document-stale', 'destination-stale', 'conflicts', 'foreign-document', 'interrupt', 'state-capture-fail', 'journal-interrupt', 'before-state-fail', 'state-replace-interrupt', 'recovery-locks']
+    scenarios += [prefix + case for prefix in ('mixed-', 'claude-') for case in
+                  ('install', 'keep', 'replace', 'uninstall', 'resource-fail', 'before-state-fail', 'partial-interrupt', 'capture-interrupt')]
+    scenarios += [prefix + case for prefix in ('mixed-', 'claude-') for case in
+                  ('narrow', 'adopt', 'link-alias', 'state-alias', 'source-stale', 'destination-stale', 'both-stale')]
+    scenarios += [prefix + case for prefix in ('mixed-', 'claude-') for case in
+                  ('path-alias', 'checkout-relocate', 'root-swap', 'parent-swap', 'outside-swap')]
+    scenarios += [prefix + case for prefix in ('mixed-', 'claude-') for case in
+                  ('state-sync', 'state-parent-sync', 'journal-unlink', 'journal-removed-sync', 'resource-cleanup', 'resource-parent-sync')]
+    scenarios += [prefix + case for prefix in ('mixed-', 'claude-') for case in
+                  ('narrow-interrupt', 'agent-source-stale', 'agent-destination-stale', 'agent-both-stale', 'agent-both-stale-kind')]
+    scenarios += [prefix + case for prefix in ('mixed-', 'claude-') for case in
+                  ('link-alias-interrupt', 'state-alias-interrupt', 'tree-root-swap', 'tree-parent-swap', 'tree-outside-swap')]
+    scenarios += [prefix + case for prefix in ('mixed-', 'claude-') for case in
+                  ('file-sync', 'file-link', 'file-temp-unlink', 'file-unlinked-interrupt', 'uninstall-state-unlink', 'uninstall-state-sync', 'uninstall-state-interrupt', 'evidence-delete', 'tree-evidence-delete', 'tree-evidence-partial', 'tree-evidence-partial-interrupt', 'late-agent-source', 'late-tree-source', 'late-document', 'late-destination', 'document-root-swap', 'document-outside-swap')]
+    scenarios += [prefix + case for prefix in ('mixed-', 'claude-') for case in
+                  ('state-link', 'state-link-dangling', 'state-link-uninstall', 'state-link-interrupt',
+                   'initial-root-file', 'initial-root-link', 'initial-root-replaced', 'initial-ancestor-replaced', 'initial-ancestor-link')]
+    scenarios += [prefix + case for prefix in ('mixed-', 'claude-') for case in
+                  ('late-link-alias', 'final-root-sync', 'post-state-config-sync')]
+    scenarios += [prefix + 'tree-stage-' + edge for prefix in ('mixed-', 'claude-')
+                  for edge in ('file-write', 'file-chmod', 'file-sync', 'directory-chmod', 'directory-sync', 'root-sync')]
+    scenarios += [prefix + 'capture-tree-' + swap for prefix in ('mixed-', 'claude-')
+                  for swap in ('root-swap', 'parent-swap', 'outside-swap')]
+    if os.environ.get('AW_APPLY_CASES'):
+        scenarios = os.environ['AW_APPLY_CASES'].split(',')
+    previous_umask = os.umask(0o022)
+    try:
+        for scenario in scenarios:
+            run_case(scenario)
+    finally:
+        os.umask(previous_umask)
+    print(f'apply contract: {len(scenarios)} real-plan rows passed')
+
+
+def run_case(scenario):
+    target = 'claude' if scenario.startswith('claude-') else 'cursor'
+    mixed = scenario.startswith(('mixed-', 'claude-'))
+    scenario = scenario.removeprefix('claude-').removeprefix('mixed-')
+    capture_tree_swap = scenario.startswith('capture-tree-')
+    with tempfile.TemporaryDirectory(prefix='aw-apply-', dir=os.environ['TMPDIR']) as tmp:
+        base = Path(tmp)
+        outcomes = []
+        for engine in ('python', 'rust'):
+            fixture = ActivationTests()
+            fixture.setUp()
+            try:
+                # Fixture helper's random root is relocated before any planning.
+                shutil.rmtree(fixture.base)
+                fixture.base = base/'fixture'
+                fixture.base.mkdir()
+                from test_workbench import Fixture
+                from test_components import configure
+                from agent_workbench.workspace import Workspace
+                fixture.fixture = Fixture(fixture.base/'repo'); configure(fixture.fixture)
+                fixture.workspace = Workspace.load(fixture.fixture.root)
+                fixture.project = fixture.base/'project'; fixture.state = fixture.base/'state'
+                if scenario == 'path-alias':
+                    fixture.workspace = Workspace.load(fixture.fixture.root/'..'/'repo')
+                    fixture.project.mkdir()
+                    (fixture.base/'project-alias').symlink_to('project', target_is_directory=True)
+                    fixture.project = fixture.base/'project-alias'
+                    fixture.state = fixture.state/'..'/'state'
+                components = (C.SKILLS, C.AGENTS, C.HOOKS, C.MCP) if mixed else ((C.MCP,) if scenario == 'mcp' else (C.HOOKS, C.MCP))
+                if target == 'claude':
+                    (fixture.fixture.root/'plugins/sample/hooks/hooks.json').write_bytes(shared_config.encode({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/stop.sh"'}]}]}}))
+                    fixture.workspace = Workspace.load(fixture.fixture.root)
+                def trusted():
+                    first = installation.plan_install(fixture.workspace, target, fixture.state, components=components, project_root=fixture.project, adopt=scenario in {'adopt', 'link-alias', 'link-alias-interrupt'})
+                    tokens = tuple({o.trust_token for o in first.all_operations if o.trust_token})
+                    result = installation.plan_install(fixture.workspace, target, fixture.state, components=components, project_root=fixture.project, trust=tokens, adopt=scenario in {'adopt', 'link-alias', 'link-alias-interrupt'})
+                    assert not result.has_conflicts, [o.as_dict() for o in result.all_operations]
+                    return result
+                plan = trusted()
+                if mixed:
+                    if scenario.startswith('initial-'):
+                        hooks_root = Path(plan.next_state.destination_roots[C.HOOKS])
+                        (hooks_root if scenario == 'initial-root-replaced' else hooks_root.parent).mkdir(parents=True, exist_ok=True)
+                        plan = trusted()
+                    assert {o.resource.kind for o in plan.operations} == {'directory-symlink', 'file-copy', 'directory-copy'}
+                    if target == 'claude':
+                        assert len({d.before.path.parent for d in plan.documents}) == 2
+                    # File-copy publication must not inherit source executable bits.
+                    (fixture.fixture.root/'plugins/sample/agents/sample-agent.md').chmod(0o751)
+                plan.state_file.parent.mkdir(parents=True, exist_ok=True)
+                key = plan.state_file.parent / ('.'+plan.state_file.name+'.transaction-key')
+                key.write_bytes(bytes(range(32))); key.chmod(0o600)
+                if scenario in {'adopt', 'link-alias', 'link-alias-interrupt'}:
+                    for op in plan.operations:
+                        if op.component not in {C.SKILLS, C.AGENTS}: continue
+                        assert op.source is not None
+                        op.destination.parent.mkdir(parents=True, exist_ok=True)
+                        if op.component is C.SKILLS:
+                            link = installation._relative_link(op.source, op.destination.parent)
+                            op.destination.symlink_to(('./' if scenario.startswith('link-alias') else '') + str(link))
+                        else: shutil.copyfile(op.source, op.destination)
+                    plan = trusted()
+                    assert any(o.kind.value == 'adopt' for o in plan.operations)
+                if capture_tree_swap or scenario in {'late-link-alias', 'keep', 'checkout-relocate', 'narrow', 'narrow-interrupt', 'state-alias', 'state-alias-interrupt', 'replace', 'uninstall', 'partial-interrupt', 'capture-interrupt', 'state-capture-fail', 'state-replace-interrupt', 'uninstall-state-unlink', 'uninstall-state-sync', 'uninstall-state-interrupt', 'evidence-delete', 'tree-evidence-delete', 'tree-evidence-partial', 'tree-evidence-partial-interrupt'}:
+                    installation.apply_plan(plan)
+                    if scenario == 'checkout-relocate':
+                        fixture.fixture.root.rename(fixture.base/'checkout')
+                        fixture.fixture.root.symlink_to('checkout', target_is_directory=True)
+                        fixture.workspace = Workspace.load(fixture.fixture.root)
+                    if scenario in {'replace', 'partial-interrupt'}:
+                        (fixture.fixture.root/'plugins/sample/hooks/stop.sh').write_text('#!/bin/sh\nexit 23\n')
+                        if mixed:
+                            with (fixture.fixture.root/'plugins/sample/agents/sample-agent.md').open('a') as handle:
+                                handle.write('\nReplacement agent\n')
+                    if scenario in {'narrow', 'narrow-interrupt'}: components = (C.HOOKS, C.MCP)
+                    plan = installation.plan_uninstall(fixture.workspace, target, fixture.state, project_root=fixture.project) if capture_tree_swap or scenario in {'uninstall', 'capture-interrupt', 'uninstall-state-unlink', 'uninstall-state-sync', 'uninstall-state-interrupt', 'evidence-delete', 'tree-evidence-delete', 'tree-evidence-partial', 'tree-evidence-partial-interrupt'} else trusted()
+                if scenario.startswith('state-link'):
+                    if scenario != 'state-link-dangling':
+                        installation.apply_plan(plan)
+                        plan.state_file.rename(plan.state_file.parent/'referent.json')
+                    plan.state_file.symlink_to('referent.json')
+                    plan = installation.plan_uninstall(fixture.workspace, target, fixture.state, project_root=fixture.project) if scenario == 'state-link-uninstall' else trusted()
+                    referent_before = observe(plan.state_file.parent/'referent.json')
+                if scenario == 'conflicts': plan = fixture.plan()
+                request = serialize(plan)
+                request['uninstall'] = capture_tree_swap or scenario in {'uninstall', 'capture-interrupt', 'uninstall-state-unlink', 'uninstall-state-sync', 'uninstall-state-interrupt', 'evidence-delete', 'tree-evidence-delete', 'tree-evidence-partial', 'tree-evidence-partial-interrupt'}
+                if scenario == 'state-link-uninstall': request['uninstall'] = True
+                if scenario.startswith('initial-'):
+                    original = hooks_root.parent if scenario.startswith('initial-ancestor') else hooks_root
+                    if original.exists(): original.rename(fixture.project/'detached')
+                    if scenario.endswith('file'): original.write_bytes(b'foreign root')
+                    elif scenario.endswith('link'):
+                        outside = fixture.project/'outside'; outside.mkdir()
+                        original.symlink_to(outside, target_is_directory=True)
+                    else: original.mkdir()
+                if scenario in {'source-stale', 'both-stale'}:
+                    (fixture.fixture.root/'plugins/sample/hooks/stop.sh').write_text('#!/bin/sh\nexit 42\n')
+                if scenario == 'state-stale': plan.state_file.write_bytes(b'{"foreign":true}\n')
+                if scenario == 'document-stale':
+                    path = plan.documents[0].before.path; path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b'{"foreign":true}\n')
+                if scenario in {'destination-stale', 'both-stale'}:
+                    path = plan.operations[0].destination; path.mkdir(parents=True, exist_ok=True)
+                    (path/'foreign').write_bytes(b'preserve')
+                if scenario in {'state-alias', 'state-alias-interrupt'}:
+                    plan.state_file.write_text(json.dumps(json.loads(plan.state_file.read_bytes()), separators=(',', ':')))
+                if scenario in {'agent-source-stale', 'agent-both-stale', 'agent-both-stale-kind'}:
+                    (fixture.fixture.root/'plugins/sample/agents/sample-agent.md').write_bytes(b'changed source')
+                if scenario in {'agent-destination-stale', 'agent-both-stale', 'agent-both-stale-kind'}:
+                    path = next(o.destination for o in plan.operations if o.component is C.AGENTS)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if scenario == 'agent-both-stale-kind': path.mkdir()
+                    else: path.write_bytes(b'foreign destination')
+                (base/'request.json').write_text(json.dumps(request))
+                recovery_calls = 0
+                result = {}
+                if engine == 'python':
+                    hit = False
+                    def assert_locks():
+                        for path in (plan.state_file.parent/('.'+plan.state_file.name+'.lock'),
+                                     Path(request['roots']['hooks']).parent/'.agent-workbench.lock'):
+                            if not path.exists():
+                                path = fixture.project/'detached'/path.name
+                            with path.open('rb') as lock:
+                                try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                except BlockingIOError: pass
+                                else: raise AssertionError(f'transaction released lock: {path}')
+                    def mark_hit():
+                        nonlocal hit
+                        assert_locks()
+                        hit = True
+                    recovery_calls = 0
+                    recover_locked = transactions._recover_locked
+                    def checked_recovery(*args, **kwargs):
+                        nonlocal recovery_calls, hit
+                        recovery_calls += 1
+                        assert_locks()
+                        if scenario == 'recovery-locks' and recovery_calls == 2:
+                            mark_hit()
+                            for path in (plan.state_file.parent/('.'+plan.state_file.name+'.lock'),
+                                         fixture.project/'.cursor/.agent-workbench.lock'):
+                                with path.open('rb') as lock:
+                                    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                    except BlockingIOError: pass
+                                    else: raise AssertionError(f'recovery released lock: {path}')
+                        return recover_locked(*args, **kwargs)
+                    replace_document = shared_config.replace_document
+                    def interrupted_journal(path, *args, **kwargs):
+                        nonlocal hit
+                        replace_document(path, *args, **kwargs)
+                        if path.name == '.agent-workbench-transaction.json' and scenario.startswith('late-'):
+                            mark_hit()
+                            if scenario == 'late-agent-source':
+                                source = fixture.fixture.root/'plugins/sample/agents/sample-agent.md'
+                                source.unlink(); source.write_bytes(b'late agent source')
+                            elif scenario == 'late-tree-source':
+                                source = fixture.fixture.root/'plugins/sample/hooks/stop.sh'
+                                source.unlink(); source.write_bytes(b'late hook source')
+                            elif scenario == 'late-document':
+                                plan.documents[0].before.path.write_bytes(b'{"foreign":true}\n')
+                            elif scenario == 'late-link-alias':
+                                destination = next(o.destination for o in plan.operations if o.component is C.SKILLS)
+                                link = os.readlink(destination)
+                                destination.unlink(); destination.symlink_to('./' + link)
+                            elif scenario == 'late-destination':
+                                destination = next(o.destination for o in plan.operations if o.component is C.AGENTS)
+                                destination.write_bytes(b'late foreign destination')
+                        if scenario in {'journal-interrupt', 'link-alias-interrupt', 'state-alias-interrupt', 'state-link-interrupt'} and path.name == '.agent-workbench-transaction.json':
+                            mark_hit()
+                            raise KeyboardInterrupt('after durable journal')
+                    replace = os.replace
+                    def interrupted_replace(source, destination, *args, **kwargs):
+                        nonlocal hit
+                        if scenario == 'state-replace-interrupt' and Path(destination) == plan.state_file:
+                            mark_hit()
+                            raise KeyboardInterrupt('before state atomic replace')
+                        return replace(source, destination, *args, **kwargs)
+                    create = installation._DestinationRoot.create
+                    quarantine = installation._DestinationRoot.quarantine
+                    captures = 0
+                    evidence_phase = None
+                    discard = installation._DestinationRoot.discard
+                    def injected_discard(root, moved):
+                        nonlocal evidence_phase
+                        evidence_phase = root.path
+                        try: return discard(root, moved)
+                        finally: evidence_phase = None
+                    def interrupted_capture(root, *args, **kwargs):
+                        nonlocal hit, captures
+                        result = quarantine(root, *args, **kwargs)
+                        if capture_tree_swap and args[0].component is C.HOOKS and not hit:
+                            swap_root(root.path.parent if scenario.endswith('parent-swap') else root.path)
+                        captures += 1
+                        if scenario in {'capture-interrupt', 'narrow-interrupt'} and captures == 2:
+                            mark_hit()
+                            raise KeyboardInterrupt('after two mixed captures')
+                        return result
+                    publications = 0
+                    def injected(root, op, content):
+                        nonlocal hit, publications
+                        create(root, op, content)
+                        publications += 1
+                        if scenario in {'root-swap', 'parent-swap', 'outside-swap'} and not hit:
+                            mark_hit()
+                            original = root.path.parent if scenario == 'parent-swap' else root.path
+                            original.rename(fixture.project/'detached')
+                            if scenario == 'outside-swap':
+                                outside = fixture.project/'outside'; outside.mkdir()
+                                original.symlink_to(outside, target_is_directory=True)
+                            else: original.mkdir()
+                        if scenario == 'partial-interrupt' and publications == 2:
+                            mark_hit()
+                            raise KeyboardInterrupt('after two mixed publications')
+                        if scenario in {'resource-fail', 'interrupt', 'foreign-document'}: mark_hit()
+                        if scenario in {'resource-fail', 'recovery-locks'}: raise OSError('injected resource publication failure')
+                        if scenario == 'interrupt': raise KeyboardInterrupt('interrupted apply')
+                        if scenario == 'foreign-document':
+                            plan.documents[0].before.path.write_bytes(b'{"foreign":true}\n')
+                            raise OSError('foreign document blocks recovery')
+                    write_state = installation.write_state
+                    state_phase = False
+                    journal_removed = False
+                    resource_renamed = False
+                    file_phase = False
+                    state_removed = False
+                    saved_link = os.link
+                    path_unlink = Path.unlink
+                    def injected_path_unlink(path, *args, **kwargs):
+                        if state_phase and path == plan.state_file:
+                            return injected_unlink(path)
+                        return path_unlink(path, *args, **kwargs)
+                    remove_state = installation.remove_state
+                    def injected_remove_state(path):
+                        nonlocal state_phase
+                        state_phase = True
+                        try: return remove_state(path)
+                        finally: state_phase = False
+                    def injected_link(*args, **kwargs):
+                        nonlocal hit, file_phase
+                        file_phase = True
+                        if scenario == 'file-link' and not hit:
+                            mark_hit()
+                            raise OSError('injected ' + scenario)
+                        return saved_link(*args, **kwargs)
+                    fsync = os.fsync
+                    unlink = os.unlink
+                    delete_tree = bundles.delete_tree
+                    rename_new = bundles.rename_new
+                    document_phase = None
+                    documents_published = False
+                    state_persisted = False
+                    compare_document = shared_config.compare_replace_document
+                    def injected_compare(snapshot, *args, **kwargs):
+                        nonlocal document_phase, documents_published
+                        document_phase = snapshot.path
+                        try:
+                            result = compare_document(snapshot, *args, **kwargs)
+                            if snapshot.path == plan.documents[-1].before.path:
+                                documents_published = True
+                            return result
+                        finally: document_phase = None
+                    def swap_root(original):
+                        nonlocal hit
+                        mark_hit()
+                        original.rename(fixture.project/'detached')
+                        if scenario.endswith('outside-swap'):
+                            outside = fixture.project/'outside'; outside.mkdir()
+                            original.symlink_to(outside, target_is_directory=True)
+                        else: original.mkdir()
+                    def injected_rename(*args, **kwargs):
+                        nonlocal resource_renamed
+                        result = rename_new(*args, **kwargs)
+                        if document_phase is not None and scenario.startswith('document-') and scenario.endswith('swap') and not hit and str(args[0]) == 'new':
+                            swap_root(document_phase.parent)
+                        if str(args[0]).startswith('.agent-workbench-copy-'):
+                            resource_renamed = True
+                            if scenario.startswith('tree-') and not hit:
+                                original = next(o.destination.parent for o in plan.operations if o.component is C.HOOKS)
+                                if scenario == 'tree-parent-swap': original = original.parent
+                                swap_root(original)
+                        return result
+                    tree_stage = False
+                    tree_directory_syncs = 0
+                    tree_directory_count = 0
+                    original_write_tree = bundles.write_tree
+                    def injected_write_tree(*args, **kwargs):
+                        nonlocal tree_stage, tree_directory_syncs, tree_directory_count
+                        tree_stage = True
+                        tree_directory_syncs = 0
+                        tree_directory_count = len(args[2].directories)
+                        try: return original_write_tree(*args, **kwargs)
+                        finally: tree_stage = False
+                    original_fchmod = os.fchmod
+                    def injected_fchmod(fd, mode):
+                        if tree_stage and not hit and scenario == 'tree-stage-' + ('directory-chmod' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file-chmod'):
+                            mark_hit()
+                            raise OSError('injected ' + scenario)
+                        return original_fchmod(fd, mode)
+                    original_fdopen = os.fdopen
+                    def injected_fdopen(fd, *args, **kwargs):
+                        handle = original_fdopen(fd, *args, **kwargs)
+                        if tree_stage and not hit and scenario == 'tree-stage-file-write':
+                            class FailingWrite:
+                                def __enter__(self): return self
+                                def __exit__(self, *args): return handle.__exit__(*args)
+                                def write(self, content):
+                                    mark_hit()
+                                    raise OSError('injected ' + scenario)
+                            return FailingWrite()
+                        return handle
+                    def injected_sync(fd):
+                        nonlocal hit, tree_directory_syncs
+                        directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+                        if tree_stage:
+                            if directory: tree_directory_syncs += 1
+                            stage_edge = ('file-sync' if not directory else
+                                          'root-sync' if tree_directory_syncs == tree_directory_count + 1 else 'directory-sync')
+                            if not hit and scenario == 'tree-stage-' + stage_edge:
+                                mark_hit()
+                                raise OSError('injected ' + scenario)
+                        if not hit and ((scenario == 'final-root-sync' and documents_published and document_phase is None and not state_phase)
+                                        or (scenario == 'post-state-config-sync' and state_persisted)):
+                            mark_hit()
+                            raise OSError('injected ' + scenario)
+                        if not hit and ((scenario == 'file-sync' and not directory and stat.S_IMODE(os.fstat(fd).st_mode) == 0o644) or (scenario == 'uninstall-state-sync' and state_removed)):
+                            mark_hit()
+                            raise OSError('injected ' + scenario)
+                        if not hit and ((state_phase and scenario == ('state-parent-sync' if directory else 'state-sync')) or
+                                        (journal_removed and scenario == 'journal-removed-sync') or
+                                        (resource_renamed and scenario == 'resource-parent-sync')):
+                            mark_hit()
+                            raise OSError('injected ' + scenario)
+                        return fsync(fd)
+                    def injected_unlink(path, *args, **kwargs):
+                        nonlocal hit, journal_removed, state_removed
+                        if evidence_phase is not None and not hit:
+                            if scenario == 'evidence-delete' and str(path) == 'entry':
+                                mark_hit()
+                                raise OSError('injected ' + scenario)
+                            if scenario in {'tree-evidence-partial', 'tree-evidence-partial-interrupt'} and evidence_phase == next(o.destination.parent for o in plan.operations if o.component is C.HOOKS):
+                                result = unlink(path, *args, **kwargs)
+                                mark_hit()
+                                if scenario.endswith('interrupt'): raise KeyboardInterrupt('injected ' + scenario)
+                                raise OSError('injected ' + scenario)
+                        if state_phase and Path(path) == plan.state_file:
+                            if scenario == 'uninstall-state-unlink' and not hit:
+                                mark_hit()
+                                raise OSError('injected ' + scenario)
+                            result = unlink(path, *args, **kwargs)
+                            state_removed = True
+                            if scenario == 'uninstall-state-interrupt' and not hit:
+                                mark_hit()
+                                raise KeyboardInterrupt('after state unlink')
+                            return result
+                        if scenario == 'file-temp-unlink' and file_phase and str(path).startswith('.agent-workbench-copy-') and not hit:
+                            mark_hit()
+                            raise OSError('injected ' + scenario)
+                        if scenario == 'file-unlinked-interrupt' and file_phase and str(path).startswith('.agent-workbench-copy-') and not hit:
+                            result = unlink(path, *args, **kwargs)
+                            mark_hit()
+                            raise KeyboardInterrupt('after file temporary unlink')
+                            return result
+                        if str(path) == '.agent-workbench-transaction.json':
+                            if scenario == 'journal-unlink' and not hit:
+                                mark_hit()
+                                raise OSError('injected ' + scenario)
+                            result = unlink(path, *args, **kwargs)
+                            journal_removed = True
+                            return result
+                        return unlink(path, *args, **kwargs)
+                    def injected_cleanup(name, *args, **kwargs):
+                        nonlocal hit
+                        if scenario == 'tree-evidence-delete' and evidence_phase is not None and str(name) == 'entry' and not hit:
+                            mark_hit()
+                            raise OSError('injected ' + scenario)
+                        if scenario == 'resource-cleanup' and str(name).startswith('.agent-workbench-copy-') and not hit:
+                            mark_hit()
+                            raise OSError('injected ' + scenario)
+                        return delete_tree(name, *args, **kwargs)
+                    def injected_state(file, state):
+                        nonlocal hit, state_phase, state_persisted
+                        if scenario == 'before-state-fail':
+                            mark_hit()
+                            raise OSError('before state persistence')
+                        if scenario == 'state-capture-fail':
+                            mark_hit()
+                            raise OSError('injected state capture failure')
+                        state_phase = True
+                        try: write_state(file, state)
+                        finally: state_phase = False
+                        state_persisted = True
+                        if scenario == 'state-fail':
+                            mark_hit()
+                            raise OSError('injected state publication failure')
+                    token_hex = secrets.token_hex
+                    def stage_token_hex(n):
+                        return '0123456789abcdef' if scenario == 'file-temp-unlink' or scenario.startswith('tree-stage-') else token_hex(n)
+                    try:
+                        with ExitStack() as patches:
+                            for item in [patch.object(bundles, 'write_tree', injected_write_tree), patch.object(os, 'fchmod', injected_fchmod), patch.object(os, 'fdopen', injected_fdopen), patch.object(shared_config, 'compare_replace_document', injected_compare), patch.object(secrets, 'token_hex', stage_token_hex), patch.object(installation._DestinationRoot, 'discard', injected_discard), patch.object(Path, 'unlink', injected_path_unlink), patch.object(installation, 'remove_state', injected_remove_state), patch.object(os, 'link', injected_link), patch.object(installation._DestinationRoot, 'quarantine', interrupted_capture), patch.object(installation._DestinationRoot, 'create', injected), patch.object(installation, 'write_state', injected_state), patch.object(transactions, '_recover_locked', checked_recovery), patch.object(shared_config, 'replace_document', interrupted_journal), patch.object(os, 'replace', interrupted_replace), patch.object(os, 'fsync', injected_sync), patch.object(os, 'unlink', injected_unlink), patch.object(os, 'supports_dir_fd', os.supports_dir_fd | {injected_unlink}), patch.object(bundles, 'delete_tree', injected_cleanup), patch.object(bundles, 'rename_new', injected_rename)]: patches.enter_context(item)
+                            (installation.apply_uninstall if request['uninstall'] else installation.apply_plan)(plan)
+                        accepted = True
+                        error = None
+                    except (OSError, ValueError, KeyboardInterrupt) as exc:
+                        accepted = False
+                        # Host-generated strerror formatting differs across
+                        # languages. Preserve the concrete class and errno;
+                        # application/injected diagnostics compare literally.
+                        error = (type(exc).__name__, exc.errno if isinstance(exc, OSError) and exc.errno is not None else str(exc))
+                    if scenario.startswith(('late-', 'tree-stage-')) or scenario.endswith(('swap', 'sync', 'cleanup', 'unlink')) or scenario in {'evidence-delete', 'tree-evidence-delete', 'tree-evidence-partial', 'tree-evidence-partial-interrupt', 'file-sync', 'file-link', 'file-unlinked-interrupt', 'uninstall-state-interrupt', 'state-alias-interrupt', 'link-alias-interrupt', 'narrow-interrupt', 'capture-interrupt', 'partial-interrupt', 'journal-interrupt', 'before-state-fail', 'state-replace-interrupt', 'recovery-locks', 'resource-fail', 'interrupt', 'foreign-document', 'state-capture-fail', 'state-fail'}: assert hit, scenario
+                else:
+                    env = dict(os.environ, AW_APPLY_BASE=str(base), AW_APPLY_SCENARIO=scenario)
+                    subprocess.run(['cargo','test','--quiet','--lib','--manifest-path',str(REPO/'rust/Cargo.toml'),
+                        'transaction::apply_parity_tests::differential_apply','--','--ignored','--exact'],
+                        cwd=REPO, env=env, check=True)
+                    result = json.loads((base/'result.json').read_text())
+                    accepted = result['accepted']
+                    error = None if accepted else (result['error_class'], result.get('errno') or result['diagnostic'])
+                    if scenario.startswith(('late-', 'tree-stage-')) or scenario.endswith(('swap', 'sync', 'cleanup', 'unlink')) or scenario in {'evidence-delete', 'tree-evidence-delete', 'tree-evidence-partial', 'tree-evidence-partial-interrupt', 'file-sync', 'file-link', 'file-unlinked-interrupt', 'uninstall-state-interrupt', 'state-alias-interrupt', 'link-alias-interrupt', 'narrow-interrupt', 'capture-interrupt', 'partial-interrupt', 'journal-interrupt', 'before-state-fail', 'state-replace-interrupt', 'recovery-locks', 'resource-fail', 'interrupt', 'foreign-document', 'state-capture-fail', 'state-fail'}: assert result['hit'], scenario
+                outcomes.append((error, observe(fixture.project), observe(fixture.state), observe(fixture.fixture.root)))
+                if scenario.startswith('tree-stage-'):
+                    assert not accepted
+                    if engine == 'python': assert recovery_calls == 2
+                    else: assert result['recovery_observed']
+                    # Ordinary failure has already completed authenticated rollback.
+                    # A fresh plan must install successfully without fixture repair.
+                    retry = trusted()
+                    if engine == 'python':
+                        installation.apply_plan(retry)
+                    else:
+                        (base/'request.json').write_text(json.dumps(serialize(retry)))
+                        subprocess.run(['cargo','test','--quiet','--lib','--manifest-path',str(REPO/'rust/Cargo.toml'),
+                            'transaction::apply_parity_tests::differential_apply','--','--ignored','--exact'],
+                            cwd=REPO, env=dict(os.environ, AW_APPLY_BASE=str(base), AW_APPLY_SCENARIO=''), check=True)
+                        assert json.loads((base/'result.json').read_text())['accepted']
+                    outcomes.append(('retried', observe(fixture.project), observe(fixture.state), observe(fixture.fixture.root)))
+                if scenario.startswith('initial-'):
+                    if engine == 'python':
+                        try:
+                            transactions.recover(plan.state_file, {c: Path(p) for c, p in plan.next_state.destination_roots.items()}, target)
+                            recovery_error = None
+                        except (OSError, ValueError) as exc:
+                            recovery_error = (type(exc).__name__, exc.errno if isinstance(exc, OSError) and exc.errno is not None else str(exc))
+                    else:
+                        subprocess.run(['cargo','test','--quiet','--lib','--manifest-path',str(REPO/'rust/Cargo.toml'),
+                            'transaction::apply_parity_tests::differential_apply','--','--ignored','--exact'],
+                            cwd=REPO, env=dict(os.environ, AW_APPLY_BASE=str(base), AW_APPLY_SCENARIO='recover-only'), check=True)
+                        recovered = json.loads((base/'result.json').read_text())
+                        recovery_error = None if recovered['accepted'] else (recovered['error_class'], recovered.get('errno') or recovered['diagnostic'])
+                    outcomes.append((recovery_error, observe(fixture.project), observe(fixture.state), observe(fixture.fixture.root)))
+                if scenario.startswith('state-link'):
+                    assert observe(plan.state_file.parent/'referent.json') == referent_before, 'state referent changed'
+                    if scenario == 'state-link-interrupt':
+                        assert not accepted
+                        if engine == 'python':
+                            assert hit
+                            try:
+                                transactions.recover(plan.state_file, {c: Path(p) for c, p in plan.next_state.destination_roots.items()}, target)
+                            except (OSError, ValueError) as exc:
+                                recovery_error = (type(exc).__name__, exc.errno if isinstance(exc, OSError) and exc.errno is not None else str(exc))
+                            else: raise AssertionError('Python unexpectedly recovered symlinked state')
+                        else:
+                            assert result['hit']
+                            subprocess.run(['cargo','test','--quiet','--lib','--manifest-path',str(REPO/'rust/Cargo.toml'),
+                                'transaction::apply_parity_tests::differential_apply','--','--ignored','--exact'],
+                                cwd=REPO, env=dict(os.environ, AW_APPLY_BASE=str(base), AW_APPLY_SCENARIO='recover-only'), check=True)
+                            recovered = json.loads((base/'result.json').read_text())
+                            assert not recovered['accepted']
+                            recovery_error = (recovered['error_class'], recovered.get('errno') or recovered['diagnostic'])
+                        outcomes.append((recovery_error, observe(fixture.project), observe(fixture.state), observe(fixture.fixture.root)))
+                if scenario in {'tree-evidence-partial-interrupt', 'file-unlinked-interrupt', 'uninstall-state-interrupt', 'partial-interrupt', 'capture-interrupt', 'narrow-interrupt', 'link-alias-interrupt', 'state-alias-interrupt'} or scenario.endswith('swap'):
+                    assert not accepted
+                    swapped = scenario.endswith('swap')
+                    if swapped:
+                        original = next(o.destination.parent for o in plan.operations if o.component is C.HOOKS) if scenario.startswith('tree-') or capture_tree_swap else plan.operations[0].destination.parent
+                        if scenario.startswith('document-'): original = plan.documents[0].before.path.parent
+                        if scenario.endswith('parent-swap'): original = original.parent
+                        if original.is_symlink(): original.unlink()
+                        else: original.rmdir()
+                        (fixture.project/'detached').rename(original)
+                    # Consume the actual interrupted Rust writer's authenticated
+                    # journal with Python, preserving every authorized parent inode.
+                    roots = {c: Path(p) for c, p in plan.next_state.destination_roots.items()}
+                    if plan.previous_state:
+                        roots.update({c: Path(p) for c, p in plan.previous_state.destination_roots.items()})
+                    if swapped and engine == 'rust':
+                        subprocess.run(['cargo','test','--quiet','--lib','--manifest-path',str(REPO/'rust/Cargo.toml'),
+                            'transaction::apply_parity_tests::differential_apply','--','--ignored','--exact'],
+                            cwd=REPO, env=dict(os.environ, AW_APPLY_BASE=str(base), AW_APPLY_SCENARIO='recover-only'), check=True)
+                        assert json.loads((base/'result.json').read_text())['accepted']
+                    else:
+                        transactions.recover(plan.state_file, roots, target)
+                    outcomes.append(('recovered', observe(fixture.project), observe(fixture.state), observe(fixture.fixture.root)))
+                    if engine == 'rust' and not swapped:
+                        # Reproduce the same real interrupted mutation after Python
+                        # rollback, then exercise Rust's integrated mixed recovery.
+                        restored = (observe(fixture.project), observe(fixture.state), observe(fixture.fixture.root))
+                        replay = installation.plan_uninstall(fixture.workspace, target, fixture.state, project_root=fixture.project) if request['uninstall'] else trusted()
+                        replay_request = serialize(replay)
+                        replay_request['uninstall'] = request['uninstall']
+                        (base/'request.json').write_text(json.dumps(replay_request))
+                        for step in (scenario, 'recover-only'):
+                            subprocess.run(['cargo','test','--quiet','--lib','--manifest-path',str(REPO/'rust/Cargo.toml'),
+                                'transaction::apply_parity_tests::differential_apply','--','--ignored','--exact'],
+                                cwd=REPO, env=dict(os.environ, AW_APPLY_BASE=str(base), AW_APPLY_SCENARIO=step), check=True)
+                            actual = json.loads((base/'result.json').read_text())
+                            assert actual['accepted'] == (step == 'recover-only'), actual
+                            if step != 'recover-only': assert actual['hit']
+                        assert (observe(fixture.project), observe(fixture.state), observe(fixture.fixture.root)) == restored, 'Rust mixed restoration differs from actual Python recovery'
+                    retry = installation.plan_uninstall(fixture.workspace, target, fixture.state, project_root=fixture.project) if request['uninstall'] else trusted()
+                    if engine == 'python':
+                        (installation.apply_uninstall if request['uninstall'] else installation.apply_plan)(retry)
+                    else:
+                        retry_request = serialize(retry)
+                        retry_request['uninstall'] = request['uninstall']
+                        (base/'request.json').write_text(json.dumps(retry_request))
+                        subprocess.run(['cargo','test','--quiet','--lib','--manifest-path',str(REPO/'rust/Cargo.toml'),
+                            'transaction::apply_parity_tests::differential_apply','--','--ignored','--exact'],
+                            cwd=REPO, env=dict(os.environ, AW_APPLY_BASE=str(base), AW_APPLY_SCENARIO=''), check=True)
+                        assert json.loads((base/'result.json').read_text())['accepted']
+                    outcomes.append(('retried', observe(fixture.project), observe(fixture.state), observe(fixture.fixture.root)))
+            finally:
+                fixture.doCleanups()
+                shutil.rmtree(base/'fixture', ignore_errors=True)
+        midpoint = len(outcomes) // 2
+        if outcomes[:midpoint] != outcomes[midpoint:]:
+            for index, (left, right) in enumerate(zip(sum((list(x) for x in outcomes[:midpoint]), []), sum((list(x) for x in outcomes[midpoint:]), []))):
+                if left != right:
+                    if isinstance(left, list):
+                        left_map, right_map = {x[0]: x for x in left}, {x[0]: x for x in right}
+                        name = next(k for k in sorted(left_map.keys() | right_map.keys()) if left_map.get(k) != right_map.get(k))
+                        left, right = left_map.get(name), right_map.get(name)
+                    raise AssertionError(f'{scenario}: field {index}: Python={str(left)[:800]} Rust={str(right)[:800]}')
+
+if __name__ == '__main__': run()

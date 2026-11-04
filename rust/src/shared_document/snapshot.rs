@@ -26,6 +26,13 @@ pub(crate) struct Snapshot {
     pub content: Option<Vec<u8>>,
     pub revision: Option<(u64, u64, u64, i128, i128)>,
 }
+pub(crate) fn from_metadata(path: PathBuf, content: Vec<u8>, info: &std::fs::Metadata) -> Snapshot {
+    Snapshot {
+        path,
+        content: Some(content),
+        revision: Some(revision(info)),
+    }
+}
 fn revision(info: &std::fs::Metadata) -> (u64, u64, u64, i128, i128) {
     (
         info.dev(),
