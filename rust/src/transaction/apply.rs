@@ -44,16 +44,16 @@ impl std::error::Error for ForeignStageReplacement {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlannedDocument {
-    before: DocumentSnapshot,
-    removed: Option<Vec<u8>>,
-    after: Option<Vec<u8>>,
+    pub before: DocumentSnapshot,
+    pub removed: Option<Vec<u8>>,
+    pub after: Option<Vec<u8>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DocumentSnapshot {
-    path: PathBuf,
-    content: Option<Vec<u8>>,
-    revision: Option<(u64, u64, u64, i128, i128)>,
+    pub path: PathBuf,
+    pub content: Option<Vec<u8>>,
+    pub revision: Option<(u64, u64, u64, i128, i128)>,
 }
 impl DocumentSnapshot {
     fn snapshot(&self) -> Snapshot {
@@ -66,47 +66,47 @@ impl DocumentSnapshot {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RootSnapshot {
-    path: PathBuf,
-    identity: Option<[u64; 2]>,
-    anchor: PathBuf,
-    anchor_identity: [u64; 2],
+pub(crate) struct RootSnapshot {
+    pub path: PathBuf,
+    pub identity: Option<[u64; 2]>,
+    pub anchor: PathBuf,
+    pub anchor_identity: [u64; 2],
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Operation {
-    kind: String,
-    path: PathBuf,
-    component: String,
-    resource: super::path_recovery::Resource,
-    source: Option<PathBuf>,
-    digest: Option<String>,
-    expected_digest: Option<String>,
-    expected_link: Option<String>,
+pub(crate) struct Operation {
+    pub kind: String,
+    pub path: PathBuf,
+    pub component: String,
+    pub resource: super::path_recovery::Resource,
+    pub source: Option<PathBuf>,
+    pub digest: Option<String>,
+    pub expected_digest: Option<String>,
+    pub expected_link: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Source {
-    path: PathBuf,
-    digest: String,
-    tree: bool,
+pub(crate) struct Source {
+    pub path: PathBuf,
+    pub digest: String,
+    pub tree: bool,
 }
 /// Entire request originates in the current caller's validated plan, NOT a journal.
 /// Complete snapshots keep byte equality separate from inode/timestamp freshness.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ApplyRequest {
-    target: String,
-    repository: PathBuf,
-    roots: BTreeMap<String, PathBuf>,
-    state_before: DocumentSnapshot,
-    state_after: Vec<u8>,
-    conflicts: bool,
-    uninstall: bool,
-    root_snapshots: Vec<RootSnapshot>,
-    documents: Vec<PlannedDocument>,
-    sources: Vec<Source>,
-    operations: Vec<Operation>,
+    pub target: String,
+    pub repository: PathBuf,
+    pub roots: BTreeMap<String, PathBuf>,
+    pub state_before: DocumentSnapshot,
+    pub state_after: Vec<u8>,
+    pub conflicts: bool,
+    pub uninstall: bool,
+    pub root_snapshots: Vec<RootSnapshot>,
+    pub documents: Vec<PlannedDocument>,
+    pub sources: Vec<Source>,
+    pub operations: Vec<Operation>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApplyBoundary {

@@ -1173,7 +1173,7 @@ def state_wire_rows(base: Path) -> None:
 
 
 def state_v4_fail_closed(base: Path) -> None:
-    side = Side("rust", base / "v4-fail-closed", "cursor")
+    side = Side("rust", base / "v4-fail-closed", "claude")
     seed_v2(side)
     state = v2_state(side)
     state.update(schemaVersion=4, slots={}, destinationRoots={"skills": str(side.destination)})
@@ -1450,7 +1450,7 @@ def trust_inspection_rows(base: Path) -> None:
 
 
 def trust_cli_fail_closed(base: Path) -> None:
-    side = Side("rust", base / "trust-cli-rejection", "cursor")
+    side = Side("rust", base / "trust-cli-rejection", "claude")
     rejection_before = trust_snapshot(side.base)
     token = "aw-trust-v1:" + "a" * 64
     # "trust" is read-only planning on non-executable resources; grants are
@@ -1485,7 +1485,7 @@ def trust_cli_fail_closed(base: Path) -> None:
         snapshots = [trust_snapshot(side.base) for side in (py, rs)]
         compare("trust pending journal", py, rs, py.command("trust"), rs.command("trust"))
         assert [trust_snapshot(side.base) for side in (py, rs)] == snapshots
-    side = Side("rust", base / "trust-cli-rejection", "cursor", initialize=False)
+    side = Side("rust", base / "trust-cli-rejection", "claude", initialize=False)
     for action, args in (("trust", ("--component", "hooks")),
                          ("trust", ("--component", "mcp", "--trust", token)),
                          ("install", ("--component", "hooks")),
@@ -1494,7 +1494,7 @@ def trust_cli_fail_closed(base: Path) -> None:
         result = side.command(action, *args)
         assert result.returncode == 2, result
         assert trust_snapshot(side.base) == rejection_before, "unsupported activation mutated fixtures"
-    print("trust CLI: six-target skills exits/output/typed snapshots match; activation remains fail-closed")
+    print("trust CLI: six-target skills exits/output/typed snapshots match; Claude activation remains fail-closed")
 
 
 def trust_snapshot(base: Path):
@@ -2588,6 +2588,14 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
+            for script in ("check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
+                           "check_cursor_activation_recovery.py"):
+                activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
+                assert activation.returncode == 0, activation.stdout + activation.stderr
+                print(activation.stdout.strip())
+            inherited_activation = run([sys.executable, str(REPOSITORY / "rust/src/activation_contract.py")])
+            assert inherited_activation.returncode == 0, inherited_activation.stdout + inherited_activation.stderr
+            print(inherited_activation.stdout.strip())
             path_recovery = run([sys.executable, str(REPOSITORY / "rust/src/transaction/path_contract.py")])
             assert path_recovery.returncode == 0, path_recovery.stdout + path_recovery.stderr
             print(path_recovery.stdout.splitlines()[-1])
