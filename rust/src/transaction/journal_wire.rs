@@ -540,11 +540,11 @@ fn decode_source(saved: &[u8]) -> Result<Vec<u32>, String> {
         return Err("invalid JSON byte encoding".into());
     }
     let points = if width == 2 {
-        let words = bytes.chunks_exact(2).map(|b| {
+        let words = bytes.as_chunks::<2>().0.iter().map(|b| {
             if little {
-                u16::from_le_bytes([b[0], b[1]])
+                u16::from_le_bytes(*b)
             } else {
-                u16::from_be_bytes([b[0], b[1]])
+                u16::from_be_bytes(*b)
             }
         });
         char::decode_utf16(words)
@@ -555,13 +555,14 @@ fn decode_source(saved: &[u8]) -> Result<Vec<u32>, String> {
             .collect::<Vec<_>>()
     } else {
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| {
-                let b = [b[0], b[1], b[2], b[3]];
                 if little {
-                    u32::from_le_bytes(b)
+                    u32::from_le_bytes(*b)
                 } else {
-                    u32::from_be_bytes(b)
+                    u32::from_be_bytes(*b)
                 }
             })
             .collect()
