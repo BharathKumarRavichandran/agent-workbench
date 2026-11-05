@@ -257,7 +257,10 @@ fn contained(root: &Path, value: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn workspace(root: &Path, id: &str) -> Result<(Catalog, validation_json::Wire, Profile)> {
+pub(crate) fn workspace(
+    root: &Path,
+    id: &str,
+) -> Result<(Catalog, validation_json::Wire, Profile)> {
     if validate_id(id, "profile id").is_err() {
         return Err(format!("profile id is invalid: {}", state::wire::repr(id)));
     }
@@ -509,7 +512,7 @@ fn inspect_artifact(repository: &Path, kind: &str, root: &Path) -> Result<artifa
 }
 
 // Internal read-only renderer dependency for validate; public render remains E3.
-enum RenderError {
+pub(crate) enum RenderError {
     Report(String),
     Git(Vec<u8>),
 }
@@ -524,6 +527,18 @@ impl From<&str> for RenderError {
     }
 }
 fn generated_check(root: &Path) -> std::result::Result<Vec<PathBuf>, RenderError> {
+    let mut stale = Vec::new();
+    for (path, content) in generated_files(root)? {
+        if !path.is_file() || fs::read(&path).map_err(|e| e.to_string())? != content.as_bytes() {
+            stale.push(path);
+        }
+    }
+    Ok(stale)
+}
+
+pub(crate) fn generated_files(
+    root: &Path,
+) -> std::result::Result<Vec<(PathBuf, String)>, RenderError> {
     let (catalog, raw, profile) = workspace(root, "default")?;
     let mut generated = Vec::new();
     for agent in ["cursor", "claude"] {
@@ -686,12 +701,16 @@ fn generated_check(root: &Path) -> std::result::Result<Vec<PathBuf>, RenderError
         plugins,
     };
     let path = root.join("catalog/lock.json");
-    if path.is_symlink() {
-        return Err(format!(
-            "generated output has a symlinked output path: {}",
-            path.display()
-        )
-        .into());
+    let mut current = root.to_path_buf();
+    for part in path.strip_prefix(root).unwrap().components() {
+        current.push(part);
+        if current.is_symlink() {
+            return Err(format!(
+                "generated output has a symlinked output path: {}",
+                current.display()
+            )
+            .into());
+        }
     }
     let mut lock =
         validation_json::parse(&serde_json::to_string(&lock).map_err(|e| e.to_string())?)?;
@@ -702,13 +721,7 @@ fn generated_check(root: &Path) -> std::result::Result<Vec<PathBuf>, RenderError
         lock.set("plugins", validation_json::Wire::Array(entries));
     }
     generated.push((path, lock.pretty()?));
-    let mut stale = Vec::new();
-    for (path, content) in generated {
-        if !path.is_file() || fs::read(&path).map_err(|e| e.to_string())? != content.as_bytes() {
-            stale.push(path);
-        }
-    }
-    Ok(stale)
+    Ok(generated)
 }
 fn truthy(value: &validation_json::Wire) -> bool {
     use validation_json::Wire;

@@ -164,3 +164,20 @@ its traceback is asserted, not silently discarded from a generic comparison.
 
 The E2 acceptance map and finite JSON evidence live in `SECTION_E_CONTRACT.md`.
 Local evidence does not substitute for focused review or exact-SHA Ubuntu CI.
+
+## RENDER-GIT-1 — uncaught rendering Git revision failure (user authorized)
+
+The user explicitly extended the VAL-GIT-1 traceback-only contract to public
+`render` and `render --check`. At the same `LockReportRenderer.render` revision
+lookup, frozen Python emits real Git stderr followed by an uncaught
+`CalledProcessError` traceback, empty stdout and exit 1. Rust retains exactly
+the real Git stderr and exit 1, emits no stdout, and omits the Python traceback.
+No other rendering failure, source update, or transaction behavior is covered.
+Python production is unchanged.
+
+`check_render_parity.py` exercises an existing nonrepository and an initialized
+repository without HEAD, through write/check/repeat paths. It separately asserts
+Python's literal traceback and Rust's traceback-free raw stderr; all filesystem
+bytes/types/modes/links and failed-command identity remain unchanged. The
+permanent test observed RED on Rust's explicit incomplete-contract refusal,
+then GREEN after this authorized error-channel change.

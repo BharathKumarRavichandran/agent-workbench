@@ -18,6 +18,7 @@ mod bundle_parity_tests;
 mod bundles;
 pub mod capabilities;
 mod lifecycle;
+mod rendering;
 mod resource;
 mod shared_document;
 #[cfg(test)]
@@ -1019,6 +1020,9 @@ pub struct CommandOutput {
 }
 
 pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
+    if rendering::requested(&args) {
+        return rendering::run(&args);
+    }
     if validation::requested(&args) {
         return validation::run(&args);
     }

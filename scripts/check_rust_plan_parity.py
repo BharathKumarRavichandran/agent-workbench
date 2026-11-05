@@ -2599,7 +2599,7 @@ def main() -> int:
                            "check_claude_activation_edges.py", "check_claude_activation_recovery.py",
                            "check_claude_native_contract.py", "check_activation_inertness.py",
                            "check_artifact_inspection_parity.py", "check_artifact_inventory.py",
-                           "check_validate_parity.py"):
+                           "check_validate_parity.py", "check_render_parity.py", "check_render_failures.py"):
                 activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
                 assert activation.returncode == 0, activation.stdout + activation.stderr
                 print(activation.stdout.strip())
