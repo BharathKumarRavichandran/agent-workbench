@@ -121,3 +121,46 @@ the replacement. A second RED after an injected post-rename fsync failure proved
 that successful-operation status was insufficient: mutation completion must be
 tracked separately. Both phase regressions now pass locally. Full gate and Ubuntu
 evidence are tracked separately in `TRANSACTION_CONTRACT.md`.
+
+## VAL-GIT-1 — uncaught validation Git revision failure (user authorized)
+
+The user explicitly approved **Python 3.12 as the exact diagnostic oracle** and
+this narrowly bounded diagnostic exception while completing Section E2. Python
+production remains frozen. This identifier is distinct from the transaction
+E1/E2 exceptions above; neither transaction authorization is changed.
+
+### Exact boundary and observable difference
+
+`agent_workbench/adapters/lock.py:35-38` invokes real `git -C <source>
+rev-parse HEAD` while the internal canonical lock renderer checks generated
+files. If Git exits unsuccessfully, its stderr is inherited and Python's
+`subprocess.CalledProcessError` escapes `validation.validate` (which catches
+only `OSError`, `ValueError`, and `KeyError`). Python emits **empty stdout,
+exit 1, the real Git stderr bytes, followed by its uncaught traceback**.
+
+Rust intentionally emits **empty stdout, exit 1, and those real Git stderr bytes
+unchanged**, omitting only the Python traceback. It emits neither a JSON report
+nor a human report, even when earlier validation issues were accumulated. This
+is a separate `RenderError::Git(Vec<u8>)` channel, not a structured
+`RENDER_FAILED`, trimming/decoding of stderr, or an exception for ordinary
+renderer errors. Failed process spawning remains the ordinary renderer-error
+path. `--no-generated-check` bypasses the Git renderer as in Python.
+
+This authorization covers only unsuccessful Git revision lookup during public
+validation. It does not authorize public `render`, source `update`, altered
+lifecycle stderr/status, execution of Python by Rust, or normalization of any
+other error. The frozen oracle still runs literally in the differential tests;
+its traceback is asserted, not silently discarded from a generic comparison.
+
+### Acceptance-to-test map
+
+| Authorized edge | Executable evidence |
+| --- | --- |
+| Existing nonrepository and initialized repository without HEAD | `check_validate_parity.py::git_revision_rows`, actual Git commands in scratch, no mocks |
+| Human and JSON modes, with and without an earlier validation issue | Eight real paired public rows; Python traceback and Rust's exact raw stderr/empty stdout/exit 1 asserted separately |
+| No partial report or filesystem mutation | Every exception row compares complete fixture file kinds, modes, bytes, lexical links, inodes and timestamps before/after |
+| Generated-check bypass | Same fixture with `--no-generated-check`, ordinary exact differential |
+| Python 3.12 runtime contract, including subprocess `python3` | `scripts/parity_oracle.py`, invoked before parity fixtures/builds and unconditionally by the full parity gate; both mismatched top-level Python and mismatched PATH are rejected |
+
+The E2 acceptance map and finite JSON evidence live in `SECTION_E_CONTRACT.md`.
+Local evidence does not substitute for focused review or exact-SHA Ubuntu CI.

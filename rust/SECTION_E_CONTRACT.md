@@ -85,8 +85,12 @@ all-target Clippy with warnings denied, Cargo tests, complete parity (including
 D8, both transaction safety exceptions, and 196 E1 public paired rows), and all
 188 Python tests. Independent correction recheck reproduced the three original
 findings as GREEN and found no remaining blocker. No declared external endpoint
-or installed host resource was touched. Exact-SHA Ubuntu CI remains the delivery
-gate before E2 begins.
+or installed host resource was touched. E1 commit
+`d1ca24b676cf854a83760ad004ad094cc9f2b269` passed all Ubuntu jobs in
+[run 41876226575](https://github.com/BharathKumarRavichandran/agent-workbench/actions/runs/41876226575)
+before E2 began (exact-SHA result freshly confirmed by the parent). The initial
+attempt failed an existing quarantine-lock test; the rerun passed at the same
+SHA. Its root cause is unconfirmed; no fix is claimed.
 
 The private API contract is distinct from public `validate` (E2). Generalized
 JSON syntax diagnostic/encoding exhaustiveness is not claimed here: the E1
@@ -95,3 +99,141 @@ malformed JSON lexeme. Custom registration evidence covers effective capability
 validation/projection, not a newly added custom-target public CLI or native
 activation lifecycle. Ubuntu evidence requires CI for the eventual exact SHA;
 local macOS success is not substituted for it.
+
+# Section E2 — public validate implementation checkpoint (review pending)
+
+Python production is unchanged. `validation.rs` handles real public `validate`,
+`--json`, and `--no-generated-check`; `validation_codec.rs` independently models
+ordered catalog/profile decoding and workspace resolution. The validation-only
+`validation_json.rs` boundary retains Python code points (including lone
+surrogates), arbitrary integers, binary64 floats and nonfinite constants; it
+does not widen lifecycle/shared-document decoding. The existing E1
+inspector is shared through `inspect_decoded`, without importing Python data.
+Transaction exceptions E1/E2 are unrelated and untouched.
+
+The read-only deterministic renderer is an **E2 dependency**: Cursor and Claude
+marketplace JSON and the catalog lock are computed internally to check canonical
+default-profile bytes. Public `render`/`render --check` remain unsupported (E3);
+there is no generated-output write implementation here. Update, lifecycle human
+output, broad parser/help parity and later units remain unimplemented.
+
+## Acceptance-to-test map
+
+`check_validate_parity.py` runs unconditionally in `check_rust_plan_parity.py`.
+Every paired public row compares stdout bytes, stderr bytes, exit status, and
+whole-fixture file type/mode/content/link/inode/mtime/ctime before and after.
+Fixtures and subprocess temporary files require explicit scratch TMPDIR.
+
+| E2 acceptance edge | Executable evidence |
+| --- | --- |
+| First actual CLI tracer, no generated check | Empty workspace JSON: Python `[]`/0 versus Rust unsupported command/2 RED, then GREEN before expansion |
+| Human no-components summary, duplicate/unknown profile-target order, repeated unknown targets | Public tracer group, both human and JSON output |
+| Inspection then provenance then renderer then duplicate-skill diagnostics; Unicode JSON escaping | Combined native/skills/unknown-artifact fixture, including duplicate unknown targets and Unicode skill names |
+| Full catalog decode before profile, full profile before identity resolution, artifacts before plugin identity | `malformed`: 109 paired omitted/null/wrong-type/unknown/combined-defect rows |
+| Source/plugin duplicates, unknown include/exclude sorting, selected missing sources/roots | Same malformed rows through the real public CLI |
+| Nested duplicate-key hook precedence and exact Python 3.12 syntax diagnostic coordinates | `wire_rows`: 44 CLI rows; `wire_boundary_rows`: 160 rows through catalog, profile, native manifest, hooks and MCP readers |
+| Canonical profile selection despite a subset profile; no-generated-check skips canonical loading | `generated_rows`, including malformed default profile with valid selected subset |
+| All three generated outputs, missing/stale/current files, directory and symlink outputs | `generated_rows`; current bytes are oracle-written fixture files, independently recomputed by Rust |
+| Native manifest fallback vs required native validation, name/description validation, malformed/duplicate manifests | `generated_rows` and `filesystem_rows` |
+| Lock version truthiness, ordered foreign version maps, floats and huge integers | Six generated-version rows; Python-compatible existing shared-document formatter reused after a real stale-lock RED |
+| Missing input files, invalid UTF-8/UTF-16 rejection, invalid/mismatched/escaping profile identifiers, symlink manifest rejection | `filesystem_rows`; actual UTF-8 and manifest-link REDs corrected |
+| Unselected unknown-source plugins do not receive resolved-plugin provenance diagnostics | Final filesystem row: concrete extra-provenance RED corrected |
+| Public validation never executes declared hooks/MCP and creates no state/trust | Existing D8 executable/loopback positive controls and private native validator retained; public no-generated-check validation now exercised in both engines |
+| Existing lifecycle dispatch cannot mistake an option value for the validate command | Cargo test `validation::tests::validate_as_an_option_value_is_not_a_command`, observed RED then GREEN |
+| All six skills, copied paths, native activation, transaction races/recovery/exceptions | Explicit Python 3.12 full parity gate passed again with all 549 E2 rows; inherited 170-row evidence is retained historically |
+
+## Approved oracle and exception contracts
+
+The user approved **Python 3.12 as the exact diagnostic oracle**. Both the full
+parity gate and E2 entry point call `scripts/parity_oracle.py` before fixtures or
+builds; the gate also invokes it as a script. It rejects a top-level interpreter
+other than 3.12 and separately verifies that subprocess `python3` on PATH is
+3.12. No diagnostics are normalized between Python releases. On this host the
+actual Python 3.14.8 entry point and the combination of top-level 3.12.15 with
+PATH `python3` 3.14 were each rejected; the fully pinned 3.12.15 path passed.
+CI already selects 3.12. A reproducible local invocation is:
+
+```sh
+TMPDIR=/Users/teslash/.hermes/profiles/agent-workbench/cache/scratch \
+PATH=/opt/homebrew/opt/python@3.12/libexec/bin:$PATH \
+/opt/homebrew/bin/python3.12 scripts/check_rust_plan_parity.py
+```
+
+The user separately approved **VAL-GIT-1**, documented in
+`PARITY_EXCEPTIONS.md`: unsuccessful Git revision lookup during validation
+retains real Git stderr bytes and exit 1, omits only Python's uncaught traceback,
+and emits no JSON or human report. This is not a `RENDER_FAILED` issue, broad
+error normalization, a production-oracle edit, or either transaction E1/E2.
+
+## Additional acceptance-to-test map
+
+| E2 completion edge | Executable evidence |
+| --- | --- |
+| Uncaught Git revision error, including pre-existing issues and both output modes | `git_revision_rows`: eight actual paired exception rows, two real Git failure classes; one ordinary no-generated-check bypass row |
+| Nonfinite constants and exponent overflow/underflow, leading zeros, incomplete fraction/exponent, invalid literals, truncated arrays, malformed escapes and control characters | `wire_rows` plus all five real reader boundaries in `wire_boundary_rows`; exact bytes, coordinates and statuses, not an accept/reject-only check |
+| Ignored catalog/profile `$schema` and foreign native-manifest fields retain permissive JSON acceptance | `json_field_rows`, NaN/±Infinity, high/low lone surrogates, separated surrogates, surrogate object keys with nested values, valid surrogate pairs |
+| Manifest version preserves nonfinite values in canonical lock bytes; malformed name/description types reject at the right boundary | Same rows check independently recomputed current/stale lock bytes, both generated and no-generated-check modes; lexical `1e999` version row |
+| Accepted lone-surrogate names/descriptions are not scalar-decoder failures | Same rows: catalog descriptive fields validate without generation; generated UTF-8 encoding failures retain exact Python diagnostic positions; manifest name mismatch remains distinct from manifest shape errors |
+| Hook/MCP foreign values, command fields, event/server names and invalid version values remain inert | `artifact_json_rows`: 60 paired rows; E2 lossless loader is injected only into readonly inspection; ordinary lifecycle inspection/compilation is unchanged |
+| Whole-fixture immutability | Every paired E2 row checks types, modes, bytes, literal links, inodes, mtime and ctime; the eight exception rows independently assert the authorized outcomes |
+| Source and provenance upstream parsing matches Python 3.12 without rewriting stored strings | `upstream_rows`: 182 public pairs, including scheme case, leading C0/space, embedded tab/CR/LF, eager bracket/IPv6/IPvFuture checks, NFKC delimiter rejection, exact SCP fullmatch, combined-defect precedence, both output modes and oracle-written current generated bytes |
+| Descriptive NUL rejection precedes scalar projection and later catalog defects | `descriptive_nul_rows`: 84 public pairs across marketplace name/description/owner.name, NUL before/after lone surrogates, ordinary NUL, accepted high/low lone surrogates, generated/no-generated modes and combined source defects |
+
+## Checkpoint evidence and remaining delivery work
+
+The inherited 170-row checkpoint was preserved before editing in a recoverable
+scratch snapshot containing tracked binary diffs, every dirty tracked/untracked
+file, and a mode/SHA-256 manifest. The completed focused matrix now passes
+**549 paired public CLI rows**, including the eight explicit VAL-GIT-1 exception
+rows. Real behavioral REDs preceded correction: structured Git reports instead
+of raw stderr; rejection of nonfinite values and lone-surrogate strings at the
+JSON boundary; wrong malformed-number/escape diagnostics; valid ignored native
+fields incorrectly making manifests invalid; and hook/MCP foreign values being
+rejected by the narrower shared-document decoder. None is claimed as exhaustive
+fuzz evidence. The native/shared-document/lifecycle parsers remain independent.
+
+The finite matrix pins the named accepted and rejected fields/lexemes above;
+it does not claim arbitrary malformed-input, recursion-limit, interpreter
+configuration, filesystem-surrogate-path, or scheduling exhaustiveness. The
+read-only renderer remains an E2 dependency only. Public render and render
+--check are still E3, and update/general parser/help migration is not enabled.
+
+All five local macOS gates passed at this stable implementation checkpoint:
+format check, warnings-denied all-target Clippy, Cargo tests (16 library and
+15 integration passed; 17 private drivers intentionally exercised by parity),
+full explicit Python 3.12 parity, and all 188 Python unittest tests. D8's real
+canaries and both native targets, all six skills lifecycles, copied/race/recovery
+suites and both transaction exceptions passed in that complete gate. The
+repository's CI unittest command passed without installing test dependencies.
+No new unsafe oracle behavior was observed.
+
+Focused review identified two reproducible parity blockers; both were corrected
+and independently rechecked. All five parent mandatory local gates passed after
+the corrections, including 815 public validation pairs and 188 Python tests.
+E2 is locally accepted; exact-SHA Ubuntu verification remains required before E3.
+Python production remains unchanged.
+
+### Independent E2 review corrections (stable, uncommitted)
+
+Both review blockers were reproduced by permanent public differential rows before
+production edits. `upstream_rows` observed actual acceptance/diagnostic drift for
+uppercase HTTPS, leading C0/space, embedded scheme controls, malformed brackets
+and SCP LF paths; its full pre-fix failure log is retained in scratch as
+`e2-upstream-red.log`. `descriptive_nul_rows` separately observed Python's
+non-empty-string rejection versus Rust acceptance/later errors for surrogate+NUL
+in name, description and sibling owner.name (`e2-descriptive-red.log`).
+
+The correction traces frozen `codec.py::_upstream` and both source/provenance
+callers, matching the relevant Python 3.12 `urlsplit` eager validation while
+retaining original strings. It checks descriptive code-point NUL before scalar
+projection and continues accepting otherwise valid lone surrogates. The complete
+E2 matrix now passes **815 paired public CLI rows** (182 upstream + 84 descriptive
+review rows added). All original independent-review reproductions are GREEN.
+Format, warnings-denied all-target Clippy and Cargo tests also pass. The parent
+will recheck the corrections and rerun all five mandatory gates at this stable
+checkpoint; no new full-gate or Ubuntu result is claimed here. Public render E3,
+Python production, VAL-GIT-1 and transaction exceptions remain unchanged.
+
+Pre-edit dirty tracked/untracked files, modes, SHA-256 manifest and binary diff
+are preserved in scratch `e2-blocker-checkpoint-20261104-185613`. No commit,
+TODO acceptance change or push was performed.

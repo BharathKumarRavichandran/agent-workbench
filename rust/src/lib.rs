@@ -27,6 +27,9 @@ mod transaction;
 #[cfg(test)]
 mod transaction_parity_tests;
 mod trust;
+mod validation;
+mod validation_codec;
+mod validation_json;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -1011,13 +1014,18 @@ pub fn operations_json(operations: &[Operation]) -> Result<String> {
 
 pub struct CommandOutput {
     pub stdout: String,
+    pub stderr: Vec<u8>,
     pub exit_code: u8,
 }
 
 pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
+    if validation::requested(&args) {
+        return validation::run(&args);
+    }
     if help_requested(&args) {
         return Ok(CommandOutput {
             stdout: usage_text() + "\n",
+            stderr: Vec::new(),
             exit_code: 0,
         });
     }
@@ -1028,6 +1036,7 @@ pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
     let (operations, conflicts) = lifecycle::run(&cli)?;
     Ok(CommandOutput {
         stdout: operations_json(&operations)? + "\n",
+        stderr: Vec::new(),
         exit_code: if conflicts { 1 } else { 0 },
     })
 }

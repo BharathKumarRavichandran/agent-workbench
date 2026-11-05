@@ -5,6 +5,10 @@ fn main() -> ExitCode {
     match execute(std::env::args().collect()) {
         Ok(output) => {
             print!("{}", output.stdout);
+            use std::io::Write;
+            std::io::stderr()
+                .write_all(&output.stderr)
+                .expect("write stderr");
             ExitCode::from(output.exit_code)
         }
         Err(error) => {

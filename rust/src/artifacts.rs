@@ -57,7 +57,7 @@ pub(crate) fn load_json_object(repository: &Path, path: &Path) -> Result<Wire> {
 
 // Path.resolve(strict=False) also retains suffixes beneath regular files. Keep
 // this inspection policy separate from installation path authorization.
-fn resolve_catalog_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_catalog_path(path: &Path) -> Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error)
@@ -93,6 +93,23 @@ pub fn inspect_catalog(repository: &Path) -> Result<CatalogInspection> {
     let catalog = decode_catalog(&catalog_path)?;
     let raw =
         crate::state::wire::parse(&fs::read_to_string(&catalog_path).map_err(|e| e.to_string())?)?;
+    inspect_decoded(repository, &catalog, &raw)
+}
+
+pub(crate) fn inspect_decoded(
+    repository: &Path,
+    catalog: &Catalog,
+    raw: &Wire,
+) -> Result<CatalogInspection> {
+    inspect_decoded_with(repository, catalog, raw, inspect)
+}
+
+pub(crate) fn inspect_decoded_with(
+    repository: &Path,
+    catalog: &Catalog,
+    raw: &Wire,
+    inspector: fn(&Path, &str, &Path) -> Result<Inventory>,
+) -> Result<CatalogInspection> {
     let Wire::Array(raw_plugins) = raw.get("plugins") else {
         unreachable!()
     };
@@ -154,7 +171,7 @@ pub fn inspect_catalog(repository: &Path) -> Result<CatalogInspection> {
                     "artifact path does not exist".into(),
                 ));
             } else {
-                match inspect(repository, kind, &root) {
+                match inspector(repository, kind, &root) {
                     Ok(inventory) => {
                         if !inventory.components.is_empty() {
                             *result.counts.entry(kind.clone()).or_default() +=

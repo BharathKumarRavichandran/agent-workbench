@@ -762,6 +762,7 @@ fn run_inner(
             return lifecycle::run(cli).and_then(|(ops, conflicts)| {
                 Ok(CommandOutput {
                     stdout: operations_json(&ops)? + "\n",
+                    stderr: Vec::new(),
                     exit_code: u8::from(conflicts),
                 })
             });
@@ -818,6 +819,7 @@ fn run_inner(
     }
     Ok(CommandOutput {
         stdout,
+        stderr: Vec::new(),
         exit_code: u8::from(conflicts),
     })
 }
