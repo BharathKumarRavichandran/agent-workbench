@@ -756,16 +756,27 @@ fn run_inner(
         .map(PublicOperation::Path)
         .chain(operations.iter().map(PublicOperation::Slot))
         .collect();
-    let stdout = serde_json::to_string_pretty(&public).map_err(|e| e.to_string())? + "\n";
+    let stdout = if cli.json {
+        serde_json::to_string_pretty(&public).map_err(|e| e.to_string())? + "\n"
+    } else {
+        let mut text = operations_output(&plan.operations, false)?;
+        for operation in &operations {
+            let reason = operation_reason(
+                &operation.reason,
+                operation.diagnostic.as_deref(),
+                operation.trust_token.as_deref(),
+                operation.trust_required,
+            );
+            text.push_str(&format!(
+                "{:14} {}/shared-json-slot {} [{}]  ({reason})\n",
+                operation.kind, operation.component, operation.destination, operation.slot
+            ));
+        }
+        text
+    };
     if matches!(cli.action, Action::Install | Action::Uninstall) && !conflicts {
         if documents.is_empty() {
-            return lifecycle::run(cli).and_then(|(ops, conflicts)| {
-                Ok(CommandOutput {
-                    stdout: operations_json(&ops)? + "\n",
-                    stderr: Vec::new(),
-                    exit_code: u8::from(conflicts),
-                })
-            });
+            return lifecycle::run(cli);
         }
         let request = tx::ApplyRequest {
             target: policy.id().into(),
@@ -815,10 +826,32 @@ fn run_inner(
                 })
                 .collect(),
         };
-        tx::apply(&request, boundary).map_err(error)?;
+        if let Err(failure) = tx::apply(&request, boundary) {
+            let state_lock = plan.state_file.with_file_name(format!(
+                ".{}.lock",
+                plan.state_file.file_name().unwrap().to_string_lossy()
+            ));
+            let message = match &failure {
+                Error::Io(e)
+                    if e.get_ref()
+                        .and_then(|cause| {
+                            cause.downcast_ref::<crate::transaction::LockContention>()
+                        })
+                        .is_some_and(|busy| busy.path == state_lock) =>
+                {
+                    format!(
+                        "installation state is locked by another operation: {}",
+                        plan.state_file.display()
+                    )
+                }
+                _ => error(failure),
+            };
+            return Ok(CommandOutput::apply_error(stdout, message, cli.json));
+        }
     }
     Ok(CommandOutput {
         stdout,
+        stdout_single_write: cli.json,
         stderr: Vec::new(),
         exit_code: u8::from(conflicts),
     })

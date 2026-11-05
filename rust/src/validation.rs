@@ -62,6 +62,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
         Err(RenderError::Git(stderr)) => {
             return Ok(CommandOutput {
                 stdout: String::new(),
+                stdout_single_write: true,
                 stderr,
                 exit_code: 1,
             })
@@ -116,6 +117,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
     };
     Ok(CommandOutput {
         stdout,
+        stdout_single_write: args.iter().any(|arg| arg == "--json"),
         stderr: Vec::new(),
         exit_code,
     })

@@ -44,13 +44,21 @@ pub(super) struct Plan {
     pub requested: Vec<ComponentKind>,
 }
 
-pub(super) fn run(cli: &Cli) -> Result<(Vec<Operation>, bool)> {
+pub(super) fn run(cli: &Cli) -> Result<CommandOutput> {
     let plan = reconcile(cli)?;
     let conflicts = has_conflicts(&plan.operations);
+    let stdout = operations_output(&plan.operations, cli.json)?;
     if matches!(cli.action, Action::Install | Action::Uninstall) && !conflicts {
-        apply(&plan, cli.action == Action::Uninstall)?;
+        if let Err(error) = apply(&plan, cli.action == Action::Uninstall) {
+            return Ok(CommandOutput::apply_error(stdout, error, cli.json));
+        }
     }
-    Ok((plan.operations, conflicts))
+    Ok(CommandOutput {
+        stdout,
+        stdout_single_write: cli.json,
+        stderr: Vec::new(),
+        exit_code: u8::from(conflicts),
+    })
 }
 
 pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {

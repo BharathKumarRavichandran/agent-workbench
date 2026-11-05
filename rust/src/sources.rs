@@ -45,12 +45,14 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
     match update(&root, &profile, &source) {
         Ok((before, after)) => Ok(CommandOutput {
             stdout: format!("{source}: {before} -> {after}\n"),
+            stdout_single_write: true,
             stderr: Vec::new(),
             exit_code: 0,
         }),
         Err(RenderError::Report(error)) => Err(error),
         Err(RenderError::Git(stderr)) => Ok(CommandOutput {
             stdout: String::new(),
+            stdout_single_write: true,
             stderr,
             exit_code: 1,
         }),

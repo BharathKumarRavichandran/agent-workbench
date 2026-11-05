@@ -413,4 +413,50 @@ all-target Clippy with warnings denied, Cargo tests, the complete parity gate
 (including 55 update scenarios / 110 paired executions), and all 188 Python
 unittests. Independent correction review passed. E4 is locally accepted under
 UPDATE-GIT-1 and UPDATE-CONFIG-1; exact-SHA Ubuntu evidence is required before E5.
-No E5/E6 implementation has begun, and Python production remains unchanged.
+E5 began only after E4 head `5ef60af40158b9043a3b54194b223665ae4dbe2e`
+passed all Ubuntu jobs in [run 41995623812](https://github.com/BharathKumarRavichandran/agent-workbench/actions/runs/41995623812);
+its checkout log confirms the literal head. Python production remains unchanged.
+
+# Section E5 — deterministic lifecycle text (review pending)
+
+`operations_output` and the native slot printer reproduce the existing Python
+14-character operation-kind padding, component/resource labels, optional source
+arrow, slot brackets, diagnostic/reason and required/granted trust text. JSON
+serialization remains the same ordered serializer. The CLI no longer requires
+`--json`; this unit does not replace the general parser/help contract (E6).
+
+Lifecycle and native apply now retain the already-rendered operation stdout
+when apply returns an ordinary error. A typed lock-contention cause preserves
+the primitive's existing diagnostic while allowing the public state-lock error
+to identify the actual state file, not infer authority from a generic errno.
+No lock or transaction mutation protocol is changed.
+
+| E5 acceptance edge | Runnable evidence |
+| --- | --- |
+| Initial public text tracer | Worker observed missing-`--json` rejection RED for Hermes, then six-row GREEN before expansion; inherited interruption snapshot `e5-resume-snapshot-h8uc9yi0` preserves every changed file and binary diffs/hash/mode manifest |
+| All six skills targets, empty/repeated uninstall, install/keep/status output and state | `check_lifecycle_text_parity.py`: each target full real lifecycle |
+| Mixed copied paths, skills, hook bundles and shared slots | `native-cursor`, `native-claude`, real human commands plus independent JSON probes |
+| Untrusted/granted/persisted trust text and exact slot ordering | Same native cases; plan/trust/status/install/refusal/reinstall/uninstall |
+| Conflict/adopt/replace-owned/remove-owned, unsupported resource and missing project diagnostics | `edges`, all six targets; CLI adopt changes real ownership and source-path relocation replaces only the owned link |
+| Apply failure retains operation bytes, exact state-lock stderr and exit 2 | `failures`, six skills targets and both native targets, install/uninstall in human and JSON modes; lock held through an independent real descriptor |
+| Separate stdout/stderr and merged-stream ordering under apply failure | Same failures execute twice while lock held; assert fixture unchanged |
+| Existing JSON, transaction and inertness behavior | Full existing parity gate retained |
+
+The focused matrix now passes 307 paired public rows and is wired
+unconditionally into `check_rust_plan_parity.py`. Review exposed inherited
+`PYTHONUNBUFFERED=1` masking default merged-stream ordering. The explicit
+absent/empty/zero/nonempty buffering matrix observed RED, then GREEN after
+matching the oracle's text and binary buffering layers and device block size.
+Large human and single-write JSON reports cross buffer thresholds in both
+buffered and unbuffered modes; their real lock failure order is compared, not
+just separate streams. Constructor metadata records JSON's single print payload
+without inferring output semantics from string contents.
+
+The public interruption driver was migrated to the new nonzero CommandOutput
+failure channel: it requires exit 2, the injected diagnostic and retained
+operation stdout. Existing authenticated journal/recovery/retry assertions are
+unchanged; both native recovery suites pass. No Python output is consumed by
+Rust. Independent correction review and all five parent mandatory local gates
+passed after correction, including the full retained parity matrix and 188
+Python tests. E5 is locally accepted; exact-SHA Ubuntu remains required before
+E6 begins.

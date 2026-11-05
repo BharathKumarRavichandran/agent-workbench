@@ -54,6 +54,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
         Err(validation::RenderError::Git(stderr)) => {
             return Ok(CommandOutput {
                 stdout: String::new(),
+                stdout_single_write: true,
                 stderr,
                 exit_code: 1,
             })
@@ -86,6 +87,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
         .collect();
     Ok(CommandOutput {
         stdout,
+        stdout_single_write: false,
         stderr: Vec::new(),
         exit_code: u8::from(check && !stale.is_empty()),
     })

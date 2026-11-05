@@ -23,11 +23,21 @@ fn differential_public_activation() {
         Ok(())
     });
     assert!(hit, "independent public plan never reached {edge}");
-    assert!(result.is_err(), "interruption silently succeeded");
+    let output = result.unwrap_or_else(|error| panic!("missing public error output: {error}"));
+    assert_eq!(output.exit_code, 2, "interruption silently succeeded");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("public activation interruption"),
+        "injected interruption diagnostic was lost"
+    );
+    assert!(
+        !output.stdout.is_empty(),
+        "pre-apply operation output was lost"
+    );
     fs::write(
         base.join("result.json"),
         serde_json::to_vec(&serde_json::json!({
-            "hit": hit, "error": result.err().unwrap()
+            "hit": hit, "exit": output.exit_code,
+            "stdout": output.stdout, "stderr": String::from_utf8(output.stderr).unwrap()
         }))
         .unwrap(),
     )

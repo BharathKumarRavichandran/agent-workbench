@@ -380,9 +380,6 @@ pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
                 .collect::<Result<Vec<_>>>()?,
         )
     };
-    if !json {
-        return Err("the Rust parity unit currently requires --json".into());
-    }
     Ok(Cli {
         root,
         profile,
@@ -1014,10 +1011,75 @@ pub fn operations_json(operations: &[Operation]) -> Result<String> {
     serde_json::to_string_pretty(operations).map_err(|error| error.to_string())
 }
 
+fn operations_output(operations: &[Operation], json: bool) -> Result<String> {
+    if json {
+        return Ok(operations_json(operations)? + "\n");
+    }
+    Ok(operations.iter().map(operation_text).collect())
+}
+
+fn operation_text(operation: &Operation) -> String {
+    let unsupported = operation.key.starts_with("component:");
+    let resource = if unsupported {
+        "unsupported"
+    } else {
+        operation.resource.kind()
+    };
+    let source = if unsupported || operation.source.is_empty() {
+        String::new()
+    } else {
+        format!(" -> {}", operation.source)
+    };
+    let reason = operation_reason(
+        &operation.reason,
+        operation.diagnostic.as_deref(),
+        operation.trust_token.as_deref(),
+        operation.trust_required,
+    );
+    format!(
+        "{:14} {}/{} {}{}  ({reason})\n",
+        operation.kind, operation.component, resource, operation.destination, source
+    )
+}
+
+fn operation_reason(
+    reason: &str,
+    diagnostic: Option<&str>,
+    token: Option<&str>,
+    required: bool,
+) -> String {
+    let mut reason = match diagnostic.filter(|s| !s.is_empty()) {
+        Some(diagnostic) => format!("{diagnostic}: {reason}"),
+        None => reason.to_owned(),
+    };
+    if let Some(token) = token.filter(|s| !s.is_empty()) {
+        reason.push_str(&format!(
+            "; trust {}: {token}",
+            if required { "required" } else { "granted" }
+        ));
+    }
+    reason
+}
+
 pub struct CommandOutput {
     pub stdout: String,
+    /// JSON reports are one Python print payload, not one print per line.
+    pub stdout_single_write: bool,
     pub stderr: Vec<u8>,
     pub exit_code: u8,
+}
+
+impl CommandOutput {
+    // The public CLI prints the plan before attempting apply. Retain those
+    // bytes on ordinary apply failure, in both output modes.
+    fn apply_error(stdout: String, error: String, json: bool) -> Self {
+        Self {
+            stdout,
+            stdout_single_write: json,
+            stderr: format!("error: {error}\n").into_bytes(),
+            exit_code: 2,
+        }
+    }
 }
 
 pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
@@ -1033,6 +1095,7 @@ pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
     if help_requested(&args) {
         return Ok(CommandOutput {
             stdout: usage_text() + "\n",
+            stdout_single_write: true,
             stderr: Vec::new(),
             exit_code: 0,
         });
@@ -1041,12 +1104,7 @@ pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
     if activation::Policy::for_target(cli.target).is_some() {
         return activation::run(&cli);
     }
-    let (operations, conflicts) = lifecycle::run(&cli)?;
-    Ok(CommandOutput {
-        stdout: operations_json(&operations)? + "\n",
-        stderr: Vec::new(),
-        exit_code: if conflicts { 1 } else { 0 },
-    })
+    lifecycle::run(&cli)
 }
 
 #[cfg(test)]
