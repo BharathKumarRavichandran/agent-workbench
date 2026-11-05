@@ -91,6 +91,49 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
     })
 }
 
+pub(crate) fn delete_generated(root: &Path, output: &Path) -> Result<()> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    let mut parent =
+        rfs::open(root, flags, Mode::empty()).map_err(|e| publication_error(e.into(), &[root]))?;
+    let relative = output
+        .strip_prefix(root)
+        .map_err(|_| "generated output escapes repository")?;
+    for part in relative
+        .parent()
+        .ok_or("output has no parent")?
+        .components()
+    {
+        let name = part.as_os_str();
+        let info = match rfs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(info) => info,
+            Err(rustix::io::Errno::NOENT) => return Ok(()),
+            Err(e) => return Err(publication_error(e.into(), &[Path::new(name)])),
+        };
+        if !FileType::from_raw_mode(info.st_mode).is_dir() {
+            return Err(format!(
+                "generated output has a non-directory parent: {}",
+                output.display()
+            ));
+        }
+        parent = rfs::openat(&parent, name, flags, Mode::empty())
+            .map_err(|e| publication_error(e.into(), &[Path::new(name)]))?;
+    }
+    let name = relative.file_name().ok_or("output has no filename")?;
+    match rfs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(publication_error(e.into(), &[Path::new(name)])),
+        Ok(info) if !FileType::from_raw_mode(info.st_mode).is_file() => {
+            return Err(format!(
+                "generated output deletion requires a regular file: {}",
+                output.display()
+            ));
+        }
+        _ => {}
+    }
+    rfs::unlinkat(&parent, name, AtFlags::empty())
+        .map_err(|e| publication_error(e.into(), &[Path::new(name)]))
+}
+
 fn fault(phase: &str) -> std::io::Result<()> {
     #[cfg(test)]
     parity_tests::inject(phase)?;
@@ -112,7 +155,7 @@ fn publication_error(error: std::io::Error, paths: &[&Path]) -> String {
     result
 }
 
-fn write_generated(root: &Path, output: &Path, content: &[u8]) -> Result<()> {
+pub(crate) fn write_generated(root: &Path, output: &Path, content: &[u8]) -> Result<()> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
     let mut parent = fault("root-open")
         .and_then(|_| rfs::open(root, flags, Mode::empty()).map_err(Into::into))

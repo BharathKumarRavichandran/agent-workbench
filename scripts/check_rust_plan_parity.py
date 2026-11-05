@@ -2667,6 +2667,9 @@ def main() -> int:
             component_override(base)
             destination_precedence(base)
             shared_state_isolation(base)
+            update = run([sys.executable, str(REPOSITORY / "scripts/check_update_parity.py")])
+            assert update.returncode == 0, update.stdout + update.stderr
+            print(update.stdout.strip())
     except AssertionError:
         import traceback
         traceback.print_exc()

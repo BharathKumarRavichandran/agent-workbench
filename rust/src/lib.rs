@@ -23,6 +23,7 @@ mod resource;
 mod shared_document;
 #[cfg(test)]
 mod shared_document_parity_tests;
+mod sources;
 mod state;
 mod transaction;
 #[cfg(test)]
@@ -1020,6 +1021,9 @@ pub struct CommandOutput {
 }
 
 pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
+    if sources::requested(&args) {
+        return sources::run(&args);
+    }
     if rendering::requested(&args) {
         return rendering::run(&args);
     }

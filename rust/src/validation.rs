@@ -50,6 +50,84 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
     }
     let root = canonicalize_existing(&root, "repository")?;
     let (catalog, raw, profile) = workspace(&root, &profile)?;
+    let issues = match collect_issues(
+        &root,
+        &catalog,
+        &raw,
+        &profile,
+        !args.iter().any(|arg| arg == "--no-generated-check"),
+    ) {
+        Ok(issues) => issues,
+        Err(RenderError::Report(error)) => return Err(error),
+        Err(RenderError::Git(stderr)) => {
+            return Ok(CommandOutput {
+                stdout: String::new(),
+                stderr,
+                exit_code: 1,
+            })
+        }
+    };
+    let exit_code = if issues.is_empty() { 0 } else { 1 };
+    let stdout = if args.iter().any(|arg| arg == "--json") {
+        ascii_json(&serde_json::to_string_pretty(&issues).map_err(|e| e.to_string())?) + "\n"
+    } else if issues.is_empty() {
+        let inspection = artifacts::inspect_decoded_with(
+            &root,
+            &catalog,
+            &raw.inspection_wire(),
+            inspect_artifact,
+        )?;
+        let selected: BTreeSet<_> = catalog
+            .plugins
+            .iter()
+            .filter(|p| selected(&profile, &p.id))
+            .map(|p| &p.id)
+            .collect();
+        let mut counts = BTreeMap::<&str, usize>::new();
+        for (id, inventory) in &inspection.inventories {
+            if selected.contains(id) && !inventory.components.is_empty() {
+                *counts.entry(&inventory.kind).or_default() += inventory.components.len();
+            }
+        }
+        let summary = counts
+            .iter()
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "validated {} plugins: {}\n",
+            selected.len(),
+            if summary.is_empty() {
+                "no components"
+            } else {
+                &summary
+            }
+        )
+    } else {
+        issues
+            .iter()
+            .map(|issue| {
+                format!(
+                    "{}: {}: {}: {}\n",
+                    issue.severity, issue.code, issue.location, issue.message
+                )
+            })
+            .collect()
+    };
+    Ok(CommandOutput {
+        stdout,
+        stderr: Vec::new(),
+        exit_code,
+    })
+}
+
+pub(crate) fn collect_issues(
+    root: &Path,
+    catalog: &Catalog,
+    raw: &validation_json::Wire,
+    profile: &Profile,
+    check_generated: bool,
+) -> std::result::Result<Vec<Issue>, RenderError> {
     let mut issues = Vec::new();
     let mut targets = BTreeSet::new();
     if profile
@@ -73,7 +151,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
         }
     }
     let inspection =
-        artifacts::inspect_decoded_with(&root, &catalog, &raw.inspection_wire(), inspect_artifact)?;
+        artifacts::inspect_decoded_with(root, catalog, &raw.inspection_wire(), inspect_artifact)?;
     for (code, _, location, message) in &inspection.issues {
         issues.push(Issue::new(code, location, message));
     }
@@ -94,7 +172,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
     }
     for agent in ["cursor", "claude"] {
         for plugin in &catalog.plugins {
-            if let Some(package) = package(&root, &catalog, plugin, agent)? {
+            if let Some(package) = package(root, catalog, plugin, agent)? {
                 let path = package.join(format!(".{agent}-plugin/plugin.json"));
                 let prefix = agent.to_uppercase();
                 if !path.is_file() {
@@ -154,8 +232,8 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
             }
         }
     }
-    if !args.iter().any(|arg| arg == "--no-generated-check") {
-        match generated_check(&root) {
+    if check_generated {
+        match generated_check(root) {
             Ok(stale) => {
                 for path in stale {
                     issues.push(Issue::new(
@@ -165,13 +243,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
                     ));
                 }
             }
-            Err(RenderError::Git(stderr)) => {
-                return Ok(CommandOutput {
-                    stdout: String::new(),
-                    stderr,
-                    exit_code: 1,
-                })
-            }
+            Err(RenderError::Git(stderr)) => return Err(RenderError::Git(stderr)),
             Err(RenderError::Report(error)) => issues.push(Issue::new(
                 "RENDER_FAILED",
                 root.display().to_string(),
@@ -179,52 +251,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
             )),
         }
     }
-    let exit_code = if issues.is_empty() { 0 } else { 1 };
-    let stdout = if args.iter().any(|arg| arg == "--json") {
-        ascii_json(&serde_json::to_string_pretty(&issues).map_err(|e| e.to_string())?) + "\n"
-    } else if issues.is_empty() {
-        let selected: BTreeSet<_> = catalog
-            .plugins
-            .iter()
-            .filter(|p| selected(&profile, &p.id))
-            .map(|p| &p.id)
-            .collect();
-        let mut counts = BTreeMap::<&str, usize>::new();
-        for (id, inventory) in &inspection.inventories {
-            if selected.contains(id) && !inventory.components.is_empty() {
-                *counts.entry(&inventory.kind).or_default() += inventory.components.len();
-            }
-        }
-        let summary = counts
-            .iter()
-            .map(|(kind, count)| format!("{kind}={count}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "validated {} plugins: {}\n",
-            selected.len(),
-            if summary.is_empty() {
-                "no components"
-            } else {
-                &summary
-            }
-        )
-    } else {
-        issues
-            .iter()
-            .map(|issue| {
-                format!(
-                    "{}: {}: {}: {}\n",
-                    issue.severity, issue.code, issue.location, issue.message
-                )
-            })
-            .collect()
-    };
-    Ok(CommandOutput {
-        stdout,
-        stderr: Vec::new(),
-        exit_code,
-    })
+    Ok(issues)
 }
 
 fn ascii_json(text: &str) -> String {
@@ -786,11 +813,11 @@ struct RenderedMarketplace<'a> {
 }
 
 #[derive(serde::Serialize)]
-struct Issue {
-    code: String,
+pub(crate) struct Issue {
+    pub(crate) code: String,
     severity: &'static str,
     location: String,
-    message: String,
+    pub(crate) message: String,
 }
 impl Issue {
     fn new(
