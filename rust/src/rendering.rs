@@ -6,43 +6,9 @@ use std::io::{Read, Write};
 #[cfg(test)]
 mod parity_tests;
 
-pub(crate) fn requested(args: &[String]) -> bool {
-    let mut args = args.iter().skip(1);
-    while let Some(arg) = args.next() {
-        if matches!(arg.as_str(), "--root" | "--profile") {
-            args.next();
-        } else if !arg.starts_with("--root=") && !arg.starts_with("--profile=") {
-            return arg == "render";
-        }
-    }
-    false
-}
-
-pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
-    let mut root = PathBuf::from(".");
-    let mut profile = "default".to_owned();
-    let mut check = false;
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--root" | "--profile" => {
-                let key = &args[index];
-                index += 1;
-                let value = args.get(index).ok_or("missing option value")?;
-                if key == "--root" {
-                    root = value.into();
-                } else {
-                    profile = value.clone();
-                }
-            }
-            "render" => {}
-            "--check" => check = true,
-            other => return Err(format!("unsupported render argument: {other}")),
-        }
-        index += 1;
-    }
-    let root = canonicalize_existing(&root, "repository")?;
-    validation::workspace(&root, &profile)?;
+pub(crate) fn run_options(root: &Path, profile: &str, check: bool) -> Result<CommandOutput> {
+    let root = artifacts::resolve_catalog_path(root)?;
+    validation::workspace(&root, profile)?;
     if profile != "default" {
         return Err(
             "canonical generated files may only be rendered with the default profile".into(),

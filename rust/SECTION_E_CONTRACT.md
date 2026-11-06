@@ -460,3 +460,278 @@ Rust. Independent correction review and all five parent mandatory local gates
 passed after correction, including the full retained parity matrix and 188
 Python tests. E5 is locally accepted; exact-SHA Ubuntu remains required before
 E6 begins.
+
+# Section E6 — first CLI help tracer (incomplete review checkpoint)
+
+E6 starts from E5 head `2470e3f07bb4031feadface932a6e57725655b20`;
+the parent verified literal-head Ubuntu run `42068777930` before delegation.
+This bounded checkpoint implements **direct help only**, not E6 acceptance.
+Python production, executable defaults, JSON codecs, target policy, lifecycle
+parsing and transaction exceptions remain unchanged. Rust does not execute
+Python or consume its plans/results. `cli_help.rs` formats option declarations
+and greedy 78-column usage independently; root help retains the exact frozen
+public command order. Existing output metadata/protocol is unchanged.
+
+## Acceptance-to-test map
+
+`scripts/check_cli_parity.py` is wired unconditionally into the existing umbrella.
+It pins Python 3.12 (including nested `python3`), requires scratch TMPDIR, uses
+isolated HOME/state and `COLUMNS=80`, asserts oracle success/empty stderr, and
+compares exact stdout, stderr, exit status and unchanged typed fixture snapshots.
+Selectors reject unknown names and the executed count must equal selected rows.
+
+| E6 edge | Current executable evidence |
+| --- | --- |
+| Root direct help bytes and exit 0 | `root-help---help` |
+| Every direct subcommand help, exact option order, wrapping, descriptions and metavar | `{validate,render,plan,install,status,trust,uninstall,update}-help---help` |
+| Direct short help, long-option help abbreviations and doubled short help | Cartesian matrix of root/eight commands with `--help`, `-h`, `--h`, `--he`, `--hel`, `-hh`: 54 public pairs |
+| Help does not load a workspace or create fixture state | Every pair executes without fixture catalog/profile and checks typed tree unchanged |
+| All other E6 acceptance | **Unproven**, named next rows below; no general parser parity claim |
+
+## Observed behavioral RED → GREEN
+
+Every command below used this environment prefix (including Cargo commands):
+
+```sh
+TMPDIR=/Users/teslash/.hermes/profiles/agent-workbench/cache/scratch \
+PATH=/opt/homebrew/opt/python@3.12/libexec/bin:$PATH \
+PYTHONDONTWRITEBYTECODE=1
+```
+
+1. Initial `python3 scripts/check_cli_parity.py root-help` (before selector
+   expansion) exited 1: Python emitted the complete argparse help with public
+   program name; Rust emitted the legacy one-line Rust-unit usage. After the
+   minimal presentation fix and offline Cargo build, the same command emitted
+   `CLI surface parity: 1 paired public rows` / exit 0. An intermediate rerun
+   caught an extra trailing newline, which was removed before that GREEN.
+2. `python3 scripts/check_cli_parity.py validate-help` (before selector expansion)
+   exited 1: Python help/exit 0 versus Rust `unsupported validate argument:
+   --help`/exit 2. The independent help formatter and direct dispatch produced
+   `CLI surface parity: 9 paired public rows` / exit 0 before widening.
+3. Expanded `python3 scripts/check_cli_parity.py root-help---he plan-help--h`
+   exited 1 on Python help/0 versus Rust `unsupported global option: --he`/2.
+   After direct help-alias recognition, the complete tracer produced
+   `CLI surface parity: 54 paired public rows` / exit 0.
+
+## Named remaining unproven rows
+
+These are real public argv probes for the next vertical tracer, not implemented
+speculation or passing acceptance rows. Replay them with a scratch workspace;
+all options/defaults must also be tested through real lifecycle effects.
+
+| Next row | Public argv / required extension |
+| --- | --- |
+| help-after-global | `--profile pstack plan --help`; repeated/abbreviated/equals globals before command |
+| help-after-options | `plan --target hermes --help`; valid options, unknown deferred extras, and help before later invalid arguments |
+| missing-value-before-help | `plan --target --help`; Python emits command usage plus expected-one-argument, exit 2 |
+| choice-before-help | `plan --component bad --help`; invalid choice precedes help |
+| explicit-help-value | `plan --help=bad`; ignored-explicit-argument diagnostic |
+| command-not-abbreviated | `p --help`; Python rejects command choice, not a subcommand alias |
+| double-dash | `-- --help`, `plan -- --help`; help after terminator is not a help action |
+| values-not-flags | `plan --target=--help`, global profile/root values `--json`/`--check`; typed dispatch must not rescan values |
+| ordinary-parser-errors | Empty argv, missing required command/target/source, unknown options/positionals, ambiguous prefixes, invalid components, combined defects and validation precedence |
+| normalized-dispatch | Equals values, accepted abbreviations, repetition (last scalar, append/list dedup), global placement and local placement for every command |
+| omitted-vs-literal-null | Omitted options versus CLI string `null` through profile, target, source, destination, project root, state dir, component and trust; do not collapse to wire None |
+| defaults-and-target-failure-order | Trace Python defaults and callers; non-native non-pstack restriction, unknown target after workspace loading, HOME/XDG_STATE_HOME absent/empty/relative/tilde, disagreeing profile/CLI overrides |
+| help-environment | Alternate/invalid COLUMNS, arbitrary repeated short-help clusters, help following parsed prefixes; this checkpoint proves COLUMNS=80 only |
+
+The legacy broad `help_requested` scan and separate legacy command parsers remain
+outside this direct-help tracer and are **not** evidence of correct placement or
+precedence. A canonical parser/typed dispatch should replace them in the next
+slice rather than extending token-anywhere scans. Full retained suites, five
+parent gates, independent review, eventual commit and exact-head Ubuntu evidence
+are deliberately left to the parent after this worker pauses. E6 is not marked
+complete; no TODO, commit, push or merge is performed here.
+
+Final focused recheck: 54 CLI pairs and six Hermes human lifecycle pairs passed;
+`validation::tests::validate_as_an_option_value_is_not_a_command` passed (one
+selected Rust test, 33 filtered out). Offline build and Cargo formatting ran;
+these are not substitutes for the parent's full retained gates.
+
+## E6 continuation — canonical argv / typed dispatch checkpoint (incomplete)
+
+This continuation supersedes the direct-help-only implementation limitations
+above, **not** the remaining E6 acceptance. The inherited dirty help checkpoint
+is preserved at
+`/Users/teslash/.hermes/profiles/agent-workbench/cache/scratch/e6-help-checkpoint-sechfsfw`.
+No Python production, dependencies, default executable, safety exceptions,
+transaction engine or publication codec was changed. No commit/push/full gates.
+
+### Implemented boundary
+
+* `rust/src/cli.rs` now owns canonical argv parsing, returning a typed command
+  or a complete help/parser-error `CommandOutput`. Root/eight command option
+  placement, equals forms, unique long prefixes, ambiguous prefixes, immediate
+  option-value/choice failures, deferred extras, required-before-extras,
+  terminators, help action order and Python 3.12.15 short-help behavior are
+  exercised through real public subprocesses.
+* Parsed values are data, not normalized argv to be rescanned. Validate/render/
+  update now receive typed root/profile/flags/source arguments; their loose
+  `requested`/`run` parsers were removed. Public lifecycle dispatch preloads the
+  workspace before converting the raw target string to `SkillsTarget`, matching
+  workspace-before-unknown-target order. The closed target registry remains
+  unchanged. Known targets are not hidden by an early enum conversion.
+* `parse_cli` retains its public signature and filesystem-free lifecycle parse
+  boundary for private drivers. Its `Cli` remains typed by `SkillsTarget`; public
+  `execute` instead uses the canonical raw-target command and loads the workspace
+  first. `help_requested` also uses the canonical parser, not a token-anywhere scan.
+* Scalars use the last value; flags remain booleans; components append and are
+  deduplicated in first-seen order at lifecycle request conversion; trust tokens
+  append without interpretation. The arbitrary non-native `profile != pstack`
+  rejection was removed. Default/custom profiles are publicly exercised against
+  the non-native `agents` target. Empty explicit root is converted to `.` like
+  Python `Path('')`.
+
+### Public differential evidence
+
+All commands used the environment prefix above. Local oracle is **Python
+3.12.15**, not a claim about every 3.12 patch release. The harness still pins
+major/minor, not patch; remote patch-release behavior needs parent verification.
+
+1. `python3 scripts/check_cli_parity.py missing-value-before-help` initially
+   exited 1 on real Python exit 2/command usage/expected-one-argument versus
+   Rust exit 0/root help. A minimal command-specific fix built and made that
+   exact row GREEN before parser expansion.
+2. `... plan-missing-required` then exited 1 on Python command usage/required
+   diagnostic versus Rust `error: --target is required`. Canonical parsing and
+   typed dispatch replaced the temporary special case. The first expanded
+   matrix reached **189 paired public rows**, exit 0, after literal oracle
+   corrections for unquoted choice lists, short help tails and help-before-
+   ambiguity on 3.12.15.
+3. `... unknown-target-workspace-first unknown-target-valid-workspace` observed
+   RED on Python invalid-profile versus Rust unsupported-target before workspace
+   loading. Public workspace preload/unknown-target diagnostic made both GREEN.
+4. `... dispatch-validate-empty-root dispatch-plan-empty-root
+   dispatch-render-empty-root dispatch-update-empty-root` observed RED on
+   Python successful planning versus Rust `path has no existing ancestor: `.
+   Explicit empty-root normalization made all four GREEN.
+5. Final expanded matrix: **297 paired public rows** / exit 0. The matrix includes
+   every declared option's missing-value-before-help or boolean-explicit-value
+   error, valid flag-looking equals values before help, both parser scopes'
+   extras, all eight normalized dispatch paths, duplicate scalars/components/
+   flags, opaque trust values, real install bytes/modes/state and real uninstall
+   after an independently executed installation. A relative checkout named
+   `--json` proves root values do not turn on JSON output; human validate and
+   human lifecycle variants pin that separation. Actual typed snapshots compare
+   without filtering; install authority is a deterministic private fixture key.
+   Selector names are unique and selected/executed counts are asserted.
+6. Focused retained checks: `check_activation_inertness.py` passed **30 paired
+   public CLI rows**, both native validators and live executable/loopback
+   canaries; `check_lifecycle_text_parity.py hermes` passed **six public pairs**;
+   `cargo test --offline --manifest-path rust/Cargo.toml
+   validation::tests::validate_as_an_option_value_is_not_a_command` passed its
+   selected Rust test. `cargo test --offline --manifest-path rust/Cargo.toml
+   --test plan_cli --test lifecycle_cli` passed both five-test targets. Its first
+   run exposed a stale `unsupported subcommand` assertion; `plan_cli.rs` now
+   checks complete canonical argparse usage/error bytes plus empty stdout,
+   consistent with the public differential rows (no weakened status check).
+   Offline build is warning-free; Cargo formatting and `git diff --check` passed.
+
+### Exact remaining edges / handoff
+
+* **Known lexer mismatch, reproduced but deliberately outside this bounded
+  GREEN matrix:** `plan --target -١ --help` (Arabic-Indic digit) gives Python
+  help/exit 0 versus Rust expected-one-argument/exit 2. Python's negative-number
+  regex uses Unicode decimal digits; the current Rust helper covers ASCII
+  digits only. Add paired Unicode-decimal and non-decimal-numeric controls
+  before changing this helper; do not broaden it to all `is_numeric()` values.
+* HOME/XDG_STATE_HOME omitted/empty/relative/tilde and every explicit default
+  lifecycle sequence remain unproven here. In particular the existing
+  `default_state_dir` treats empty XDG as a path rather than Python's fallback;
+  this continuation did not change default-home/state policy.
+* Full omitted-option versus literal CLI `null` matrix and corresponding private
+  wire omitted-versus-null consumers remain to be traced; no codec distinction
+  was collapsed to make argv tests pass.
+* Help/usage widths other than `COLUMNS=80`, invalid COLUMNS, Unicode diagnostic
+  repr corner cases (including POSIX undecodable argv), full Unicode path lexical
+  normalization and the complete negative-number token language are not proved.
+* Every long-option prefix and every combined-defect permutation is not
+  exhaustively enumerated. Public normalized render uses `--check`; normalized
+  update reaches the real local-source refusal, not a successful Git update.
+  Successful normalized Git updates, alternate native-target activation grants,
+  mixed-component first-seen order and all path override channels still need
+  retained/full-matrix evidence. Existing dedicated suites remain the parent gate.
+* Workspace preloading now uses the existing validation workspace reader before
+  lifecycle reparses its domain model. Malformed-workspace precedence and
+  lossless/native codec interactions across every lifecycle need parent full
+  retained gates; passing these focused rows is not that evidence.
+* Independent review, parent full gates and literal-head Ubuntu evidence are
+  intentionally not run. E6 remains incomplete; no F/default cutover.
+
+## E6 defaults / actual normalized lifecycle continuation
+
+The parent added `check_cli_defaults_parity.py` (unconditionally wired into the
+umbrella) after the canonical parser worker paused. Its 160 paired public
+executions close the defaults/null/successful-update/native grant rows above:
+
+| Edge | Executable cases |
+| --- | --- |
+| XDG state fallback and path expansion | `xdg-{omitted,empty,relative,absolute,tilde}`, `state-{empty,tilde,null}` through plan/install/status/uninstall |
+| Literal `null` is a value, not omission | destination/project/state/trust paths or tokens; component/target/profile/root rejections; a real profile named `null`; update source named `null` refusal |
+| Explicit wire null remains distinct from missing | profile destination/projectRoot/components set to JSON null are rejected, while omitted fields work |
+| HOME behavior | empty and absent HOME with explicit scratch roots; relative HOME; empty-HOME default destination through read-only plan only |
+| Target-specific environment truthiness | Codex/Hermes home absent, empty, relative, absolute and tilde through complete lifecycle |
+| Overrides change effective behavior | profile destination/project/components disagree with CLI; CLI controls actual installed paths/components and persisted state |
+| Successful normalized Git command | real disposable local Git update with repeated/equals/abbreviated root/profile/source; separate and merged streams, generated bytes/modes and semantic Git state |
+| Native normalized activation | Cursor/Claude mixed skills/agents/hooks/MCP/rules-or-commands lifecycle with repeated scalar/component/trust options, real content-bound grants and uninstall; exact JSON/human output and snapshots |
+
+The existing E4/E5 drivers expose opt-in normalized-argv modes; their original
+default matrices and assertions are unchanged. All test state/authority stays
+under scratch. HOME absence uses explicit project/destination/state. Empty HOME
+has Python's `/` expansion, so its fallback destination is exercised by a
+read-only plan rather than publication outside scratch.
+
+Observed RED: `... check_cli_defaults_parity.py xdg-empty` produced Python plan
+exit 0 versus Rust exit 2 (`path has no existing ancestor: `). Filtering empty
+XDG and expanding both default and explicit state roots made the lifecycle
+matrix GREEN. A separate read-only `home-empty-default-plan` RED showed Python
+`/.agents/skills/example` versus Rust's cwd-relative `.agents/skills/example`;
+the HOME-empty expansion fix made it GREEN. The completed script reports
+`CLI defaults parity: 160 paired public lifecycle executions` / exit 0.
+Help-width/Unicode work remains independently in progress; no E6 acceptance or
+full-gate claim is made at this intermediate checkpoint.
+
+## E6 final integration / review corrections (acceptance pending)
+
+This section supersedes the intermediate remaining-edge lists above. All three
+E6 differential scripts run unconditionally in the umbrella gate:
+
+* `check_cli_parity.py`: 297 public pairs for all eight commands, exact help/
+  parser diagnostics and status, aliases/prefixes, global placement, option
+  values versus flags, repeated scalars/flags/components, required/choice/help/
+  extras precedence, custom/default profiles and real normalized dispatch.
+* `check_cli_help_edges.py`: 675 public pairs for Unicode-15 decimal operands
+  (not all Unicode numerics), regex terminal-newline behavior, environment-driven
+  help/usage width, description/hyphen wrapping and program-length thresholds.
+  Its matrix includes absent/empty/invalid/Unicode/underscored/large COLUMNS and
+  Python's 4300-digit integer-conversion boundary. The initial Arabic-digit
+  operand RED and 116 width mismatches were corrected before matrix expansion.
+* `check_cli_defaults_parity.py`: now 328 paired public executions. In addition
+  to the 160 rows mapped above, 144 executions preserve ignored schema
+  surrogate/NaN/nested-infinity/null annotations through plan/install/status/
+  uninstall for every target. Twenty-four rows cover bare, dotted and absolute
+  missing roots through all eight commands and workspace-before-target/source
+  failure precedence, with exact diagnostics and read-only typed snapshots.
+
+The independent precommit reviewer reproduced two blockers. Parent reproductions
+were added permanently before fixes: ignored catalog surrogate produced Python
+plan/0 versus Rust `unexpected end of hex escape`/2; a missing relative root
+produced Python's absolute catalog-read diagnostic versus Rust's ancestor or
+strict-root error. Lifecycle and native activation now use the same accepted
+workspace catalog/profile readers as public preload instead of narrower serde
+reparsing. No source-artifact, shared-document, state, journal or trust decoder
+was widened. Relative non-strict workspace resolution is anchored to cwd, and
+validate/render/update use it as lifecycle already does. The corrected defaults
+matrix passed 328 paired executions. The focused reviewer also passed 1,781
+additional deterministic parser comparisons; these are review evidence, not
+substitutes for permanent CI rows.
+
+The independent correction recheck passed both original reproductions, all 328
+expanded lifecycle executions and Cargo authorization/containment/rejection
+tests, with no remaining blocker. All five mandatory parent gates passed on the
+stable corrected tree, including the complete retained parity matrix and 188
+Python tests. E6 is locally accepted; exact-SHA Ubuntu remains pending.
+E5's literal corrected head
+`2470e3f07bb4031feadface932a6e57725655b20` passed Ubuntu run `42068777930`
+(checkout log verified) before E6 began. Python production, default executable,
+Section F and all intentional parity exceptions remain unchanged.

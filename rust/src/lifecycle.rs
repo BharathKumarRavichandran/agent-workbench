@@ -63,11 +63,11 @@ pub(super) fn run(cli: &Cli) -> Result<CommandOutput> {
 
 pub(super) fn reconcile(cli: &Cli) -> Result<Plan> {
     let repository = canonicalize_existing(&cli.root, "repository root")?;
-    let catalog = decode_catalog(&repository.join("catalog/plugins.json"))?;
+    let (catalog, _) = validation_codec::catalog(&repository.join("catalog/plugins.json"))?;
     let profile_path = repository
         .join("profiles")
         .join(format!("{}.json", cli.profile));
-    let profile = decode_profile(&profile_path)?;
+    let profile = validation_codec::profile(&profile_path)?;
     if profile.id != cli.profile {
         return Err("profile id must match profile filename".into());
     }

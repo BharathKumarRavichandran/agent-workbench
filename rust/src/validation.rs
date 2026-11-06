@@ -7,56 +7,23 @@ mod tests {
     fn validate_as_an_option_value_is_not_a_command() {
         for key in ["--root", "--profile"] {
             let args = ["aw", key, "validate", "plan", "--target", "hermes"].map(str::to_owned);
-            assert!(!super::requested(&args));
+            assert!(matches!(
+                crate::cli::parse(&args),
+                crate::cli::Parsed::Command(crate::cli::Command::Lifecycle { .. })
+            ));
         }
     }
 }
 
-pub(crate) fn requested(args: &[String]) -> bool {
-    let mut args = args.iter().skip(1);
-    while let Some(arg) = args.next() {
-        if matches!(arg.as_str(), "--root" | "--profile") {
-            args.next();
-            continue;
-        }
-        if arg.starts_with("--root=") || arg.starts_with("--profile=") {
-            continue;
-        }
-        return arg == "validate";
-    }
-    false
-}
-
-pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
-    let mut root = PathBuf::from(".");
-    let mut profile = "default".to_owned();
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--root" | "--profile" => {
-                let key = &args[index];
-                index += 1;
-                let value = args.get(index).ok_or("missing option value")?;
-                if key == "--root" {
-                    root = value.into();
-                } else {
-                    profile = value.clone();
-                }
-            }
-            "validate" | "--json" | "--no-generated-check" => {}
-            other => return Err(format!("unsupported validate argument: {other}")),
-        }
-        index += 1;
-    }
-    let root = canonicalize_existing(&root, "repository")?;
-    let (catalog, raw, profile) = workspace(&root, &profile)?;
-    let issues = match collect_issues(
-        &root,
-        &catalog,
-        &raw,
-        &profile,
-        !args.iter().any(|arg| arg == "--no-generated-check"),
-    ) {
+pub(crate) fn run_options(
+    root: &Path,
+    profile: &str,
+    json: bool,
+    generated: bool,
+) -> Result<CommandOutput> {
+    let root = artifacts::resolve_catalog_path(root)?;
+    let (catalog, raw, profile) = workspace(&root, profile)?;
+    let issues = match collect_issues(&root, &catalog, &raw, &profile, generated) {
         Ok(issues) => issues,
         Err(RenderError::Report(error)) => return Err(error),
         Err(RenderError::Git(stderr)) => {
@@ -69,7 +36,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
         }
     };
     let exit_code = if issues.is_empty() { 0 } else { 1 };
-    let stdout = if args.iter().any(|arg| arg == "--json") {
+    let stdout = if json {
         ascii_json(&serde_json::to_string_pretty(&issues).map_err(|e| e.to_string())?) + "\n"
     } else if issues.is_empty() {
         let inspection = artifacts::inspect_decoded_with(
@@ -117,7 +84,7 @@ pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
     };
     Ok(CommandOutput {
         stdout,
-        stdout_single_write: args.iter().any(|arg| arg == "--json"),
+        stdout_single_write: json,
         stderr: Vec::new(),
         exit_code,
     })

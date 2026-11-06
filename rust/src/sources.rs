@@ -6,43 +6,9 @@ use validation::RenderError;
 
 type UpdateResult<T> = std::result::Result<T, RenderError>;
 
-pub(crate) fn requested(args: &[String]) -> bool {
-    let mut args = args.iter().skip(1);
-    while let Some(arg) = args.next() {
-        if matches!(arg.as_str(), "--root" | "--profile") {
-            args.next();
-        } else if !arg.starts_with("--root=") && !arg.starts_with("--profile=") {
-            return arg == "update";
-        }
-    }
-    false
-}
-
-pub(crate) fn run(args: &[String]) -> Result<CommandOutput> {
-    let mut root = PathBuf::from(".");
-    let mut profile = "default".to_owned();
-    let mut source = None;
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--root" | "--profile" | "--source" => {
-                let key = &args[index];
-                index += 1;
-                let value = args.get(index).ok_or("missing option value")?;
-                match key.as_str() {
-                    "--root" => root = value.into(),
-                    "--profile" => profile = value.clone(),
-                    _ => source = Some(value.clone()),
-                }
-            }
-            "update" => {}
-            other => return Err(format!("unsupported update argument: {other}")),
-        }
-        index += 1;
-    }
-    let source = source.ok_or("update requires --source")?;
-    let root = canonicalize_existing(&root, "repository")?;
-    match update(&root, &profile, &source) {
+pub(crate) fn run_options(root: &Path, profile: &str, source: &str) -> Result<CommandOutput> {
+    let root = artifacts::resolve_catalog_path(root)?;
+    match update(&root, profile, source) {
         Ok((before, after)) => Ok(CommandOutput {
             stdout: format!("{source}: {before} -> {after}\n"),
             stdout_single_write: true,

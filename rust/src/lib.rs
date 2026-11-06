@@ -17,6 +17,8 @@ pub mod artifacts;
 mod bundle_parity_tests;
 mod bundles;
 pub mod capabilities;
+mod cli;
+mod cli_help;
 mod lifecycle;
 mod rendering;
 mod resource;
@@ -283,126 +285,25 @@ impl Serialize for Operation {
 }
 
 pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
-    let mut args = args.into_iter();
-    let _program = args.next();
-    let mut root = PathBuf::from(".");
-    let mut profile = String::from("default");
-    let mut token = args.next().ok_or_else(usage)?;
-    while token.starts_with("--") {
-        match token.as_str() {
-            "--root" => root = PathBuf::from(args.next().ok_or("--root requires a value")?),
-            "--profile" => profile = args.next().ok_or("--profile requires a value")?,
-            "--help" | "-h" => return Err(usage()),
-            _ => return Err(format!("unsupported global option: {token}")),
+    match cli::parse(&args.into_iter().collect::<Vec<_>>()) {
+        cli::Parsed::Command(cli::Command::Lifecycle { options, action }) => {
+            options.lifecycle(action)
         }
-        token = args.next().ok_or_else(usage)?;
+        cli::Parsed::Command(_) => Err("expected lifecycle command".into()),
+        cli::Parsed::Output(output) => Err(if output.exit_code == 0 {
+            output.stdout
+        } else {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        }),
     }
-    let action = match token.as_str() {
-        "plan" => lifecycle::Action::Plan,
-        "status" => lifecycle::Action::Status,
-        "trust" => lifecycle::Action::Trust,
-        "install" => lifecycle::Action::Install,
-        "uninstall" => lifecycle::Action::Uninstall,
-        _ => {
-            return Err(format!(
-                "unsupported subcommand for Rust parity unit: {token}"
-            ))
-        }
-    };
-
-    let mut target = None;
-    let mut destination = None;
-    let mut project_root = None;
-    let mut state_dir = default_state_dir()?;
-    let mut adopt = false;
-    let mut trust = Vec::new();
-    let mut json = false;
-    let mut components = Vec::new();
-    while let Some(option) = args.next() {
-        match option.as_str() {
-            "--target" => target = Some(args.next().ok_or("--target requires a value")?),
-            "--destination" => {
-                destination = Some(expand_home(
-                    &args.next().ok_or("--destination requires a value")?,
-                )?)
-            }
-            "--project-root" => {
-                project_root = Some(expand_home(
-                    &args.next().ok_or("--project-root requires a value")?,
-                )?)
-            }
-            "--state-dir" => {
-                state_dir = PathBuf::from(args.next().ok_or("--state-dir requires a value")?)
-            }
-            "--component" if action != lifecycle::Action::Uninstall => {
-                components.push(args.next().ok_or("--component requires a value")?)
-            }
-            "--trust" if action != lifecycle::Action::Uninstall => {
-                // Path-only resources never consume activation grants. Keep
-                // Python's repeatable opaque-token parsing; executable selections
-                // remain rejected below, rather than accepting unused authority.
-                trust.push(args.next().ok_or("--trust requires a value")?);
-            }
-            "--adopt" if action != lifecycle::Action::Uninstall => adopt = true,
-            "--json" => json = true,
-            _ => return Err(format!("unsupported {} option: {option}", token)),
-        }
-    }
-    let target = SkillsTarget::parse(&target.ok_or("--target is required")?)?;
-    if profile != "pstack" && activation::Policy::for_target(target).is_none() {
-        return Err(format!(
-            "unsupported profile for Rust parity unit: {profile}"
-        ));
-    }
-    if components.iter().any(|component| {
-        !matches!(
-            component.as_str(),
-            "skills" | "agents" | "rules" | "commands" | "hooks" | "mcp"
-        )
-    }) {
-        return Err("Rust parity unit supports only path components".into());
-    }
-    let components = if components.is_empty() {
-        None
-    } else {
-        Some(
-            components
-                .into_iter()
-                .map(|component| match component.as_str() {
-                    "skills" => Ok(ComponentKind::Skills),
-                    "agents" => Ok(ComponentKind::Agents),
-                    "rules" => Ok(ComponentKind::Rules),
-                    "commands" => Ok(ComponentKind::Commands),
-                    "hooks" => Ok(ComponentKind::Hooks),
-                    "mcp" => Ok(ComponentKind::Mcp),
-                    _ => Err("Rust parity unit supports only path components".into()),
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )
-    };
-    Ok(Cli {
-        root,
-        profile,
-        target,
-        components,
-        destination,
-        project_root,
-        state_dir,
-        adopt,
-        trust,
-        json,
-        action,
-    })
 }
 
 fn usage() -> String {
-    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] {plan,status,trust,install,uninstall} --target {agents,claude,codex,cursor,grok,hermes} [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] [--trust TOKEN] --json".into()
+    cli_help::text("")
 }
 
 pub fn help_requested(args: &[String]) -> bool {
-    args.iter()
-        .skip(1)
-        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    matches!(cli::parse(args), cli::Parsed::Output(output) if output.exit_code == 0)
 }
 
 pub fn usage_text() -> String {
@@ -410,14 +311,15 @@ pub fn usage_text() -> String {
 }
 
 fn default_state_dir() -> Result<PathBuf> {
-    if let Some(value) = env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(value));
+    if let Some(value) = env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return expand_home_path(PathBuf::from(value));
     }
     Ok(home_dir()?.join(".local/state"))
 }
 
 fn home_dir() -> Result<PathBuf> {
     match env::var_os("HOME") {
+        Some(value) if value.is_empty() => Ok(PathBuf::from("/")),
         Some(value) => Ok(PathBuf::from(value)),
         None => platform_home_dir(),
     }
@@ -1083,28 +985,35 @@ impl CommandOutput {
 }
 
 pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
-    if sources::requested(&args) {
-        return sources::run(&args);
+    match cli::parse(&args) {
+        cli::Parsed::Output(output) => Ok(output),
+        cli::Parsed::Command(command) => match command {
+            cli::Command::Validate { options, generated } => {
+                validation::run_options(&options.root, &options.profile, options.json, generated)
+            }
+            cli::Command::Render { options, check } => {
+                rendering::run_options(&options.root, &options.profile, check)
+            }
+            cli::Command::Update { options, source } => {
+                sources::run_options(&options.root, &options.profile, &source)
+            }
+            cli::Command::Lifecycle { options, action } => {
+                // Workspace loading precedes target lookup in the frozen public CLI.
+                // Private parse_cli callers retain their filesystem-free parse boundary.
+                let root = artifacts::resolve_catalog_path(&options.root)?;
+                validation::workspace(&root, &options.profile)?;
+                if SkillsTarget::parse(&options.target).is_err() {
+                    return Err(format!("unknown install target: {}", options.target));
+                }
+                let cli = options.lifecycle(action)?;
+                if activation::Policy::for_target(cli.target).is_some() {
+                    activation::run(&cli)
+                } else {
+                    lifecycle::run(&cli)
+                }
+            }
+        },
     }
-    if rendering::requested(&args) {
-        return rendering::run(&args);
-    }
-    if validation::requested(&args) {
-        return validation::run(&args);
-    }
-    if help_requested(&args) {
-        return Ok(CommandOutput {
-            stdout: usage_text() + "\n",
-            stdout_single_write: true,
-            stderr: Vec::new(),
-            exit_code: 0,
-        });
-    }
-    let cli = parse_cli(args)?;
-    if activation::Policy::for_target(cli.target).is_some() {
-        return activation::run(&cli);
-    }
-    lifecycle::run(&cli)
 }
 
 #[cfg(test)]

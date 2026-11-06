@@ -102,7 +102,7 @@ def skills_edges(base, target):
     return len(expected)
 
 
-def native(base, target):
+def native(base, target, *, normalized=False):
     from check_cursor_activation_parity import prepare
     expected = []
     for engine in ('python', 'rust'):
@@ -119,13 +119,18 @@ def native(base, target):
             command = prefix + ['--root', str(repository), '--profile', 'pstack', action,
                                 '--target', target, '--state-dir', str(root / 'state'),
                                 '--project-root', str(root / 'project')]
+            if normalized:
+                command = prefix + ['--root=ignored', f'--roo={repository}', '--profile=missing',
+                                    '--prof=pstack', action, '--target=bad', f'--tar={target}',
+                                    '--state-dir=ignored', f'--state-d={root / "state"}',
+                                    '--project-root=ignored', f'--project-r={root / "project"}']
             if action != 'uninstall':
                 for component in ['skills', 'agents', 'hooks', 'mcp', 'rules' if target == 'cursor' else 'commands']:
-                    command += ['--component', component]
+                    command += [f'--comp={component}', f'--component={component}'] if normalized else ['--component', component]
             if granted:
                 assert tokens
                 for token in tokens:
-                    command += ['--trust', token]
+                    command += [f'--tru={token}', f'--trust={token}'] if normalized else ['--trust', token]
             # JSON is independently exercised through the same actual CLI before
             # each human command. Only inspect via plan (never double-apply).
             inspect = command.copy()

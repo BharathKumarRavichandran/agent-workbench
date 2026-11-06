@@ -515,8 +515,8 @@ fn run_inner(
 ) -> Result<CommandOutput> {
     let policy = Policy::for_target(cli.target).ok_or("unsupported activation target")?;
     let mut plan = lifecycle::reconcile(cli)?;
-    let catalog = decode_catalog(&plan.repository.join("catalog/plugins.json"))?;
-    let profile = decode_profile(
+    let (catalog, _) = validation_codec::catalog(&plan.repository.join("catalog/plugins.json"))?;
+    let profile = validation_codec::profile(
         &plan
             .repository
             .join("profiles")

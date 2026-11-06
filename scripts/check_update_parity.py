@@ -220,7 +220,7 @@ def config_diagnostic(output):
     return output[final.start():]
 
 
-def run_case(base, case):
+def run_case(base, case, *, normalized=False, source_value=None):
     root, env, old, new = setup(base, case)
     saved = base / 'saved'
     config_class = CONFIG_CASES.get(case, ('', None))[1]
@@ -230,8 +230,11 @@ def run_case(base, case):
     rows = []
     for engine in ([sys.executable, '-m', 'agent_workbench'], [str(RUST)]):
         options = ['--profile', 'subset'] if case == 'nondefault' else []
-        source = 'missing' if case == 'unknown-source' else 'sample'
+        source = source_value if source_value is not None else ('missing' if case == 'unknown-source' else 'sample')
         command = [*engine, '--root', str(root), *options, 'update', '--source', source]
+        if normalized:
+            command = [*engine, '--root=ignored', f'--ro={root}', '--profile=missing',
+                       '--prof=default', 'update', '--source=null', f'--sou={source}']
         before = tree(root)
         before_git = git_state(root, env)
         result = subprocess.run(command,

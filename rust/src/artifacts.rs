@@ -58,6 +58,10 @@ pub(crate) fn load_json_object(repository: &Path, path: &Path) -> Result<Wire> {
 // Path.resolve(strict=False) also retains suffixes beneath regular files. Keep
 // this inspection policy separate from installation path authorization.
 pub(crate) fn resolve_catalog_path(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        let current = std::env::current_dir().map_err(|error| error.to_string())?;
+        return resolve_catalog_path(&current.join(path));
+    }
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error)
