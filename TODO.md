@@ -70,7 +70,7 @@ Convert the workbench to a standalone Rust CLI without extending product behavio
 
 ### F. Packaging, compatibility, and cutover
 
-- [ ] Add clean-install and upgrade tests using ownership states produced by released Python behavior.
+- [x] Add clean-install and upgrade tests using ownership states produced by released Python behavior.
 - [ ] Test relocation, interruption, and recovery across Python-to-Rust handoff boundaries.
 - [ ] Run the full parity suite on macOS and Linux with supported filesystem primitives.
 - [ ] Build release binaries and provide one `agent-workbench` executable with documented install, upgrade, and uninstall paths.
