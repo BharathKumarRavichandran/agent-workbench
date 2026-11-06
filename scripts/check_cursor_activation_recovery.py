@@ -19,14 +19,14 @@ from apply_contract import observe
 from agent_workbench import cli, installation, shared_config
 
 
-def interrupt(base, runner, phase, uninstall):
+def interrupt(base, runner, phase, uninstall, components=('skills', 'agents', 'hooks', 'mcp')):
     args = ['--root', str(runner.repository), '--profile', 'pstack',
             'uninstall' if uninstall else 'install', '--target', runner.target,
             '--project-root', str(runner.root / 'project'), '--state-dir', str(runner.root / 'state'), '--json']
     if not uninstall:
-        for component in ('skills', 'agents', 'hooks', 'mcp'):
+        for component in components:
             args += ['--component', component]
-        for token in runner.grants(('skills', 'agents', 'hooks', 'mcp')):
+        for token in runner.grants(components):
             args += ['--trust', token]
     if runner.engine == 'rust':
         (base / 'args.json').write_text(json.dumps(args))

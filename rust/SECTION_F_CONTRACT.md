@@ -59,9 +59,9 @@ rows.
 | No silent evidence discard | Downgrade rows compare pre/post file bytes; reverse status leaves Rust state intact |
 | Inertness | `PAYLOAD_EXECUTED` absent; status/trust do not mutate snapshots |
 
-## Later units (not F1)
+## Later units (not F1/F2)
 
-F2 relocation / interruption / recovery handoff, F3 platform primitives, F4
+F3 platform primitives, F4
 release executable, F5 invocation wrappers, F6 intentional differences, F7
 default cutover, F8 Python removal.
 
@@ -87,3 +87,57 @@ The producer is current-tree Python whose `HEAD:agent_workbench` tree must
 equal `01c263007031df3ea599813796e2d3c127f4b4ce` (the Section E merge tree).
 Ancestor checks run only when that commit object is present, so shallow CI
 checkouts still pin package bytes.
+
+## F2 — relocation, interruption, and recovery handoff
+
+`scripts/check_python_rust_recovery_handoff.py` runs unconditionally in the
+umbrella parity gate, alongside all Section D/E/F1 scripts. Run its `tracer`
+argument for the narrow held-resource-lock regression. Python production and
+the baseline tree pin above are unchanged. No later F unit is implemented.
+
+### Acceptance criteria and test map
+
+| F2 acceptance | Runnable evidence in `check_python_rust_recovery_handoff.py` |
+| --- | --- |
+| Authentic Python ownership survives checkout relocation or fails closed without rewriting recorded paths | `relocation_skills` for all six targets; `relocation_activation` for Cursor/Claude; actual checkout rename, then same-tree differential status/install/uninstall |
+| Source-only move does not manufacture authorization | Both relocation helpers with `source_only=True`: rename `plugins` without editing catalog/state/grants; compare exact failure output and unchanged trees on rejection |
+| Python interrupted apply → Rust public status/recovery/retry | `tracer` / `recover_tracer`, both native targets, journal-durable and before-state boundaries, install and uninstall; real CLI planning and apply, authenticated journal, exact public output and recovered bytes/modes/types |
+| Rust interrupted apply → Rust recovery/retry | Same tracer matrix with `engine='rust'`: ignored private driver takes CLI argv and independently plans/applies; Rust public status consumes its genuine journal |
+| Interruption combined with checkout relocation | `tracer(..., relocate=True)`: Python before-state interruption, checkout rename, unchanged authenticated destination parents, Rust recovery/retry/uninstall |
+| Authentic parent inodes remain attached during replay | `parents` / `assert_parents` before oracle recovery, before and after file/evidence replay; no fixture-tree restore. Only non-authority temporary directories may be recreated |
+| Copied/unauthenticated journals are NOT successful handoffs | `rejected_journal`: copied tree (including key but unchanged journal paths), bad MAC, substituted state parent; Python/Rust status/install/uninstall reject identically without mutating either original or copied evidence. Only the untouched original or reattached original inode then recovers |
+| Interrupted recovery can itself be retried | `recovery_interrupted`: Python and Rust real apply journals; existing private recovery driver faults actual `AfterPath`, asserts fault hit, failure class, retained journal and parent identities, then public Rust status/retry/uninstall |
+| Resource and document lock contention retains evidence | `locked_recovery`, both native targets, independently opened `flock` descriptors, status/install/uninstall: exact Python/Rust diagnostics and immutable filesystem identities; release then real recovery/retry |
+| Shared slots, copied resources, foreign fields, publication residue | Native tracer includes skills, agents, Cursor rules / Claude commands, hooks bundles and MCP; interrupts before and after publication, compares recovered typed tree/state, preserves foreign hook/MCP fields and removes only the managed bundle on uninstall |
+| Content-bound trust remains read-only and cannot recover pending journals | Native tracer asserts pending `trust` refusal is identity-inert; after recovery, changed hook bytes invalidate old tokens, failed install keeps ownership bytes, explicit fresh grants permit retry |
+| Skills-only interrupted ownership, all six targets | `skills_interrupted`: real Python durable progress interruption during two-skill install/uninstall, then same-tree Python/Rust status/install/uninstall. Skills-only uses progress state, NOT an activation journal; no synthetic journal is asserted |
+| Hooks/MCP never execute or connect during handoff | Native tracer reuses executable/loopback `Observer` fixtures and real positive controls, checks tripwires after interruption/recovery/trust/retry/uninstall. Existing D8/E inertness/inspection/validation/render/migration gates remain in the umbrella unchanged |
+
+### Direction and evidence boundaries
+
+Supported direction is Python-produced ownership/journals → Rust recovery and
+retry. Rust-produced interrupted apply → Rust recovery is also tested. Reverse
+Rust → Python recovery is **not supported as an upgrade**. The Python consumer
+used to characterize recovery of a Rust journal in the differential harness is
+only an executable oracle comparison at identical lexical parents, not a
+downgrade promise. No journal is discarded to make a reverse operation succeed.
+The private recovery driver receives roots from authentic ownership bytes,
+not a Python plan; successful public recovery is separately exercised.
+
+### Behavioral RED → GREEN
+
+The first uncontented Python-journal → Rust status tracer characterized inherited
+GREEN behavior. Extending that exact handoff to a held ownership-state lock
+produced a real behavioral RED: Python returned exit 2 with
+`installation state is locked by another operation: <state-file>`, while Rust
+returned exit 2 with `File exists (os error 17)`. This was not a build/import
+failure. `check_python_rust_recovery_handoff.py tracer` reproduces the boundary.
+
+Rust recovery was converting the typed `LockContention` to a generic string,
+unlike the public apply boundary. F2 preserves the typed operand through the
+public recovery printer for both state and document locks. It does not change
+authentication, locking, rollback, journal formats, or the frozen oracle.
+The tracer is GREEN with exact stdout/stderr/status, unchanged pending bytes
+and identities under contention, and successful recovery after lock release.
+Harness-only file replay/isolated-HOME setup failures are not behavioral REDs.
+E1/E2 and VAL-GIT-1 / RENDER-GIT-1 / UPDATE-GIT-1 / UPDATE-CONFIG-1 remain intact.
