@@ -27,6 +27,7 @@ from agent_workbench.state import load_state, write_state
 
 RUST = REPO / "rust/target/debug/agent-workbench-rs"
 PINNED_BASELINE = "04502a0054fcd3c666e06f4e20ef7603293cfed3"
+PINNED_PYTHON_TREE = "01c263007031df3ea599813796e2d3c127f4b4ce"
 
 
 def require_pinned_baseline() -> None:
@@ -37,18 +38,24 @@ def require_pinned_baseline() -> None:
     releases = subprocess.run(["gh", "release", "list"], cwd=REPO, capture_output=True, text=True)
     if releases.returncode == 0 and releases.stdout.strip():
         raise SystemExit(f"GitHub releases exist; update the F1 pin before claiming coverage:\n{releases.stdout}")
-    present = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", PINNED_BASELINE, "HEAD"], cwd=REPO
-    )
-    if present.returncode:
-        raise SystemExit(f"pinned Python baseline {PINNED_BASELINE} is not an ancestor of HEAD")
-    drifted = subprocess.run(
-        ["git", "diff", "--quiet", PINNED_BASELINE, "--", "agent_workbench"], cwd=REPO
-    )
-    if drifted.returncode:
+    tree = subprocess.run(
+        ["git", "rev-parse", "HEAD:agent_workbench"], cwd=REPO, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    if tree != PINNED_PYTHON_TREE:
         raise SystemExit(
-            f"production package agent_workbench drifted from pinned Python {PINNED_BASELINE}"
+            f"production package agent_workbench drifted from pinned tree {PINNED_PYTHON_TREE}: {tree}"
         )
+    has_pin = subprocess.run(
+        ["git", "cat-file", "-e", f"{PINNED_BASELINE}^{{commit}}"],
+        cwd=REPO,
+        capture_output=True,
+    )
+    if has_pin.returncode == 0:
+        present = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", PINNED_BASELINE, "HEAD"], cwd=REPO
+        )
+        if present.returncode:
+            raise SystemExit(f"pinned Python baseline {PINNED_BASELINE} is not an ancestor of HEAD")
 
 
 def env_for(root: Path) -> dict[str, str]:

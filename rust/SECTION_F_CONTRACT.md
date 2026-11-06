@@ -83,5 +83,7 @@ and destination/kind/reason — not fixture-specific slot hashes.
 Independent review passed with no security or logic blockers. Applied
 non-blocking follow-ups: fail if `agent_workbench/` drifts from the pin,
 cover copied-resource leftover foreign files, and reject unknown argv.
-The producer is current-tree Python whose package bytes must match
-`04502a0054fcd3c666e06f4e20ef7603293cfed3`.
+The producer is current-tree Python whose `HEAD:agent_workbench` tree must
+equal `01c263007031df3ea599813796e2d3c127f4b4ce` (the Section E merge tree).
+Ancestor checks run only when that commit object is present, so shallow CI
+checkouts still pin package bytes.
