@@ -146,7 +146,13 @@ fn malformed_state_and_unknown_commands_fail_with_exit_two() {
         .output()
         .unwrap();
     assert_eq!(code(&unknown), 2);
-    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unsupported subcommand"));
+    assert!(unknown.stdout.is_empty());
+    let usage = agent_workbench_rs::usage_text();
+    let usage = usage.split("\n\n").next().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&unknown.stderr),
+        format!("{usage}\nagent-workbench: error: argument command: invalid choice: 'unknown' (choose from validate, render, plan, install, status, trust, uninstall, update)\n")
+    );
 }
 
 #[test]

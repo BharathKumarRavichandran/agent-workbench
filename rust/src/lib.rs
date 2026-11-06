@@ -11,18 +11,29 @@ mod activation;
 #[cfg(test)]
 mod activation_parity_tests;
 #[cfg(test)]
+mod artifact_parity_tests;
+pub mod artifacts;
+#[cfg(test)]
 mod bundle_parity_tests;
 mod bundles;
+pub mod capabilities;
+mod cli;
+mod cli_help;
 mod lifecycle;
+mod rendering;
 mod resource;
 mod shared_document;
 #[cfg(test)]
 mod shared_document_parity_tests;
+mod sources;
 mod state;
 mod transaction;
 #[cfg(test)]
 mod transaction_parity_tests;
 mod trust;
+mod validation;
+mod validation_codec;
+mod validation_json;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -274,133 +285,25 @@ impl Serialize for Operation {
 }
 
 pub fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
-    let mut args = args.into_iter();
-    let _program = args.next();
-    let mut root = PathBuf::from(".");
-    let mut profile = String::from("default");
-    let mut token = args.next().ok_or_else(usage)?;
-    while token.starts_with("--") {
-        match token.as_str() {
-            "--root" => root = PathBuf::from(args.next().ok_or("--root requires a value")?),
-            "--profile" => profile = args.next().ok_or("--profile requires a value")?,
-            "--help" | "-h" => return Err(usage()),
-            _ => return Err(format!("unsupported global option: {token}")),
+    match cli::parse(&args.into_iter().collect::<Vec<_>>()) {
+        cli::Parsed::Command(cli::Command::Lifecycle { options, action }) => {
+            options.lifecycle(action)
         }
-        token = args.next().ok_or_else(usage)?;
+        cli::Parsed::Command(_) => Err("expected lifecycle command".into()),
+        cli::Parsed::Output(output) => Err(if output.exit_code == 0 {
+            output.stdout
+        } else {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        }),
     }
-    let action = match token.as_str() {
-        "plan" => lifecycle::Action::Plan,
-        "status" => lifecycle::Action::Status,
-        "trust" => lifecycle::Action::Trust,
-        "install" => lifecycle::Action::Install,
-        "uninstall" => lifecycle::Action::Uninstall,
-        _ => {
-            return Err(format!(
-                "unsupported subcommand for Rust parity unit: {token}"
-            ))
-        }
-    };
-
-    let mut target = None;
-    let mut destination = None;
-    let mut project_root = None;
-    let mut state_dir = default_state_dir()?;
-    let mut adopt = false;
-    let mut trust = Vec::new();
-    let mut json = false;
-    let mut components = Vec::new();
-    while let Some(option) = args.next() {
-        match option.as_str() {
-            "--target" => target = Some(args.next().ok_or("--target requires a value")?),
-            "--destination" => {
-                destination = Some(expand_home(
-                    &args.next().ok_or("--destination requires a value")?,
-                )?)
-            }
-            "--project-root" => {
-                project_root = Some(expand_home(
-                    &args.next().ok_or("--project-root requires a value")?,
-                )?)
-            }
-            "--state-dir" => {
-                state_dir = PathBuf::from(args.next().ok_or("--state-dir requires a value")?)
-            }
-            "--component" if action != lifecycle::Action::Uninstall => {
-                components.push(args.next().ok_or("--component requires a value")?)
-            }
-            "--trust" if action != lifecycle::Action::Uninstall => {
-                // Path-only resources never consume activation grants. Keep
-                // Python's repeatable opaque-token parsing; executable selections
-                // remain rejected below, rather than accepting unused authority.
-                trust.push(args.next().ok_or("--trust requires a value")?);
-            }
-            "--adopt" if action != lifecycle::Action::Uninstall => adopt = true,
-            "--json" => json = true,
-            _ => return Err(format!("unsupported {} option: {option}", token)),
-        }
-    }
-    let target = SkillsTarget::parse(&target.ok_or("--target is required")?)?;
-    if profile != "pstack" && activation::Policy::for_target(target).is_none() {
-        return Err(format!(
-            "unsupported profile for Rust parity unit: {profile}"
-        ));
-    }
-    if components.iter().any(|component| {
-        !matches!(
-            component.as_str(),
-            "skills" | "agents" | "rules" | "commands" | "hooks" | "mcp"
-        )
-    }) {
-        return Err("Rust parity unit supports only path components".into());
-    }
-    let components = if components.is_empty() {
-        None
-    } else {
-        Some(
-            components
-                .into_iter()
-                .map(|component| match component.as_str() {
-                    "skills" => Ok(ComponentKind::Skills),
-                    "agents" => Ok(ComponentKind::Agents),
-                    "rules" => Ok(ComponentKind::Rules),
-                    "commands" => Ok(ComponentKind::Commands),
-                    "hooks" if activation::Policy::for_target(target).is_some() => {
-                        Ok(ComponentKind::Hooks)
-                    }
-                    "mcp" if activation::Policy::for_target(target).is_some() => {
-                        Ok(ComponentKind::Mcp)
-                    }
-                    _ => Err("Rust parity unit supports only path components".into()),
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )
-    };
-    if !json {
-        return Err("the Rust parity unit currently requires --json".into());
-    }
-    Ok(Cli {
-        root,
-        profile,
-        target,
-        components,
-        destination,
-        project_root,
-        state_dir,
-        adopt,
-        trust,
-        json,
-        action,
-    })
 }
 
 fn usage() -> String {
-    "usage: agent-workbench-rs [--root ROOT] [--profile PROFILE] {plan,status,trust,install,uninstall} --target {agents,claude,codex,cursor,grok,hermes} [--destination PATH] [--state-dir PATH] [--component skills] [--adopt] [--trust TOKEN] --json".into()
+    cli_help::text("")
 }
 
 pub fn help_requested(args: &[String]) -> bool {
-    args.iter()
-        .skip(1)
-        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    matches!(cli::parse(args), cli::Parsed::Output(output) if output.exit_code == 0)
 }
 
 pub fn usage_text() -> String {
@@ -408,14 +311,15 @@ pub fn usage_text() -> String {
 }
 
 fn default_state_dir() -> Result<PathBuf> {
-    if let Some(value) = env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(value));
+    if let Some(value) = env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return expand_home_path(PathBuf::from(value));
     }
     Ok(home_dir()?.join(".local/state"))
 }
 
 fn home_dir() -> Result<PathBuf> {
     match env::var_os("HOME") {
+        Some(value) if value.is_empty() => Ok(PathBuf::from("/")),
         Some(value) => Ok(PathBuf::from(value)),
         None => platform_home_dir(),
     }
@@ -698,7 +602,15 @@ fn reject_destination_root_symlink(path: &Path) -> Result<()> {
 }
 
 fn discover_skills(root: &Path) -> Result<Vec<(String, PathBuf)>> {
-    reject_symlink_tree(root)?;
+    if root.is_symlink() {
+        return Err(format!(
+            "skills root may not be a symlink: {}",
+            root.display()
+        ));
+    }
+    if !root.is_dir() {
+        return Err(format!("skills root does not exist: {}", root.display()));
+    }
     let mut directories = fs::read_dir(root)
         .map_err(|error| format!("skills root does not exist: {}: {error}", root.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -709,6 +621,12 @@ fn discover_skills(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         let metadata = entry
             .file_type()
             .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+        if metadata.is_symlink() {
+            return Err(format!(
+                "skill directory may not be a symlink: {}",
+                entry.path().display()
+            ));
+        }
         if !metadata.is_dir() {
             continue;
         }
@@ -723,6 +641,7 @@ fn discover_skills(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             }
             _ => continue,
         }
+        reject_symlink_tree(&entry.path())?;
         let name = parse_frontmatter(&skill_file)?;
         skills.push((name, canonicalize_existing(&entry.path(), "skill source")?));
     }
@@ -765,6 +684,7 @@ fn reject_symlink_tree(root: &Path) -> Result<()> {
 
 fn parse_frontmatter(path: &Path) -> Result<String> {
     let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
     if !text.starts_with("---\n") {
         return Err(format!(
             "skill frontmatter must start at byte zero: {}",
@@ -775,26 +695,32 @@ fn parse_frontmatter(path: &Path) -> Result<String> {
         .find("\n---\n")
         .map(|index| index + 4)
         .ok_or_else(|| format!("skill frontmatter is not closed: {}", path.display()))?;
+    let frontmatter = &text[4..closing];
     let mut name = None;
     let mut description = false;
-    for line in text[4..closing].lines() {
-        let Some((key, raw_value)) = line.split_once(':') else {
-            continue;
-        };
-        match key {
-            "name" if name.is_none() => {
-                let value = raw_value.trim().trim_matches(['\'', '"']);
-                if !value.is_empty() {
-                    name = Some(value.to_owned());
-                }
+    let mut offset = 0;
+    for line in frontmatter.split_inclusive('\n') {
+        // Python's anchored regular expressions allow \s to cross a newline;
+        // these are deliberately not YAML scalar semantics.
+        if name.is_none() && line.starts_with("name:") {
+            let remaining = frontmatter[offset + "name:".len()..].trim_start();
+            let value = remaining.split('\n').next().unwrap_or("").trim_end();
+            let value = value.strip_prefix(['\'', '"']).unwrap_or(value);
+            let value = value.strip_suffix(['\'', '"']).unwrap_or(value);
+            if !value.is_empty() && !value.contains(['\'', '"']) {
+                name = Some(value.trim().to_owned());
             }
-            "description" if !raw_value.is_empty() => description = true,
-            _ => {}
         }
+        if line.starts_with("description:") {
+            description |= frontmatter[offset + "description:".len()..]
+                .chars()
+                .any(|ch| ch != '\n');
+        }
+        offset += line.len();
     }
-    let name = name.filter(|value| safe_filename(value)).ok_or_else(|| {
+    let name = name.ok_or_else(|| {
         format!(
-            "skill frontmatter needs safe name and description: {}",
+            "skill frontmatter needs name and description: {}",
             path.display()
         )
     })?;
@@ -802,6 +728,13 @@ fn parse_frontmatter(path: &Path) -> Result<String> {
         return Err(format!(
             "skill frontmatter needs name and description: {}",
             path.display()
+        ));
+    }
+    if !safe_filename(&name) {
+        return Err(format!(
+            "skill name must be one safe filename component: {}: {}",
+            path.display(),
+            state::wire::repr(&name)
         ));
     }
     Ok(name)
@@ -980,27 +913,107 @@ pub fn operations_json(operations: &[Operation]) -> Result<String> {
     serde_json::to_string_pretty(operations).map_err(|error| error.to_string())
 }
 
+fn operations_output(operations: &[Operation], json: bool) -> Result<String> {
+    if json {
+        return Ok(operations_json(operations)? + "\n");
+    }
+    Ok(operations.iter().map(operation_text).collect())
+}
+
+fn operation_text(operation: &Operation) -> String {
+    let unsupported = operation.key.starts_with("component:");
+    let resource = if unsupported {
+        "unsupported"
+    } else {
+        operation.resource.kind()
+    };
+    let source = if unsupported || operation.source.is_empty() {
+        String::new()
+    } else {
+        format!(" -> {}", operation.source)
+    };
+    let reason = operation_reason(
+        &operation.reason,
+        operation.diagnostic.as_deref(),
+        operation.trust_token.as_deref(),
+        operation.trust_required,
+    );
+    format!(
+        "{:14} {}/{} {}{}  ({reason})\n",
+        operation.kind, operation.component, resource, operation.destination, source
+    )
+}
+
+fn operation_reason(
+    reason: &str,
+    diagnostic: Option<&str>,
+    token: Option<&str>,
+    required: bool,
+) -> String {
+    let mut reason = match diagnostic.filter(|s| !s.is_empty()) {
+        Some(diagnostic) => format!("{diagnostic}: {reason}"),
+        None => reason.to_owned(),
+    };
+    if let Some(token) = token.filter(|s| !s.is_empty()) {
+        reason.push_str(&format!(
+            "; trust {}: {token}",
+            if required { "required" } else { "granted" }
+        ));
+    }
+    reason
+}
+
 pub struct CommandOutput {
     pub stdout: String,
+    /// JSON reports are one Python print payload, not one print per line.
+    pub stdout_single_write: bool,
+    pub stderr: Vec<u8>,
     pub exit_code: u8,
 }
 
+impl CommandOutput {
+    // The public CLI prints the plan before attempting apply. Retain those
+    // bytes on ordinary apply failure, in both output modes.
+    fn apply_error(stdout: String, error: String, json: bool) -> Self {
+        Self {
+            stdout,
+            stdout_single_write: json,
+            stderr: format!("error: {error}\n").into_bytes(),
+            exit_code: 2,
+        }
+    }
+}
+
 pub fn execute(args: Vec<String>) -> Result<CommandOutput> {
-    if help_requested(&args) {
-        return Ok(CommandOutput {
-            stdout: usage_text() + "\n",
-            exit_code: 0,
-        });
+    match cli::parse(&args) {
+        cli::Parsed::Output(output) => Ok(output),
+        cli::Parsed::Command(command) => match command {
+            cli::Command::Validate { options, generated } => {
+                validation::run_options(&options.root, &options.profile, options.json, generated)
+            }
+            cli::Command::Render { options, check } => {
+                rendering::run_options(&options.root, &options.profile, check)
+            }
+            cli::Command::Update { options, source } => {
+                sources::run_options(&options.root, &options.profile, &source)
+            }
+            cli::Command::Lifecycle { options, action } => {
+                // Workspace loading precedes target lookup in the frozen public CLI.
+                // Private parse_cli callers retain their filesystem-free parse boundary.
+                let root = artifacts::resolve_catalog_path(&options.root)?;
+                validation::workspace(&root, &options.profile)?;
+                if SkillsTarget::parse(&options.target).is_err() {
+                    return Err(format!("unknown install target: {}", options.target));
+                }
+                let cli = options.lifecycle(action)?;
+                if activation::Policy::for_target(cli.target).is_some() {
+                    activation::run(&cli)
+                } else {
+                    lifecycle::run(&cli)
+                }
+            }
+        },
     }
-    let cli = parse_cli(args)?;
-    if activation::Policy::for_target(cli.target).is_some() {
-        return activation::run(&cli);
-    }
-    let (operations, conflicts) = lifecycle::run(&cli)?;
-    Ok(CommandOutput {
-        stdout: operations_json(&operations)? + "\n",
-        exit_code: if conflicts { 1 } else { 0 },
-    })
 }
 
 #[cfg(test)]

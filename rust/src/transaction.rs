@@ -28,6 +28,19 @@ use std::{
     path::Path,
 };
 
+/// Preserve the primitive's diagnostic while carrying the exact flock operand
+/// to the public lifecycle printer (not an inferred generic EEXIST failure).
+#[derive(Debug)]
+pub(crate) struct LockContention {
+    pub path: std::path::PathBuf,
+}
+impl std::fmt::Display for LockContention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::io::Error::from_raw_os_error(rustix::io::Errno::EXIST.raw_os_error()).fmt(f)
+    }
+}
+impl std::error::Error for LockContention {}
+
 /// OS entropy, never timestamps, process IDs, or a deterministic fallback.
 fn random<const N: usize>() -> io::Result<[u8; N]> {
     #[cfg(test)]
@@ -178,7 +191,12 @@ pub(crate) fn document_lock(
     }
     rfs::flock(&lock, rfs::FlockOperation::NonBlockingLockExclusive).map_err(|error| {
         if error == rustix::io::Errno::WOULDBLOCK {
-            io_error(rustix::io::Errno::EXIST)
+            Error::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                LockContention {
+                    path: base.join(name),
+                },
+            ))
         } else {
             io_error(error)
         }

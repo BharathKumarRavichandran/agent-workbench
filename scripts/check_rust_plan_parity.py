@@ -1496,7 +1496,7 @@ def trust_cli_contract(base: Path) -> None:
                          ("install", ("--component", "hooks", "--trust", token)),
                          ("install", ("--component", "mcp", "--trust", token))):
         result = side.command(action, *args)
-        assert result.returncode == 2, result
+        assert result.returncode == 1 and 'COMPONENT_UNSUPPORTED' in result.stdout, result
         assert trust_snapshot(side.base) == rejection_before, "unsupported activation mutated fixtures"
     print("trust CLI: six-target skills exits/output/typed snapshots match; unsupported Codex activation remains fail-closed")
 
@@ -2585,6 +2585,8 @@ def transaction_durable_rows(base: Path) -> None:
 
 
 def main() -> int:
+    from parity_oracle import require_python312
+    require_python312()
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
         sys.stderr.write(build.stderr)
@@ -2592,10 +2594,14 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
-            for script in ("check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
+            for script in ("parity_oracle.py", "check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
                            "check_cursor_activation_recovery.py", "check_claude_activation_parity.py",
                            "check_claude_activation_edges.py", "check_claude_activation_recovery.py",
-                           "check_claude_native_contract.py", "check_activation_inertness.py"):
+                           "check_claude_native_contract.py", "check_activation_inertness.py",
+                           "check_artifact_inspection_parity.py", "check_artifact_inventory.py",
+                           "check_validate_parity.py", "check_render_parity.py", "check_render_failures.py",
+                           "check_lifecycle_text_parity.py", "check_cli_parity.py",
+                           "check_cli_defaults_parity.py", "check_cli_help_edges.py"):
                 activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
                 assert activation.returncode == 0, activation.stdout + activation.stderr
                 print(activation.stdout.strip())
@@ -2663,6 +2669,9 @@ def main() -> int:
             component_override(base)
             destination_precedence(base)
             shared_state_isolation(base)
+            update = run([sys.executable, str(REPOSITORY / "scripts/check_update_parity.py")])
+            assert update.returncode == 0, update.stdout + update.stderr
+            print(update.stdout.strip())
     except AssertionError:
         import traceback
         traceback.print_exc()

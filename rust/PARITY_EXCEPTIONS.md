@@ -121,3 +121,112 @@ the replacement. A second RED after an injected post-rename fsync failure proved
 that successful-operation status was insufficient: mutation completion must be
 tracked separately. Both phase regressions now pass locally. Full gate and Ubuntu
 evidence are tracked separately in `TRANSACTION_CONTRACT.md`.
+
+## VAL-GIT-1 — uncaught validation Git revision failure (user authorized)
+
+The user explicitly approved **Python 3.12 as the exact diagnostic oracle** and
+this narrowly bounded diagnostic exception while completing Section E2. Python
+production remains frozen. This identifier is distinct from the transaction
+E1/E2 exceptions above; neither transaction authorization is changed.
+
+### Exact boundary and observable difference
+
+`agent_workbench/adapters/lock.py:35-38` invokes real `git -C <source>
+rev-parse HEAD` while the internal canonical lock renderer checks generated
+files. If Git exits unsuccessfully, its stderr is inherited and Python's
+`subprocess.CalledProcessError` escapes `validation.validate` (which catches
+only `OSError`, `ValueError`, and `KeyError`). Python emits **empty stdout,
+exit 1, the real Git stderr bytes, followed by its uncaught traceback**.
+
+Rust intentionally emits **empty stdout, exit 1, and those real Git stderr bytes
+unchanged**, omitting only the Python traceback. It emits neither a JSON report
+nor a human report, even when earlier validation issues were accumulated. This
+is a separate `RenderError::Git(Vec<u8>)` channel, not a structured
+`RENDER_FAILED`, trimming/decoding of stderr, or an exception for ordinary
+renderer errors. Failed process spawning remains the ordinary renderer-error
+path. `--no-generated-check` bypasses the Git renderer as in Python.
+
+This authorization covers only unsuccessful Git revision lookup during public
+validation. It does not authorize public `render`, source `update`, altered
+lifecycle stderr/status, execution of Python by Rust, or normalization of any
+other error. The frozen oracle still runs literally in the differential tests;
+its traceback is asserted, not silently discarded from a generic comparison.
+
+### Acceptance-to-test map
+
+| Authorized edge | Executable evidence |
+| --- | --- |
+| Existing nonrepository and initialized repository without HEAD | `check_validate_parity.py::git_revision_rows`, actual Git commands in scratch, no mocks |
+| Human and JSON modes, with and without an earlier validation issue | Eight real paired public rows; Python traceback and Rust's exact raw stderr/empty stdout/exit 1 asserted separately |
+| No partial report or filesystem mutation | Every exception row compares complete fixture file kinds, modes, bytes, lexical links, inodes and timestamps before/after |
+| Generated-check bypass | Same fixture with `--no-generated-check`, ordinary exact differential |
+| Python 3.12 runtime contract, including subprocess `python3` | `scripts/parity_oracle.py`, invoked before parity fixtures/builds and unconditionally by the full parity gate; both mismatched top-level Python and mismatched PATH are rejected |
+
+The E2 acceptance map and finite JSON evidence live in `SECTION_E_CONTRACT.md`.
+Local evidence does not substitute for focused review or exact-SHA Ubuntu CI.
+
+## RENDER-GIT-1 — uncaught rendering Git revision failure (user authorized)
+
+The user explicitly extended the VAL-GIT-1 traceback-only contract to public
+`render` and `render --check`. At the same `LockReportRenderer.render` revision
+lookup, frozen Python emits real Git stderr followed by an uncaught
+`CalledProcessError` traceback, empty stdout and exit 1. Rust retains exactly
+the real Git stderr and exit 1, emits no stdout, and omits the Python traceback.
+No other rendering failure, source update, or transaction behavior is covered.
+Python production is unchanged.
+
+`check_render_parity.py` exercises an existing nonrepository and an initialized
+repository without HEAD, through write/check/repeat paths. It separately asserts
+Python's literal traceback and Rust's traceback-free raw stderr; all filesystem
+bytes/types/modes/links and failed-command identity remain unchanged. The
+permanent test observed RED on Rust's explicit incomplete-contract refusal,
+then GREEN after this authorized error-channel change.
+
+## UPDATE-GIT-1 — uncaught source-update Git failures (user authorized)
+
+The user explicitly extended the traceback-only exception to public `update`,
+including revision/registration lookup and mutation-phase Git failures, also
+when the failure is re-raised after rollback. Python production remains frozen.
+`agent_workbench/sources.py::update_source`, `_revision`, and
+`_verify_submodule_registration` remain the executable specification.
+
+Rust must preserve **actual Git stdout and stderr bytes, their ordering, exit
+1, and every filesystem and rollback effect**. It omits only the uncaught Python
+`subprocess.CalledProcessError` traceback. This is not permission to suppress
+Git output, change failed-command status to 2, change rollback ordering, retain
+original generated modes instead of Python's effective 0600 restoration, alter
+nested-submodule residue, or make other safety changes. Pre-snapshot failures
+must remain pre-mutation; caught ordinary errors remain `error: ...` / exit 2.
+VAL-GIT-1, RENDER-GIT-1 and transaction E1/E2 are unchanged.
+
+`check_update_parity.py` uses actual isolated Git repositories, exact child-only
+reviewed-URL rewrites and `GIT_ALLOW_PROTOCOL=file`. It independently asserts
+the frozen oracle's traceback for missing reviewed branches, invalid revision
+lookup, dirty-checkout failure and unavailable local nested repositories. Rust
+must match the raw streams without that traceback. Every scenario is replayed
+with a shared stdout/stderr descriptor to compare cross-stream ordering, and
+with separate descriptors to compare each stream. Typed working-tree snapshots
+retain generated bytes/modes/types/literal links and `.git` indirection files;
+Git's administrative directories have separate HEAD/ref/index/status/config/
+reflog-subject semantic observations. No Python outputs or plans feed Rust.
+
+ConfigParser errors are not covered by UPDATE-GIT-1. The user separately
+authorized the bounded UPDATE-CONFIG-1 contract below.
+
+## UPDATE-CONFIG-1 — uncaught update registration parser errors (user authorized)
+
+For `.gitmodules` errors in Python 3.12's `configparser.Error` family, the user
+approved omitting Python stack frames while retaining the **exact final
+exception class and complete message, exit 1, empty stdout and no mutation**.
+This includes duplicate options/sections, missing section headers, parsing
+errors and interpolation syntax/missing-option/depth errors. It does not permit
+accepting malformed registration, changing validation order, suppressing the
+final diagnostic, or changing any Git/filesystem behavior. Python is unchanged.
+
+`check_update_parity.py` separately asserts Python's real traceback and extracts
+only its final `configparser.<Class>Error: ...` diagnostic for comparison with
+Rust. It retains multi-line messages and the concrete PosixPath/line/option/
+section details, and verifies typed working-tree plus semantic Git state remain
+unchanged. Both separate and merged output streams are replayed. The original
+duplicate-option status mismatch was observed RED before correction; additional
+interpolation rows observed RED on ordinary Rust exit-2 errors before correction.

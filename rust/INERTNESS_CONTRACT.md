@@ -50,7 +50,7 @@ configuration, credential or network endpoint is used.
 | Changed content invalidates persisted/old grants without implicit renewal | Four real plan/trust/status/stale-token-install phases; `TRUST_REQUIRED` and unchanged saved state; no executable/network activity |
 | Uninstall is inert | Real public uninstall after changed source; observers remain quiet |
 | Both target-native policies and both independent public implementations | 30 paired public CLI rows plus native validator executions, at the same lexical paths with deterministic test authority after the untrusted phase |
-| Native validation and public command scope stay distinct | Rust public `validate` is explicitly asserted fail-closed; full public `validate` remains Section E, not silently ported or claimed by D8 |
+| Native validation and public command scope stay distinct | D8 originally asserted public `validate` fail-closed. E2 now additionally exercises real public `validate --json --no-generated-check` for both engines under the same observers, retaining D8's private native validator; E2's separate acceptance map governs its incomplete public-command parity |
 | Coverage runs in Ubuntu CI | `scripts/check_rust_plan_parity.py` invokes the inertness script and private validator unconditionally, alongside all D5–D7 and E1/E2 suites |
 
 The test's initial implementation passed the existing inert production behavior;

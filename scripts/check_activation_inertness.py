@@ -3,8 +3,7 @@
 
 Only harmless, explicitly invoked canaries execute. Malicious-looking Markdown,
 prompt and opaque artifact text remain data throughout validation and lifecycle.
-The Rust public validate command belongs to Section E and stays fail-closed;
-its actual native inventory validator is exercised through a private test driver.
+E2 also exercises real public validate, retaining the native private driver.
 """
 from __future__ import annotations
 import json
@@ -119,11 +118,11 @@ def validate_inventory(base, runner):
             env=dict(os.environ, AW_PUBLIC_ACTIVATION_BASE=str(base)), capture_output=True, text=True)
         assert result.returncode == 0 and '1 passed' in result.stdout, result.stdout + result.stderr
         assert json.loads((base / 'validation-result.json').read_text()) == {'valid': True}
-        # Do not widen Section E just to make a public validation claim.
-        public = subprocess.run([str(RUST), '--root', str(runner.repository), '--profile', 'pstack', 'validate', '--json'],
-            cwd=REPO, capture_output=True, text=True,
-            env=dict(os.environ, HOME=str(runner.root / 'home')))
-        assert public.returncode == 2 and 'unsupported subcommand' in public.stderr
+    command = [sys.executable, '-m', 'agent_workbench'] if runner.engine == 'python' else [str(RUST)]
+    public = subprocess.run([*command, '--root', str(runner.repository), '--profile', 'pstack',
+        'validate', '--json', '--no-generated-check'], cwd=REPO, capture_output=True, text=True,
+        env=dict(os.environ, HOME=str(runner.root / 'home'), PYTHONDONTWRITEBYTECODE='1'), timeout=30)
+    assert (public.returncode, public.stdout, public.stderr) == (0, '[]\n', ''), public
     assert before == readonly_identity(runner.root), 'validation mutated fixture identity/bytes'
     return snapshot(runner.root)
 
