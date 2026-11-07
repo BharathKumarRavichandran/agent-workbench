@@ -79,7 +79,34 @@ pub(super) fn recover(
     let request =
         recovery::RecoveryRequest::new(file.to_path_buf(), policy.id(), roots_wire(roots))
             .map_err(error)?;
-    recovery::recover(&request, |_| Ok(())).map_err(error)
+    recovery::recover(&request, |_| Ok(())).map_err(|failure| {
+        if let Error::Io(e) = &failure {
+            if let Some(busy) = e
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<crate::transaction::LockContention>())
+            {
+                let state_lock = file.with_file_name(format!(
+                    ".{}.lock",
+                    file.file_name().unwrap().to_string_lossy()
+                ));
+                if busy.path == state_lock {
+                    return format!(
+                        "installation state is locked by another operation: {}",
+                        file.display()
+                    );
+                }
+                if let Some(config) = roots.get(&ComponentKind::Hooks).and_then(|p| p.parent()) {
+                    if busy.path == config.join(".agent-workbench.lock") {
+                        return format!(
+                            "target document is locked by another operation: {}",
+                            config.display()
+                        );
+                    }
+                }
+            }
+        }
+        error(failure)
+    })
 }
 fn selected<'a>(
     catalog: &'a Catalog,

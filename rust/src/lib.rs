@@ -20,6 +20,8 @@ pub mod capabilities;
 mod cli;
 mod cli_help;
 mod lifecycle;
+#[cfg(test)]
+mod platform_parity_tests;
 mod rendering;
 mod resource;
 mod shared_document;
