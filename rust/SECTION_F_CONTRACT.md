@@ -145,8 +145,8 @@ E1/E2 and VAL-GIT-1 / RENDER-GIT-1 / UPDATE-GIT-1 / UPDATE-CONFIG-1 remain intac
 
 The `rust-plan-parity` CI job now has independent `ubuntu-24.04` and `macos-15`
 matrix cells with `fail-fast: false`. Both check out the literal PR head SHA,
-pin top-level and nested Python to 3.12, use job-owned `runner.temp` as `TMPDIR`
-for builds and fixtures, and run fmt, check, all-target clippy with denied
+pin top-level and nested Python to 3.12, publish a job-owned scratch subdirectory
+beneath `runner.temp` through `GITHUB_ENV` for builds and fixtures, and run fmt, check, all-target clippy with denied
 warnings, Rust tests, the **entire** umbrella parity suite, and Python tests.
 There is no smoke-only substitute, platform exclusion, or continue-on-error.
 Existing Python 3.9/3.12 catalog jobs remain unchanged.
@@ -171,3 +171,8 @@ results require their own exact-head CI execution; local macOS is not a
 substitute. The platform scope is the named runners and their tested filesystem
 primitives, not Windows, Linux arm64, network filesystems, arbitrary kernels,
 or a claim of hardware/power-loss durability. F4–F8 remain separate units.
+
+The initial F3 workflow was rejected before any jobs ran because `runner.temp`
+is not an allowed job-level `env` context. The correction sets scratch through
+a runner step instead; local actionlint 1.7.12 validates the corrected workflow.
+That configuration failure is not a test/behavioral RED or platform evidence.
