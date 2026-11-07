@@ -59,9 +59,9 @@ rows.
 | No silent evidence discard | Downgrade rows compare pre/post file bytes; reverse status leaves Rust state intact |
 | Inertness | `PAYLOAD_EXECUTED` absent; status/trust do not mutate snapshots |
 
-## Later units (not F1–F6)
+## Later units (not F1–F7)
 
-F7 default cutover, F8 Python removal.
+F8 Python removal.
 
 ## Observed RED → GREEN
 
@@ -386,4 +386,33 @@ Python 3.12 oracle.
 - evidence: scripts/check_python_baseline_upgrade.py reverse_and_downgrade
 
 The F6 RED was missing catalog documentation and the dedicated gate. Authorized
-exception behavior is inherited characterization GREEN. F7–F8 remain later.
+exception behavior is inherited characterization GREEN. F8 remains a later unit.
+
+## F7 — default cutover
+
+Rust is the documented default CLI. The default entry point is the Rust
+`agent-workbench` executable (`$PREFIX/bin/agent-workbench` and the transition
+wrapper). python3 -m agent_workbench still runs as the oracle; F8
+removes Python later. F6 catalog IDs and producer→rewrite / fail-closed
+reverse/downgrade evidence remain required. Do not invent divergences, hide
+them in a generic normalizer, delete `agent_workbench/` or Python tests, or
+publish Git tags or GitHub releases.
+
+`scripts/check_default_cutover.py` runs unconditionally in the umbrella parity
+gate. It requires explicit scratch `TMPDIR` and the pinned Python 3.12 oracle.
+The F7 TODO box is checked only after local gates; this test must not require
+the box already checked.
+
+### Acceptance-to-test map
+
+| F7 acceptance | Runnable evidence in `check_default_cutover.py` |
+| --- | --- |
+| Documented default CLI is the Rust `agent-workbench` executable, not `python3 -m agent_workbench` | `documented_default_is_rust` |
+| README Commands, Makefile recipes that were Python module invocations, and the transition wrapper dispatch to that default | `leftover_documented_default_is_not_python`, `makefile_dispatches_to_default`, `wrapper_dispatches_to_rust` |
+| Fail if a leftover documented path still execs Python as default | `leftover_documented_default_is_not_python` |
+| `python3 -m agent_workbench` still runs as the oracle; F8 stays later | `oracle_module_still_runs`; TODO Python-removal box remains unchecked |
+| Producer-written ownership → default-Rust status/reinstall/uninstall | `migration_through_default` |
+| Unsupported reverse/downgrade still fail closed | `migration_through_default` via `reverse_and_downgrade` |
+| Authorized differences stay the F6 catalog | `f6_catalog_required` |
+| F6 catalog and migration evidence remain required | `f6_catalog_required`; umbrella still runs `check_intentional_differences.py` |
+| Document the default cutover | `documentation_records_cutover` |

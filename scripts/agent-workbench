@@ -1,20 +1,27 @@
-#!/usr/bin/env python3
-"""Explicit Python CLI wrapper for the transition.
+#!/bin/sh
+# Transition wrapper for the default Rust CLI.
+# The Python module form remains the frozen oracle until F8.
+# This script is not $PREFIX/bin/agent-workbench and must not be installed
+# in its place.
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 
-Python remains the default engine via `python3 -m agent_workbench`. This
-script is not the optional Rust release binary at
-`$PREFIX/bin/agent-workbench` and must not be installed in its place.
-"""
-from __future__ import annotations
+resolve() {
+    if [ -n "${AGENT_WORKBENCH_BIN:-}" ]; then
+        printf '%s\n' "$AGENT_WORKBENCH_BIN"
+        return 0
+    fi
+    if [ -x "$ROOT/rust/target/release/agent-workbench-rs" ]; then
+        printf '%s\n' "$ROOT/rust/target/release/agent-workbench-rs"
+        return 0
+    fi
+    if [ -x "$ROOT/rust/target/debug/agent-workbench-rs" ]; then
+        printf '%s\n' "$ROOT/rust/target/debug/agent-workbench-rs"
+        return 0
+    fi
+    printf '%s\n' "agent-workbench: default Rust CLI is missing. Install with python3 scripts/package_release.py --prefix \"\$HOME/.local\" or build rust/target/debug/agent-workbench-rs." >&2
+    return 127
+}
 
-import os
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-env = os.environ.copy()
-pythonpath = str(ROOT)
-if env.get("PYTHONPATH"):
-    pythonpath = pythonpath + os.pathsep + env["PYTHONPATH"]
-env["PYTHONPATH"] = pythonpath
-os.execve(sys.executable, [sys.executable, "-m", "agent_workbench", *sys.argv[1:]], env)
+BIN=$(resolve)
+exec "$BIN" "$@"

@@ -185,8 +185,8 @@ def documentation_records_catalog() -> None:
     body = parts[1]
     assert "Acceptance-to-test map" in body, body[:500]
     commands = readme.split("## Commands", 1)[1].split("## ", 1)[0]
-    assert "python3 -m agent_workbench validate" in commands
-    assert "agent-workbench --profile" not in commands
+    assert "agent-workbench validate" in commands
+    assert "python3 -m agent_workbench validate" not in commands
     for row in (*CATALOG, *MIGRATION):
         assert row["id"] in readme, f"README missing {row['id']}"
         for field in (
@@ -222,7 +222,6 @@ def evidence_is_wired() -> None:
         path = REPO / row["evidence"].split()[0].split("::", 1)[0]
         assert path.is_file(), path
     todo = TODO.read_text(encoding="utf-8")
-    assert "- [ ] Make Rust the default only after" in todo
     assert "- [ ] Remove Python runtime code" in todo
 
 
@@ -319,7 +318,7 @@ def main() -> int:
     print(
         f"F6 intentional differences: {len(CATALOG)} authorized exceptions, "
         f"{len(MIGRATION)} migration directions, {rows} producer/rewrite rows; "
-        f"default engine python3 -m agent_workbench"
+        f"oracle python3 -m agent_workbench; default CLI is Rust"
     )
     return 0
 

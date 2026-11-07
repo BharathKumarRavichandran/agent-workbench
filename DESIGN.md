@@ -124,10 +124,10 @@ Cursor supports skills, Markdown agents, and project `.mdc` rules. Claude suppor
 The old scripts remain as wrappers while the stable command is:
 
 ```bash
-python3 -m agent_workbench <command>
+agent-workbench <command>
 ```
 
-The wrappers contain no duplicated catalog, rendering, validation, or installation logic.
+`python3 -m agent_workbench` remains the frozen oracle. The wrappers contain no duplicated catalog, rendering, validation, or installation logic.
 
 ## Exact activation transactions
 

@@ -32,7 +32,6 @@ SHEBANG_WRAPPERS = (
     REPO / "scripts" / "update.py",
     REPO / "scripts" / "install_skills.py",
 )
-MAKE_PYTHON_TARGETS = ("render", "validate", "update", "plan-hermes")
 ELF_OR_MACHO = (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf")
 
 
@@ -43,6 +42,8 @@ def file_kind(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
     if text.startswith("#!/usr/bin/env python3") and "-m" in text and "agent_workbench" in text:
         return "python-wrapper"
+    if text.startswith("#!/bin/sh") and "exec" in text and "-m agent_workbench" not in text:
+        return "rust-wrapper"
     raise AssertionError(f"unclassified invocation file {path}: {header!r}")
 
 
@@ -67,16 +68,6 @@ def documented_module_form(root: Path) -> None:
 
 
 def makefile_stays_on_python_module() -> None:
-    for target in MAKE_PYTHON_TARGETS:
-        result = subprocess.run(
-            ["make", "-n", target],
-            cwd=REPO,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        assert "-m agent_workbench" in result.stdout, (target, result.stdout)
-        assert "package_release.py" not in result.stdout
     dry = subprocess.run(
         ["make", "-n", "install-dry-run"],
         cwd=REPO,
@@ -117,10 +108,9 @@ def explicit_wrapper_is_python(prefix: Path | None = None) -> None:
     assert WRAPPER.is_file(), WRAPPER
     mode = stat.S_IMODE(WRAPPER.stat().st_mode)
     assert mode & 0o111, mode
-    assert file_kind(WRAPPER) == "python-wrapper"
+    assert file_kind(WRAPPER) == "rust-wrapper"
     text = WRAPPER.read_text(encoding="utf-8")
-    assert "agent-workbench-rs" not in text
-    assert "cargo" not in text
+    assert "-m agent_workbench" not in text
     if prefix is not None:
         names = sorted(path.name for path in (prefix / "bin").iterdir())
         assert names == [EXECUTABLE], names
@@ -132,18 +122,18 @@ def three_forms_distinguishable(prefix: Path, root: Path) -> None:
     wrapped = invoke_wrapper(root, ["--help"])
     binary = invoke_release(installed_binary(prefix), root, ["--help"])
     assert module.returncode == wrapped.returncode == binary.returncode == 0
-    assert (module.returncode, module.stdout, module.stderr) == (
-        wrapped.returncode,
-        wrapped.stdout,
-        wrapped.stderr,
+    assert (wrapped.returncode, wrapped.stdout, wrapped.stderr) == (
+        binary.returncode,
+        binary.stdout,
+        binary.stderr,
     )
     kinds = {
         "python-module": tuple(module.args[:3]),
-        "python-wrapper": file_kind(WRAPPER),
+        "rust-wrapper": file_kind(WRAPPER),
         "rust-binary": file_kind(installed_binary(prefix)),
     }
     assert kinds["python-module"] == (sys.executable, "-m", "agent_workbench")
-    assert kinds["python-wrapper"] == "python-wrapper"
+    assert kinds["rust-wrapper"] == "rust-wrapper"
     assert kinds["rust-binary"] == "rust-binary"
     assert len(set(kinds.values())) == 3
 
@@ -151,11 +141,11 @@ def three_forms_distinguishable(prefix: Path, root: Path) -> None:
 def default_engine_unchanged() -> None:
     readme = (REPO / "README.md").read_text(encoding="utf-8")
     commands = readme.split("## Commands", 1)[1].split("## ", 1)[0]
-    assert "python3 -m agent_workbench validate" in commands
-    assert "python3 -m agent_workbench --profile pstack plan --target hermes" in commands
-    assert "agent-workbench --profile" not in commands
+    assert "agent-workbench validate" in commands
+    assert "agent-workbench --profile pstack plan --target hermes" in commands
+    assert "python3 -m agent_workbench validate" not in commands
+    assert "python3 -m agent_workbench" in readme
     assert "scripts/agent-workbench" in readme
-    assert "does not replace" in readme or "not the default" in readme.lower()
 
 
 def upgrade_uninstall_through_preserved(base: Path) -> int:

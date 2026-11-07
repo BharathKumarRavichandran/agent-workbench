@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Install the release `agent-workbench` executable into PREFIX/bin.
 
-Python remains the default CLI. This does not publish Git tags or GitHub
-releases; F1 still pins in-tree Python as the ownership producer.
+Python remains the frozen oracle until F8. This installs the default Rust CLI and does not publish Git tags or GitHub releases; F1 still pins in-tree Python as the ownership producer.
 """
 from __future__ import annotations
 

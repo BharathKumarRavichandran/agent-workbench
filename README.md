@@ -38,11 +38,11 @@ cd agent-workbench
 make check
 ```
 
-The runtime uses only the Python standard library and supports Python 3.9 or newer.
+The runtime uses only the Python standard library and supports Python 3.9 or newer. Rust is the default CLI.
 
-## Optional Rust release executable
+## Default CLI
 
-Python remains the default CLI. An optional release build installs one `agent-workbench` executable. It does not publish Git tags or GitHub releases.
+The documented default CLI is the Rust `agent-workbench` executable. An install places one binary at `$PREFIX/bin/agent-workbench`. It does not publish Git tags or GitHub releases.
 
 ```bash
 python3 scripts/package_release.py --prefix ~/.local
@@ -60,9 +60,9 @@ agent-workbench --profile pstack uninstall --target hermes
 
 ## Transition invocations
 
-Python remains the default engine. `python3 -m agent_workbench` and the Makefile targets (`make validate`, `make render`, `make update`, `make plan-hermes`) are unchanged. Command-specific shebang wrappers remain at `scripts/validate.py`, `scripts/render_marketplaces.py`, `scripts/update.py`, and `scripts/install_skills.py`.
+Rust is the default CLI. Makefile targets (`make validate`, `make render`, `make update`, `make plan-hermes`) dispatch to that default through `scripts/agent-workbench`. Command-specific shebang wrappers remain at `scripts/validate.py`, `scripts/render_marketplaces.py`, `scripts/update.py`, and `scripts/install_skills.py` for the Python oracle.
 
-`scripts/agent-workbench` is an explicit Python wrapper that execs `python3 -m agent_workbench`. It does not replace `$PREFIX/bin/agent-workbench` and is not the default:
+`python3 -m agent_workbench` still runs as the frozen oracle. `scripts/agent-workbench` is a transition wrapper that execs the Rust `agent-workbench` executable. It does not replace `$PREFIX/bin/agent-workbench`:
 
 ```bash
 python3 -m agent_workbench --help
@@ -71,9 +71,9 @@ scripts/agent-workbench --profile pstack status --target hermes
 
 ## Intentional Python/Rust differences
 
-Python remains the default CLI until a later cutover. The optional Rust executable matches Python except the authorized differences `E1`, `E2`, `VAL-GIT-1`, `RENDER-GIT-1`, `UPDATE-GIT-1`, and `UPDATE-CONFIG-1`. Each has a permanent paired regression that asserts the oracle and replacement separately. None is hidden in a generic normalizer or extended to another command.
+Rust is the default CLI. Python remains the frozen oracle until a later removal unit. The default executable matches Python except the authorized differences `E1`, `E2`, `VAL-GIT-1`, `RENDER-GIT-1`, `UPDATE-GIT-1`, and `UPDATE-CONFIG-1`. Each has a permanent paired regression that asserts the oracle and replacement separately. None is hidden in a generic normalizer or extended to another command.
 
-State/config migration required before any default cutover: `PYTHON-TO-RUST-UPGRADE` consumes producer-written ownership in place. `REVERSE-STATUS-NOT-SUPPORTED` and `REJECT-V4-AS-V3` fail closed without discarding evidence.
+State/config migration for the default CLI: `PYTHON-TO-RUST-UPGRADE` consumes producer-written ownership in place. `REVERSE-STATUS-NOT-SUPPORTED` and `REJECT-V4-AS-V3` fail closed without discarding evidence.
 
 Exact command, failure boundary, stdout/stderr class, exit status, and state/config effect for each row: [`rust/SECTION_F_CONTRACT.md`](rust/SECTION_F_CONTRACT.md) (F6) and [`rust/PARITY_EXCEPTIONS.md`](rust/PARITY_EXCEPTIONS.md).
 
@@ -81,26 +81,26 @@ Exact command, failure boundary, stdout/stderr class, exit status, and state/con
 
 ```bash
 # Validate the catalog, manifests, component artifacts, lock report, and generated files.
-python3 -m agent_workbench validate
+agent-workbench validate
 
 # Render native marketplaces and catalog/lock.json.
-python3 -m agent_workbench render
-python3 -m agent_workbench render --check
+agent-workbench render
+agent-workbench render --check
 
 # Preview an installation without changing the machine.
-python3 -m agent_workbench --profile pstack plan --target hermes
+agent-workbench --profile pstack plan --target hermes
 
 # Apply it. Existing exact links require explicit adoption once.
-python3 -m agent_workbench --profile pstack install --target hermes --adopt
+agent-workbench --profile pstack install --target hermes --adopt
 
 # Inspect current desired-versus-actual state.
-python3 -m agent_workbench --profile pstack status --target hermes
+agent-workbench --profile pstack status --target hermes
 
 # Remove only paths recorded as owned by this workbench.
-python3 -m agent_workbench --profile pstack uninstall --target hermes
+agent-workbench --profile pstack uninstall --target hermes
 
 # Advance the reviewed upstream source, then render and validate.
-python3 -m agent_workbench update --source cursor-plugins
+agent-workbench update --source cursor-plugins
 ```
 
 `--destination` overrides the skills directory. `--project-root` selects project directories for components. `--state-dir` overrides machine-local ownership storage.
@@ -108,9 +108,9 @@ python3 -m agent_workbench update --source cursor-plugins
 To install pstack agents into a project:
 
 ```bash
-python3 -m agent_workbench --profile pstack plan --target cursor --component agents --project-root /path/to/project
-python3 -m agent_workbench --profile pstack install --target cursor --component agents --project-root /path/to/project
-python3 -m agent_workbench --profile pstack uninstall --target cursor --project-root /path/to/project
+agent-workbench --profile pstack plan --target cursor --component agents --project-root /path/to/project
+agent-workbench --profile pstack install --target cursor --component agents --project-root /path/to/project
+agent-workbench --profile pstack uninstall --target cursor --project-root /path/to/project
 ```
 
 Repeat `--component` to select more than one kind, such as `--component skills --component agents`. The same flags apply to `plan`, `install`, and `status`. Text and JSON operations identify the component and resource kind. Unsupported requests produce `COMPONENT_UNSUPPORTED` conflicts before mutation, even when selected plugins export none of that component.
@@ -133,9 +133,9 @@ Cursor and Claude support explicit activation of their exact hook formats and MC
 To activate Cursor hooks and MCP for a project, first inspect the plan and its trust tokens:
 
 ```bash
-python3 -m agent_workbench trust --target cursor --project-root /path/to/project \
+agent-workbench trust --target cursor --project-root /path/to/project \
   --component hooks --component mcp --json
-python3 -m agent_workbench install --target cursor --project-root /path/to/project \
+agent-workbench install --target cursor --project-root /path/to/project \
   --component hooks --component mcp \
   --trust aw-trust-v1:<hooks-token> --trust aw-trust-v1:<mcp-token>
 ```
