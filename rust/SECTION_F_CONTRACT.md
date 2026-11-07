@@ -59,9 +59,9 @@ rows.
 | No silent evidence discard | Downgrade rows compare pre/post file bytes; reverse status leaves Rust state intact |
 | Inertness | `PAYLOAD_EXECUTED` absent; status/trust do not mutate snapshots |
 
-## Later units (not F1/F2/F3/F4/F5)
+## Later units (not F1–F6)
 
-F6 intentional differences, F7 default cutover, F8 Python removal.
+F7 default cutover, F8 Python removal.
 
 ## Observed RED → GREEN
 
@@ -232,4 +232,158 @@ Python 3.12 oracle.
 
 Documented module, Makefile, and shebang forms were inherited characterization
 GREEN. The F5 RED was the missing explicit wrapper (`scripts/agent-workbench`).
-F6–F8 remain separate units.
+F7–F8 remain separate units.
+
+## F6 — intentional differences and migration
+
+Python remains the frozen oracle and the default CLI
+(`python3 -m agent_workbench`) until F7. F6 records already-authorized
+differences and the state/config migration required before cutover. It does
+not change production Python or Rust behavior, invent divergences, replace
+`$PREFIX/bin/agent-workbench`, or publish Git tags or GitHub releases.
+
+`scripts/check_intentional_differences.py` runs unconditionally in the
+umbrella parity gate. It requires explicit scratch `TMPDIR` and the pinned
+Python 3.12 oracle.
+
+### Acceptance-to-test map
+
+| F6 acceptance | Runnable evidence in `check_intentional_differences.py` |
+| --- | --- |
+| Every authorized difference is named with command, boundary, stdout/stderr class, exit, and state/config effect | `CATALOG` versus `PARITY_EXCEPTIONS.md` headings; this section copies each field |
+| Each difference has a permanent paired regression (oracle and replacement asserted separately) | `exception_tests_assert_separately` plus `paired_git_validate`, `paired_git_render`, `paired_update_exceptions`; E1/E2 remain `state_parent_contract.py` / `stage_cleanup_contract.py` |
+| Do not hide a difference in a generic normalizer or extend it to another command | Separate Python/Rust assertions in the mapped scripts; `normalize_traceback` is absent |
+| Producer-written ownership → rewrite before default cutover | `same_tree_status` hermes (`PYTHON-TO-RUST-UPGRADE`) |
+| Unsupported reverse/downgrade still fail closed | `reverse_and_downgrade` (`REVERSE-STATUS-NOT-SUPPORTED`, `REJECT-V4-AS-V3`) |
+| Default CLI is still `python3 -m agent_workbench` | `default_engine_unchanged`; README Commands stay on the module form |
+| F7/F8 stay later | `TODO.md` default-cutover and Python-removal boxes remain unchecked |
+| Document differences and migration | README section plus this map |
+
+### E1
+
+- command: install/uninstall apply (Cursor/Claude private driver)
+- boundary: ownership-state parent replaced immediately before or after final rename/unlink
+- python_stdout: empty or success operations
+- python_stderr: none on directory replacement; Git-unrelated
+- python_exit: 0 on regular-directory replacement; nonzero on symlink nofollow sync
+- python_state: overwrites or removes foreign state; original detached state retained
+- rust_stdout: empty on failure
+- rust_stderr: typed parent-identity failure
+- rust_exit: nonzero
+- rust_state: foreign replacement bytes/mode/inode unchanged; authenticated journal retained
+- evidence: rust/src/transaction/state_parent_contract.py
+
+### E2
+
+- command: install apply (Cursor/Claude private driver)
+- boundary: foreign directory recreated at consumed .agent-workbench-copy-* staging name
+- python_stdout: success operations when no injected fsync fault
+- python_stderr: none on false success
+- python_exit: 0 without injected fault
+- python_state: recursively deletes the foreign staging replacement; journal removed on false success
+- rust_stdout: empty on conflict
+- rust_stderr: typed foreign-stage conflict
+- rust_exit: nonzero
+- rust_state: foreign inode/bytes/modes preserved; authenticated journal retained
+- evidence: rust/src/transaction/stage_cleanup_contract.py
+
+### VAL-GIT-1
+
+- command: validate
+- boundary: uncaught git rev-parse HEAD failure during generated-file lock rendering
+- python_stdout: empty
+- python_stderr: raw Git stderr plus CalledProcessError traceback
+- python_exit: 1
+- python_state: unchanged
+- rust_stdout: empty
+- rust_stderr: raw Git stderr only
+- rust_exit: 1
+- rust_state: unchanged
+- evidence: scripts/check_validate_parity.py::git_revision_rows
+
+### RENDER-GIT-1
+
+- command: render / render --check
+- boundary: uncaught git rev-parse HEAD failure during lock rendering
+- python_stdout: empty
+- python_stderr: raw Git stderr plus CalledProcessError traceback
+- python_exit: 1
+- python_state: unchanged
+- rust_stdout: empty
+- rust_stderr: raw Git stderr only
+- rust_exit: 1
+- rust_state: unchanged
+- evidence: scripts/check_render_parity.py git-nonrepository git-no-head
+
+### UPDATE-GIT-1
+
+- command: update --source sample
+- boundary: uncaught source-update Git failures, including after rollback
+- python_stdout: empty except dirty-checkout Git stdout
+- python_stderr: actual Git streams plus CalledProcessError traceback
+- python_exit: 1
+- python_state: pre-snapshot failures remain pre-mutation; rollback matches Python
+- rust_stdout: matches Python without traceback
+- rust_stderr: actual Git streams without traceback
+- rust_exit: 1
+- rust_state: matches Python filesystem and Git semantic state
+- evidence: scripts/check_update_parity.py missing-branch
+
+### UPDATE-CONFIG-1
+
+- command: update --source sample
+- boundary: .gitmodules configparser.Error family during registration parse
+- python_stdout: empty
+- python_stderr: traceback plus exact final configparser.<Class>Error message
+- python_exit: 1
+- python_state: unchanged
+- rust_stdout: empty
+- rust_stderr: exact final configparser.<Class>Error message without stack frames
+- rust_exit: 1
+- rust_state: unchanged
+- evidence: scripts/check_update_parity.py config-duplicate-section
+
+### PYTHON-TO-RUST-UPGRADE
+
+- command: status after python3 -m agent_workbench install
+- boundary: producer-written ownership consumed in place by Rust
+- python_stdout: status operations
+- python_stderr: empty on success
+- python_exit: 0
+- python_state: inert snapshot; v3 skills / v4 activation retained
+- rust_stdout: matches Python
+- rust_stderr: matches Python
+- rust_exit: 0
+- rust_state: inert snapshot; no rewrite of producer bytes on status
+- evidence: scripts/check_python_baseline_upgrade.py tracer
+
+### REVERSE-STATUS-NOT-SUPPORTED
+
+- command: python3 -m agent_workbench status on Rust-written ownership
+- boundary: unsupported reverse upgrade
+- python_stdout: status or error report
+- python_stderr: error class if rejected
+- python_exit: 0, 1, or 2
+- python_state: Rust evidence bytes unchanged
+- rust_stdout: not a reverse consumer
+- rust_stderr: not a reverse consumer
+- rust_exit: n/a
+- rust_state: producer for this row
+- evidence: scripts/check_python_baseline_upgrade.py reverse_and_downgrade
+
+### REJECT-V4-AS-V3
+
+- command: status on v4 activation rewritten as v3
+- boundary: unsupported schema downgrade with slots kept or dropped
+- python_stdout: empty or error report
+- python_stderr: schema rejection
+- python_exit: nonzero
+- python_state: file bytes unchanged
+- rust_stdout: empty or error report
+- rust_stderr: schema rejection
+- rust_exit: nonzero
+- rust_state: file bytes unchanged
+- evidence: scripts/check_python_baseline_upgrade.py reverse_and_downgrade
+
+The F6 RED was missing catalog documentation and the dedicated gate. Authorized
+exception behavior is inherited characterization GREEN. F7–F8 remain later.

@@ -75,7 +75,7 @@ Convert the workbench to a standalone Rust CLI without extending product behavio
 - [x] Run the full parity suite on macOS and Linux with supported filesystem primitives.
 - [x] Build release binaries and provide one `agent-workbench` executable with documented install, upgrade, and uninstall paths.
 - [x] Preserve existing invocation compatibility or ship an explicit, tested wrapper during the transition.
-- [ ] Record every intentional behavioral difference and its state/config migration before changing the default executable.
+- [x] Record every intentional behavioral difference and its state/config migration before changing the default executable.
 - [ ] Make Rust the default only after all supported commands, targets, states, generated artifacts, and recovery paths pass parity gates.
 - [ ] Remove Python runtime code and compatibility scaffolding only after a clean-install and existing-state release candidate passes end to end.
 

@@ -69,6 +69,14 @@ python3 -m agent_workbench --help
 scripts/agent-workbench --profile pstack status --target hermes
 ```
 
+## Intentional Python/Rust differences
+
+Python remains the default CLI until a later cutover. The optional Rust executable matches Python except the authorized differences `E1`, `E2`, `VAL-GIT-1`, `RENDER-GIT-1`, `UPDATE-GIT-1`, and `UPDATE-CONFIG-1`. Each has a permanent paired regression that asserts the oracle and replacement separately. None is hidden in a generic normalizer or extended to another command.
+
+State/config migration required before any default cutover: `PYTHON-TO-RUST-UPGRADE` consumes producer-written ownership in place. `REVERSE-STATUS-NOT-SUPPORTED` and `REJECT-V4-AS-V3` fail closed without discarding evidence.
+
+Exact command, failure boundary, stdout/stderr class, exit status, and state/config effect for each row: [`rust/SECTION_F_CONTRACT.md`](rust/SECTION_F_CONTRACT.md) (F6) and [`rust/PARITY_EXCEPTIONS.md`](rust/PARITY_EXCEPTIONS.md).
+
 ## Commands
 
 ```bash
