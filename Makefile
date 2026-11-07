@@ -1,6 +1,7 @@
 PYTHON ?= python3
+PREFIX ?= $(HOME)/.local
 
-.PHONY: render validate test check update plan-hermes install-dry-run
+.PHONY: render validate test check update plan-hermes install-dry-run rust-release
 
 render:
 	$(PYTHON) -m agent_workbench render
@@ -22,3 +23,6 @@ plan-hermes:
 
 install-dry-run:
 	$(PYTHON) scripts/install_skills.py --target agents --dry-run
+
+rust-release:
+	$(PYTHON) scripts/package_release.py --prefix "$(PREFIX)"

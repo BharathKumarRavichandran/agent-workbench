@@ -40,6 +40,24 @@ make check
 
 The runtime uses only the Python standard library and supports Python 3.9 or newer.
 
+## Optional Rust release executable
+
+Python remains the default CLI. An optional release build installs one `agent-workbench` executable. It does not publish Git tags or GitHub releases.
+
+```bash
+python3 scripts/package_release.py --prefix ~/.local
+# equivalent: make rust-release PREFIX=$HOME/.local
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The install path is `$PREFIX/bin/agent-workbench`. Upgrade consumes producer-written ownership in place (status and keep-reinstall). Uninstall removes only recorded owned resources:
+
+```bash
+agent-workbench --profile pstack status --target hermes
+agent-workbench --profile pstack install --target hermes
+agent-workbench --profile pstack uninstall --target hermes
+```
+
 ## Commands
 
 ```bash

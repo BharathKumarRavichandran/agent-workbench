@@ -59,10 +59,10 @@ rows.
 | No silent evidence discard | Downgrade rows compare pre/post file bytes; reverse status leaves Rust state intact |
 | Inertness | `PAYLOAD_EXECUTED` absent; status/trust do not mutate snapshots |
 
-## Later units (not F1/F2/F3)
+## Later units (not F1/F2/F3/F4)
 
-F4 release executable, F5 invocation wrappers, F6 intentional differences, F7
-default cutover, F8 Python removal.
+F5 invocation wrappers, F6 intentional differences, F7 default cutover, F8
+Python removal.
 
 ## Observed RED → GREEN
 
@@ -92,7 +92,7 @@ checkouts still pin package bytes.
 `scripts/check_python_rust_recovery_handoff.py` runs unconditionally in the
 umbrella parity gate, alongside all Section D/E/F1 scripts. Run its `tracer`
 argument for the narrow held-resource-lock regression. Python production and
-the baseline tree pin above are unchanged. No later F unit is implemented.
+the baseline tree pin above are unchanged. F4 is a later packaging unit.
 
 ### Acceptance criteria and test map
 
@@ -176,3 +176,32 @@ The initial F3 workflow was rejected before any jobs ran because `runner.temp`
 is not an allowed job-level `env` context. The correction sets scratch through
 a runner step instead; local actionlint 1.7.12 validates the corrected workflow.
 That configuration failure is not a test/behavioral RED or platform evidence.
+
+## F4 — release executable
+
+`scripts/package_release.py` builds `cargo --release` and installs one
+`agent-workbench` executable at `$PREFIX/bin/agent-workbench`. The crate debug
+binary remains `agent-workbench-rs` for existing parity drivers. Python remains
+the default CLI. No Git tag or GitHub release is published; the F1 producer pin
+still fails if one appears. Production Python and Rust behavior are unchanged.
+
+`scripts/check_release_executable.py` runs unconditionally in the umbrella
+parity gate. It requires explicit scratch `TMPDIR` and the pinned Python 3.12
+oracle.
+
+### Acceptance-to-test map
+
+| F4 acceptance | Runnable evidence |
+| --- | --- |
+| Release build produces one installed executable named `agent-workbench` | `package_release.py --prefix <scratch>` copies `rust/target/release/agent-workbench-rs` to `$PREFIX/bin/agent-workbench` mode `0755`; the prefix contains no `agent-workbench-rs`; header is ELF or Mach-O |
+| Documented install path | README / `make rust-release PREFIX=...`; gate invokes the packager then `PATH=$PREFIX/bin agent-workbench --help` |
+| Documented upgrade path | Python hermes skills install, then same-tree Python vs installed-release `status` and keep-`install`; exact stdout/stderr/status and inert snapshot |
+| Documented uninstall path | Python hermes install, then paired Python vs installed-release `uninstall`; return status, BASE-normalized output, and remaining typed snapshot |
+| Clean install with the release binary | Paired empty-tree Python vs installed-release hermes install |
+| Help names the installed executable | `--help` contains `usage: agent-workbench` and not `agent-workbench-rs` |
+| Default CLI and producer pin unchanged | README Commands remain `python3 -m agent_workbench`; F1 tag/release refusal still runs via `require_pinned_baseline` |
+
+The first same-tree status tracer is inherited characterization GREEN: the
+release binary matches debug/Python status on producer-written hermes
+ownership. Packaging absence was the F4 RED (`package_release.py` missing).
+F5–F8 remain separate units.
