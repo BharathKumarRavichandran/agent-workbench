@@ -59,10 +59,9 @@ rows.
 | No silent evidence discard | Downgrade rows compare pre/post file bytes; reverse status leaves Rust state intact |
 | Inertness | `PAYLOAD_EXECUTED` absent; status/trust do not mutate snapshots |
 
-## Later units (not F1/F2)
+## Later units (not F1/F2/F3)
 
-F3 platform primitives, F4
-release executable, F5 invocation wrappers, F6 intentional differences, F7
+F4 release executable, F5 invocation wrappers, F6 intentional differences, F7
 default cutover, F8 Python removal.
 
 ## Observed RED → GREEN
@@ -141,3 +140,34 @@ The tracer is GREEN with exact stdout/stderr/status, unchanged pending bytes
 and identities under contention, and successful recovery after lock release.
 Harness-only file replay/isolated-HOME setup failures are not behavioral REDs.
 E1/E2 and VAL-GIT-1 / RENDER-GIT-1 / UPDATE-GIT-1 / UPDATE-CONFIG-1 remain intact.
+
+## F3 — full macOS/Linux parity and required filesystem primitives
+
+The `rust-plan-parity` CI job now has independent `ubuntu-24.04` and `macos-15`
+matrix cells with `fail-fast: false`. Both check out the literal PR head SHA,
+pin top-level and nested Python to 3.12, use job-owned `runner.temp` as `TMPDIR`
+for builds and fixtures, and run fmt, check, all-target clippy with denied
+warnings, Rust tests, the **entire** umbrella parity suite, and Python tests.
+There is no smoke-only substitute, platform exclusion, or continue-on-error.
+Existing Python 3.9/3.12 catalog jobs remain unchanged.
+
+### Acceptance-to-test map
+
+| F3 acceptance | Runnable evidence |
+| --- | --- |
+| Required primitives work on the actual fixture filesystem | `scripts/check_platform_primitives.py` and `platform_parity_tests::required_filesystem_primitives`: descriptor-relative operations, no-follow directory open, file/directory fsync, exact modes, hardlink publication refusing replacement, native exclusive directory rename refusing an occupied empty directory, independent-descriptor nonblocking flock, and mutation through the retained parent descriptor after lexical substitution |
+| Python and actual Rust backend have matching primitive effects | The script invokes Python production `bundles.open_directory` / `rename_new`, then the Rust production counterparts and rustix operations; compares literal typed bytes/modes/link targets. Primitive-only fixtures carry no ownership/journals and may be rebuilt |
+| Missing primitives are hard failures, not skipped success | Every probe requires positive syscall execution and expected refusal behavior. Python requires `supports_dir_fd`; no-follow, no-replace, lock contention, fsync or parent-pinning failure stops the gate |
+| Full earlier acceptance survives on each OS | Both CI matrix cells run `check_rust_plan_parity.py` unconditionally, including all D/E/F1/F2 drivers and the new platform script; no narrowing of journal recovery, trust, output, migration, rendering or executable/network tripwires |
+| Actual fsync fault instrumentation is working | Existing `capture_contract.py` canaries exercise Darwin dyld interposition or Linux x86_64 thread-following ptrace against the actual configured rustix backend; unsupported/blocked observers fail closed |
+| Raw filenames are characterized rather than normalized | Existing `wire_contract.py` probes actual file/directory creation; publication rows run only when the filesystem accepts those raw names. Rejected names are reported as rejection evidence, not successful publication |
+| Literal tested revision and platform are auditable | Each matrix cell records `uname -sm`, rustc and oracle versions; verify run `headSha`, each checkout's `HEAD is now at <implementation>`, job success, primitive report and final umbrella summary before declaring F3 complete |
+
+The first primitive tracer is inherited characterization GREEN on local
+Darwin/arm64 with Python 3.12.15; it does not establish a new production defect
+or a behavioral RED. F3 adds tests and CI configuration, not runtime behavior.
+Compilation/format failures are not behavioral REDs. Linux and hosted macOS
+results require their own exact-head CI execution; local macOS is not a
+substitute. The platform scope is the named runners and their tested filesystem
+primitives, not Windows, Linux arm64, network filesystems, arbitrary kernels,
+or a claim of hardware/power-loss durability. F4–F8 remain separate units.

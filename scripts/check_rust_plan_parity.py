@@ -2594,7 +2594,7 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
-            for script in ("parity_oracle.py", "check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
+            for script in ("parity_oracle.py", "check_platform_primitives.py", "check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
                            "check_cursor_activation_recovery.py", "check_claude_activation_parity.py",
                            "check_claude_activation_edges.py", "check_claude_activation_recovery.py",
                            "check_claude_native_contract.py", "check_activation_inertness.py",
