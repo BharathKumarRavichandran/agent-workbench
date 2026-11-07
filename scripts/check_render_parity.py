@@ -13,6 +13,27 @@ from parity_oracle import require_python312
 from check_validate_parity import ROOT, RUST, snapshot
 
 
+def git_env():
+    return dict(
+        os.environ,
+        GIT_CONFIG_NOSYSTEM='1',
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_CONFIG_SYSTEM=os.devnull,
+        GIT_OPTIONAL_LOCKS='0',
+        GIT_AUTHOR_DATE='2020-01-01T00:00:00+00:00',
+        GIT_COMMITTER_DATE='2020-01-01T00:00:00+00:00',
+    )
+
+
+def git(source, *arguments):
+    subprocess.run(
+        ['git', '-C', str(source), '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', *arguments],
+        env=git_env(),
+        check=True,
+        capture_output=True,
+    )
+
+
 def fixture(root):
     (root / 'catalog').mkdir(parents=True)
     (root / 'profiles').mkdir()
@@ -99,7 +120,7 @@ def setup_case(root, case):
         (root / 'catalog/plugins.json').write_text(json.dumps(catalog))
         (root / 'source').mkdir()
         if case == 'git-no-head':
-            subprocess.run(['git', 'init', '-q', str(root / 'source')], check=True, capture_output=True)
+            git(root / 'source', 'init', '-q')
     elif case == 'git-valid':
         catalog = json.loads((root / 'catalog/plugins.json').read_text())
         catalog['sources'] = [{'id': 'sample', 'kind': 'git-submodule', 'path': 'source',
@@ -108,13 +129,21 @@ def setup_case(root, case):
         source = root / 'source'
         source.mkdir()
         (source / 'README').write_text('fixture')
-        env = dict(os.environ, GIT_AUTHOR_DATE='2020-01-01T00:00:00+00:00',
-                   GIT_COMMITTER_DATE='2020-01-01T00:00:00+00:00')
-        for arguments in (['init', '-q', '-b', 'main'], ['add', 'README'],
-                          ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
-                           '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture']):
-            subprocess.run(['git', '-C', str(source), *arguments], env=env,
-                           check=True, capture_output=True)
+        git(source, 'init', '-q', '-b', 'main')
+        git(source, 'add', 'README')
+        git(
+            source,
+            '-c',
+            'user.name=Fixture',
+            '-c',
+            'user.email=fixture@example.invalid',
+            '-c',
+            'commit.gpgsign=false',
+            'commit',
+            '-qm',
+            'fixture',
+        )
+        assert not (source / '.git/objects/maintenance.lock').exists()
     elif case == 'stale-modes':
         for rel in ('.cursor-plugin/marketplace.json', '.claude-plugin/marketplace.json', 'catalog/lock.json'):
             path = root / rel
