@@ -58,6 +58,17 @@ agent-workbench --profile pstack install --target hermes
 agent-workbench --profile pstack uninstall --target hermes
 ```
 
+## Transition invocations
+
+Python remains the default engine. `python3 -m agent_workbench` and the Makefile targets (`make validate`, `make render`, `make update`, `make plan-hermes`) are unchanged. Command-specific shebang wrappers remain at `scripts/validate.py`, `scripts/render_marketplaces.py`, `scripts/update.py`, and `scripts/install_skills.py`.
+
+`scripts/agent-workbench` is an explicit Python wrapper that execs `python3 -m agent_workbench`. It does not replace `$PREFIX/bin/agent-workbench` and is not the default:
+
+```bash
+python3 -m agent_workbench --help
+scripts/agent-workbench --profile pstack status --target hermes
+```
+
 ## Commands
 
 ```bash

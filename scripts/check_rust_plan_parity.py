@@ -2603,7 +2603,7 @@ def main() -> int:
                            "check_lifecycle_text_parity.py", "check_cli_parity.py",
                            "check_cli_defaults_parity.py", "check_cli_help_edges.py",
                            "check_python_baseline_upgrade.py", "check_python_rust_recovery_handoff.py",
-                           "check_release_executable.py"):
+                           "check_release_executable.py", "check_invocation_compatibility.py"):
                 activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
                 assert activation.returncode == 0, activation.stdout + activation.stderr
                 print(activation.stdout.strip())

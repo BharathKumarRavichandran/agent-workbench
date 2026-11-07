@@ -59,10 +59,9 @@ rows.
 | No silent evidence discard | Downgrade rows compare pre/post file bytes; reverse status leaves Rust state intact |
 | Inertness | `PAYLOAD_EXECUTED` absent; status/trust do not mutate snapshots |
 
-## Later units (not F1/F2/F3/F4)
+## Later units (not F1/F2/F3/F4/F5)
 
-F5 invocation wrappers, F6 intentional differences, F7 default cutover, F8
-Python removal.
+F6 intentional differences, F7 default cutover, F8 Python removal.
 
 ## Observed RED → GREEN
 
@@ -204,4 +203,33 @@ oracle.
 The first same-tree status tracer is inherited characterization GREEN: the
 release binary matches debug/Python status on producer-written hermes
 ownership. Packaging absence was the F4 RED (`package_release.py` missing).
-F5–F8 remain separate units.
+
+## F5 — invocation compatibility
+
+Python remains the default CLI until F7. Existing `python3 -m agent_workbench`
+invocations, Makefile recipes, and command-specific shebang wrappers stay on
+the Python engine. `scripts/agent-workbench` is an explicit, tested wrapper
+that execs `python3 -m agent_workbench`. It is not installed as
+`$PREFIX/bin/agent-workbench` and does not change the default engine. No Git
+tag or GitHub release is published; the F1 producer pin still fails if one
+appears. Production Python and Rust command behavior are unchanged.
+
+`scripts/check_invocation_compatibility.py` runs unconditionally in the
+umbrella parity gate. It requires explicit scratch `TMPDIR` and the pinned
+Python 3.12 oracle.
+
+### Acceptance-to-test map
+
+| F5 acceptance | Runnable evidence |
+| --- | --- |
+| `python3 -m agent_workbench` still works | `documented_module_form`: argv is `python3 -m agent_workbench`; `--help` exits 0 |
+| Makefile entry points stay on the Python module | `makefile_stays_on_python_module`: `make -n` for render/validate/update/plan-hermes contains `-m agent_workbench`; `install-dry-run` still calls `scripts/install_skills.py`; `rust-release` still calls `package_release.py` and does not install the wrapper |
+| Documented shebang wrappers still run | `shebang_entry_points_still_run`: `validate.py`, `render_marketplaces.py`, `update.py`, `install_skills.py` keep `#!/usr/bin/env python3` and `--help` exits 0 |
+| Explicit wrapper does not silently change the default engine | `explicit_wrapper_is_python`: `scripts/agent-workbench` is a shebang script that execs `-m agent_workbench`; `$PREFIX/bin` still contains only the Rust `agent-workbench` binary; README Commands remain `python3 -m agent_workbench` |
+| Wrapper vs real binary vs `python3 -m` are distinguishable | `three_forms_distinguishable`: module argv, wrapper file kind `python-wrapper`, installed file kind `rust-binary`; wrapper `--help` matches the module and not the binary's file kind |
+| Upgrade/uninstall of producer-written ownership through the preserved invocation | `upgrade_uninstall_through_preserved`: Python hermes install, then same-tree module vs wrapper `status` (inert snapshot) and paired `uninstall` |
+| Default CLI and producer pin unchanged | `default_engine_unchanged` plus `require_pinned_baseline`; F6/F7/F8 remain later units |
+
+Documented module, Makefile, and shebang forms were inherited characterization
+GREEN. The F5 RED was the missing explicit wrapper (`scripts/agent-workbench`).
+F6–F8 remain separate units.
