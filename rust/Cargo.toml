@@ -1,5 +1,5 @@
 [package]
-name = "agent-workbench-rs"
+name = "agent-workbench"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -17,5 +17,5 @@ base64 = "0.22"
 tempfile = "3"
 
 [[bin]]
-name = "agent-workbench-rs"
+name = "agent-workbench"
 path = "src/main.rs"

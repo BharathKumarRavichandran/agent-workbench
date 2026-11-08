@@ -10,15 +10,15 @@ resolve() {
         printf '%s\n' "$AGENT_WORKBENCH_BIN"
         return 0
     fi
-    if [ -x "$ROOT/rust/target/release/agent-workbench-rs" ]; then
-        printf '%s\n' "$ROOT/rust/target/release/agent-workbench-rs"
+    if [ -x "$ROOT/target/release/agent-workbench" ]; then
+        printf '%s\n' "$ROOT/target/release/agent-workbench"
         return 0
     fi
-    if [ -x "$ROOT/rust/target/debug/agent-workbench-rs" ]; then
-        printf '%s\n' "$ROOT/rust/target/debug/agent-workbench-rs"
+    if [ -x "$ROOT/target/debug/agent-workbench" ]; then
+        printf '%s\n' "$ROOT/target/debug/agent-workbench"
         return 0
     fi
-    printf '%s\n' "agent-workbench: default Rust CLI is missing. Install with make rust-release PREFIX=\"\$HOME/.local\" or build rust/target/debug/agent-workbench-rs." >&2
+    printf '%s\n' "agent-workbench: default Rust CLI is missing. Install with make rust-release PREFIX=\"\$HOME/.local\" or build target/debug/agent-workbench." >&2
     return 127
 }
 

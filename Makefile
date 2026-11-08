@@ -10,7 +10,7 @@ validate:
 	$(CLI) validate
 
 test:
-	cargo test --manifest-path rust/Cargo.toml
+	cargo test
 
 check: test validate
 
@@ -24,6 +24,6 @@ install-dry-run:
 	$(CLI) --profile pstack plan --target agents
 
 rust-release:
-	cargo build --release --manifest-path rust/Cargo.toml
+	cargo build --release
 	mkdir -p "$(PREFIX)/bin"
-	install -m 0755 rust/target/release/agent-workbench-rs "$(PREFIX)/bin/agent-workbench"
+	install -m 0755 target/release/agent-workbench "$(PREFIX)/bin/agent-workbench"

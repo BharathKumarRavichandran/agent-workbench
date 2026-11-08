@@ -54,7 +54,7 @@ impl Fixture {
     }
 
     fn run(&self, action: &str, extra: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agent-workbench-rs"))
+        Command::new(env!("CARGO_BIN_EXE_agent-workbench"))
             .args([
                 "--root",
                 self.root.to_str().unwrap(),

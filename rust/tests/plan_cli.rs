@@ -60,7 +60,7 @@ impl Fixture {
     }
 
     fn command(&self, adopt: bool) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-workbench-rs"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-workbench"));
         command.args([
             "--root",
             self.root.to_str().unwrap(),
@@ -141,13 +141,13 @@ fn malformed_state_and_unknown_commands_fail_with_exit_two() {
     assert_eq!(code(&state), 2);
     assert!(String::from_utf8_lossy(&state.stderr).contains("unsupported installation state"));
 
-    let unknown = Command::new(env!("CARGO_BIN_EXE_agent-workbench-rs"))
+    let unknown = Command::new(env!("CARGO_BIN_EXE_agent-workbench"))
         .args(["--root", fixture.root.to_str().unwrap(), "unknown"])
         .output()
         .unwrap();
     assert_eq!(code(&unknown), 2);
     assert!(unknown.stdout.is_empty());
-    let usage = agent_workbench_rs::usage_text();
+    let usage = agent_workbench::usage_text();
     let usage = usage.split("\n\n").next().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&unknown.stderr),
@@ -198,7 +198,7 @@ fn destination_symlink_and_indented_frontmatter_match_python_rejection() {
 #[test]
 fn explicit_skills_component_and_global_help_are_supported() {
     let fixture = Fixture::new();
-    let component = Command::new(env!("CARGO_BIN_EXE_agent-workbench-rs"))
+    let component = Command::new(env!("CARGO_BIN_EXE_agent-workbench"))
         .args([
             "--root",
             fixture.root.to_str().unwrap(),
@@ -224,14 +224,14 @@ fn explicit_skills_component_and_global_help_are_supported() {
         String::from_utf8_lossy(&component.stderr)
     );
 
-    let help = Command::new(env!("CARGO_BIN_EXE_agent-workbench-rs"))
+    let help = Command::new(env!("CARGO_BIN_EXE_agent-workbench"))
         .arg("--help")
         .output()
         .unwrap();
     assert_eq!(code(&help), 0);
     assert!(String::from_utf8_lossy(&help.stdout).starts_with("usage:"));
 
-    let help_after_global = Command::new(env!("CARGO_BIN_EXE_agent-workbench-rs"))
+    let help_after_global = Command::new(env!("CARGO_BIN_EXE_agent-workbench"))
         .args(["--root", fixture.root.to_str().unwrap(), "--help"])
         .output()
         .unwrap();
