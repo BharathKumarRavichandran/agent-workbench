@@ -14,7 +14,7 @@ pub(super) fn event(event: &str, path: &Path) -> Result<()> {
 }
 
 #[test]
-#[ignore = "driven by scripts/check_rust_plan_parity.py with isolated fixtures"]
+#[ignore]
 fn differential_copy_race() {
     let base = PathBuf::from(env::var_os("AW_COPY_BASE").unwrap());
     let scenario = env::var("AW_COPY_CASE").unwrap();

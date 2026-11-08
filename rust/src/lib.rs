@@ -1028,65 +1028,213 @@ mod tests {
         assert!(error.contains("duplicate JSON key \"id\""), "{error}");
     }
 
+    const OPERATION_FIELDS: [&str; 11] = [
+        "kind",
+        "key",
+        "destination",
+        "source",
+        "reason",
+        "component",
+        "resourceKind",
+        "digest",
+        "diagnostic",
+        "trustToken",
+        "trustRequired",
+    ];
+
     #[test]
-    fn copied_resource_json_matches_python_oracle() {
+    fn copied_resource_json_has_stable_shape() {
         let digest = resource::ContentDigest::parse(&"ab".repeat(32)).unwrap();
         let proof = format!("aw-proof-v1:{}", "cd".repeat(32));
         let trust = format!("aw-trust-v1:{}", "ef".repeat(32));
-        let actual = serde_json::json!({
-            "symlink-operation": serde_json::to_string_pretty(&operation_fixture(
-                "skills",
-                resource::PathResource::DirectorySymlink,
-                "/src/skill",
-            )).unwrap(),
-            "file-operation": serde_json::to_string_pretty(&operation_fixture(
-                "agents",
-                resource::PathResource::FileCopy(digest.clone()),
-                "/src/agent.md",
-            )).unwrap(),
-            "directory-operation": serde_json::to_string_pretty(&operation_fixture(
-                "hooks",
-                resource::PathResource::DirectoryCopy(digest.clone()),
-                "/src/hooks",
-            )).unwrap(),
-            "symlink-entry": state::entry_json(&entry_fixture(
-                "skill:sample",
-                ComponentKind::Skills,
-                resource::PathResource::DirectorySymlink,
-                None,
-                None,
-            )).unwrap(),
-            "file-entry": state::entry_json(&entry_fixture(
-                "agent:sample.md",
-                ComponentKind::Agents,
-                resource::PathResource::FileCopy(digest.clone()),
-                None,
-                None,
-            )).unwrap(),
-            "directory-entry": state::entry_json(&entry_fixture(
-                "hook:sample",
-                ComponentKind::Hooks,
-                resource::PathResource::DirectoryCopy(digest.clone()),
-                Some(trust.clone()),
-                None,
-            )).unwrap(),
-            "directory-entry-proof": state::entry_json(&entry_fixture(
-                "hook:sample",
-                ComponentKind::Hooks,
-                resource::PathResource::DirectoryCopy(digest.clone()),
-                Some(trust),
-                Some(proof),
-            )).unwrap(),
-            "directory-entry-null-trust": state::entry_json(&entry_fixture(
-                "hook:sample",
-                ComponentKind::Hooks,
-                resource::PathResource::DirectoryCopy(digest),
-                None,
-                None,
-            )).unwrap(),
-        });
-        let expected = python_resource_contract();
-        assert_eq!(expected, actual, "{expected:#?}\n{actual:#?}");
+        let digest_json = serde_json::Value::String(digest.as_str().to_owned());
+
+        let symlink_operation = serde_json::to_string_pretty(&operation_fixture(
+            "skills",
+            resource::PathResource::DirectorySymlink,
+            "/src/skill",
+        ))
+        .unwrap();
+        assert_operation_shape(
+            &symlink_operation,
+            "directory-symlink",
+            serde_json::Value::Null,
+        );
+
+        let file_operation = serde_json::to_string_pretty(&operation_fixture(
+            "agents",
+            resource::PathResource::FileCopy(digest.clone()),
+            "/src/agent.md",
+        ))
+        .unwrap();
+        assert_operation_shape(&file_operation, "file-copy", digest_json.clone());
+
+        let directory_operation = serde_json::to_string_pretty(&operation_fixture(
+            "hooks",
+            resource::PathResource::DirectoryCopy(digest.clone()),
+            "/src/hooks",
+        ))
+        .unwrap();
+        assert_operation_shape(&directory_operation, "directory-copy", digest_json);
+
+        let symlink_entry = state::entry_json(&entry_fixture(
+            "skill:sample",
+            ComponentKind::Skills,
+            resource::PathResource::DirectorySymlink,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_entry_shape(
+            &symlink_entry,
+            "skills",
+            "directory-symlink",
+            None,
+            None,
+            None,
+        );
+
+        let file_entry = state::entry_json(&entry_fixture(
+            "agent:sample.md",
+            ComponentKind::Agents,
+            resource::PathResource::FileCopy(digest.clone()),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_entry_shape(
+            &file_entry,
+            "agents",
+            "file-copy",
+            Some(digest.as_str()),
+            None,
+            None,
+        );
+
+        let directory_entry = state::entry_json(&entry_fixture(
+            "hook:sample",
+            ComponentKind::Hooks,
+            resource::PathResource::DirectoryCopy(digest.clone()),
+            Some(trust.clone()),
+            None,
+        ))
+        .unwrap();
+        assert_entry_shape(
+            &directory_entry,
+            "hooks",
+            "directory-copy",
+            Some(digest.as_str()),
+            Some(serde_json::Value::String(trust.clone())),
+            None,
+        );
+
+        let directory_entry_proof = state::entry_json(&entry_fixture(
+            "hook:sample",
+            ComponentKind::Hooks,
+            resource::PathResource::DirectoryCopy(digest.clone()),
+            Some(trust.clone()),
+            Some(proof.clone()),
+        ))
+        .unwrap();
+        assert_entry_shape(
+            &directory_entry_proof,
+            "hooks",
+            "directory-copy",
+            Some(digest.as_str()),
+            Some(serde_json::Value::String(trust)),
+            Some(&proof),
+        );
+
+        let directory_entry_null_trust = state::entry_json(&entry_fixture(
+            "hook:sample",
+            ComponentKind::Hooks,
+            resource::PathResource::DirectoryCopy(digest.clone()),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_entry_shape(
+            &directory_entry_null_trust,
+            "hooks",
+            "directory-copy",
+            Some(digest.as_str()),
+            Some(serde_json::Value::Null),
+            None,
+        );
+    }
+
+    fn assert_field_order(json: &str, fields: &[&str]) {
+        let positions: Vec<_> = fields
+            .iter()
+            .map(|field| {
+                json.find(&format!("\"{field}\"")).unwrap_or_else(|| {
+                    panic!("missing {field} in {json}");
+                })
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "field order in {json}"
+        );
+    }
+
+    fn assert_operation_shape(json: &str, resource_kind: &str, digest: serde_json::Value) {
+        assert_field_order(json, &OPERATION_FIELDS);
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["kind"], "create");
+        assert_eq!(value["key"], "sample");
+        assert_eq!(value["destination"], "/dest/sample");
+        assert_eq!(value["resourceKind"], resource_kind);
+        assert_eq!(value["digest"], digest);
+        assert!(value["diagnostic"].is_null());
+        assert!(value["trustToken"].is_null());
+        assert_eq!(value["trustRequired"], false);
+    }
+
+    fn assert_entry_shape(
+        json: &str,
+        component: &str,
+        resource_kind: &str,
+        digest: Option<&str>,
+        trust: Option<serde_json::Value>,
+        proof: Option<&str>,
+    ) {
+        let mut fields = Vec::new();
+        if proof.is_some() {
+            fields.push("trustProof");
+        }
+        fields.extend([
+            "key",
+            "plugin",
+            "source",
+            "destination",
+            "component",
+            "resourceKind",
+            "sourceRepository",
+        ]);
+        if trust.is_some() {
+            fields.push("trust");
+        }
+        if digest.is_some() {
+            fields.push("digest");
+        }
+        assert_field_order(json, &fields);
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        if let Some(proof) = proof {
+            assert_eq!(value["trustProof"], proof);
+        } else {
+            assert!(value.get("trustProof").is_none());
+        }
+        assert_eq!(value["component"], component);
+        assert_eq!(value["resourceKind"], resource_kind);
+        match digest {
+            Some(digest) => assert_eq!(value["digest"], digest),
+            None => assert!(value.get("digest").is_none()),
+        }
+        match trust {
+            Some(trust) => assert_eq!(value["trust"], trust),
+            None => assert!(value.get("trust").is_none()),
+        }
     }
 
     fn operation_fixture(
@@ -1130,66 +1278,8 @@ mod tests {
         }
     }
 
-    fn pinned_oracle_root() -> PathBuf {
-        let tmp = std::env::var("TMPDIR").expect("explicit scratch TMPDIR required");
-        let dest = PathBuf::from(tmp).join("pinned-python-oracle");
-        if dest.join("agent_workbench").join("__init__.py").is_file() {
-            return dest;
-        }
-        std::fs::create_dir_all(&dest).unwrap();
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let archive = std::process::Command::new("git")
-            .current_dir(&repo)
-            .args([
-                "archive",
-                "04502a0054fcd3c666e06f4e20ef7603293cfed3",
-                "agent_workbench",
-                "tests",
-            ])
-            .output()
-            .expect("git archive pinned producer");
-        assert!(
-            archive.status.success(),
-            "{}",
-            String::from_utf8_lossy(&archive.stderr)
-        );
-        let mut tar = std::process::Command::new("tar")
-            .current_dir(&dest)
-            .arg("-x")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .expect("tar extract pinned producer");
-        {
-            use std::io::Write;
-            tar.stdin
-                .as_mut()
-                .unwrap()
-                .write_all(&archive.stdout)
-                .unwrap();
-        }
-        assert!(tar.wait().unwrap().success());
-        dest
-    }
-
-    fn python_resource_contract() -> serde_json::Value {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let output = std::process::Command::new("python3")
-            .current_dir(root)
-            .env("PYTHONPATH", pinned_oracle_root())
-            .arg("-c")
-            .arg(include_str!("resource_contract.py"))
-            .output()
-            .expect("python resource oracle");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        serde_json::from_slice(&output.stdout).expect("python resource oracle json")
-    }
-
     #[test]
-    fn output_field_order_is_the_python_contract() {
+    fn output_field_order_is_stable() {
         let operation = Operation {
             kind: "create",
             key: "skill:x".into(),
@@ -1205,23 +1295,6 @@ mod tests {
             expected_digest: None,
         };
         let value = operations_json(&[operation]).unwrap();
-        let expected = [
-            "kind",
-            "key",
-            "destination",
-            "source",
-            "reason",
-            "component",
-            "resourceKind",
-            "digest",
-            "diagnostic",
-            "trustToken",
-            "trustRequired",
-        ];
-        let positions: Vec<_> = expected
-            .iter()
-            .map(|field| value.find(&format!("\"{field}\"")).unwrap())
-            .collect();
-        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_field_order(&value, &OPERATION_FIELDS);
     }
 }

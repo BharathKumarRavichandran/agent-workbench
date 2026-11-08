@@ -260,7 +260,7 @@ fn run_contract(input: &serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
-#[ignore = "private Python differential driver"]
+#[ignore]
 fn path_contract_driver() {
     let input = std::fs::read(std::env::var("AW_PATH_INPUT").unwrap()).unwrap();
     let input: serde_json::Value = serde_json::from_slice(&input).unwrap();

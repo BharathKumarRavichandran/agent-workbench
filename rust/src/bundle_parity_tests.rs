@@ -3,7 +3,7 @@ use super::*;
 use std::cell::RefCell;
 
 #[test]
-#[ignore = "driven by scripts/check_rust_plan_parity.py"]
+#[ignore]
 fn differential_names() {
     let base = PathBuf::from(env::var_os("AW_BUNDLE_BASE").unwrap());
     let rows: Vec<Vec<Vec<u8>>> =
@@ -33,7 +33,7 @@ pub(super) fn after_read(path: &Path) -> std::io::Result<()> {
 }
 
 #[test]
-#[ignore = "driven by scripts/check_rust_plan_parity.py"]
+#[ignore]
 fn differential_publication() {
     let base = PathBuf::from(env::var_os("AW_BUNDLE_BASE").unwrap());
     let rows: Vec<serde_json::Value> =
@@ -137,7 +137,7 @@ fn differential_publication() {
 }
 
 #[test]
-#[ignore = "driven by scripts/check_rust_plan_parity.py"]
+#[ignore]
 fn differential_bundles() {
     let base = PathBuf::from(env::var_os("AW_BUNDLE_BASE").unwrap());
     let rows: Vec<serde_json::Value> =

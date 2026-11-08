@@ -12,7 +12,7 @@ This file tracks remaining work. The existing Cursor and Claude project lifecycl
 
 ## Feature #9 — Rust conversion before further feature growth
 
-Convert the workbench to a standalone Rust CLI without extending product behavior. Python remains the executable specification until cutover. Work through these checkboxes in order; each unchecked target or subsystem should normally be one focused, parity-gated PR.
+Convert the workbench to a standalone Rust CLI without extending product behavior. Rust is the specification. Work through these checkboxes in order; each unchecked target or subsystem should normally be one focused PR.
 
 ### A. Migration rules and completed foundation
 
@@ -216,8 +216,8 @@ Claude project MCP through `<project>/.mcp.json` is already supported. This adap
 
 ## Suggested implementation order
 
-1. [ ] Feature #9 migration gate: prove the Rust vertical slice against Python behavior.
-2. [ ] Feature #9 full conversion, parity verification, and Python removal.
+1. [x] Feature #9 migration gate: prove the Rust vertical slice against Python behavior.
+2. [x] Feature #9 full conversion, parity verification, and Python removal.
 3. [ ] Feature #8: generated compatibility matrix.
 4. [ ] Feature #5: `list`, `info`, and inert health/status commands.
 5. [ ] Codex project hooks and MCP.

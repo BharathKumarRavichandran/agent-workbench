@@ -3,7 +3,7 @@
 //! Copied files and directories carry a validated SHA-256 digest. Directory
 //! symlinks do not. Skills installation still emits only directory symlinks;
 //! copied-resource mutation and multi-root state authorization are later units.
-//! Serialization matches Python `InstallOperation.as_dict` and `StateEntry.as_dict`.
+//! Serialization is the stable operation and state JSON shape.
 
 use super::Result;
 
