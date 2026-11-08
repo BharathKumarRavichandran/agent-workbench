@@ -12,7 +12,7 @@ import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / 'scripts')]
-from parity_oracle import require_python312
+from parity_oracle import oracle_pythonpath, require_python312
 from check_cursor_activation_parity import snapshot
 
 RUST = REPO / 'rust/target/debug/agent-workbench-rs'
@@ -40,7 +40,7 @@ def dispatch_pair(base, command, profile='default', variant='json'):
         key.write_bytes(bytes(range(32)))
         key.chmod(0o600)
         env = dict(os.environ, HOME=str(directory / 'home'), XDG_STATE_HOME=str(state),
-                   PYTHONPATH=str(REPO), COLUMNS='80', PYTHONDONTWRITEBYTECODE='1')
+                   PYTHONPATH=oracle_pythonpath(str(REPO)), COLUMNS='80', PYTHONDONTWRITEBYTECODE='1')
         globals_ = ['--root=ignored', '--ro=--json', '--profile=missing', f'--prof={profile}']
         common = ['--target=bad', '--tar=agents', '--destination=ignored', f'--dest={destination}',
                   '--state-dir=ignored', f'--state-d={state}', '--js', '--json']

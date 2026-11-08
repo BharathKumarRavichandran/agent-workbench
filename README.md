@@ -38,32 +38,68 @@ cd agent-workbench
 make check
 ```
 
-The runtime uses only the Python standard library and supports Python 3.9 or newer.
+The default CLI is the Rust `agent-workbench` executable. Remaining parity gates materialize a pinned Python 3.12 producer when they still compare against the frozen oracle; the in-tree Python runtime is removed.
+
+## Default CLI
+
+The documented default CLI is the Rust `agent-workbench` executable. An install places one binary at `$PREFIX/bin/agent-workbench`. It does not publish Git tags or GitHub releases.
+
+```bash
+python3 scripts/package_release.py --prefix ~/.local
+# equivalent: make rust-release PREFIX=$HOME/.local
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The install path is `$PREFIX/bin/agent-workbench`. Upgrade consumes producer-written ownership in place (status and keep-reinstall). Uninstall removes only recorded owned resources:
+
+```bash
+agent-workbench --profile pstack status --target hermes
+agent-workbench --profile pstack install --target hermes
+agent-workbench --profile pstack uninstall --target hermes
+```
+
+## Transition invocations
+
+Rust is the default CLI. Makefile targets (`make validate`, `make render`, `make update`, `make plan-hermes`) dispatch to that default through `scripts/agent-workbench`.
+
+The Python runtime is removed. `python3 -m` is not a supported runtime. `scripts/agent-workbench` is a transition wrapper that execs the Rust `agent-workbench` executable. It does not replace `$PREFIX/bin/agent-workbench`:
+
+```bash
+scripts/agent-workbench --profile pstack status --target hermes
+```
+
+## Intentional Python/Rust differences
+
+Rust is the default CLI. The Python runtime is removed. Remaining oracle gates materialize the pinned producer commit. The default executable matches that producer except the authorized differences `E1`, `E2`, `VAL-GIT-1`, `RENDER-GIT-1`, `UPDATE-GIT-1`, and `UPDATE-CONFIG-1`. Each has a permanent paired regression that asserts the oracle and replacement separately. None is hidden in a generic normalizer or extended to another command.
+
+State/config migration for the default CLI: `PYTHON-TO-RUST-UPGRADE` consumes producer-written ownership in place. `REVERSE-STATUS-NOT-SUPPORTED` and `REJECT-V4-AS-V3` fail closed without discarding evidence.
+
+Exact command, failure boundary, stdout/stderr class, exit status, and state/config effect for each row: [`rust/SECTION_F_CONTRACT.md`](rust/SECTION_F_CONTRACT.md) (F6) and [`rust/PARITY_EXCEPTIONS.md`](rust/PARITY_EXCEPTIONS.md).
 
 ## Commands
 
 ```bash
 # Validate the catalog, manifests, component artifacts, lock report, and generated files.
-python3 -m agent_workbench validate
+agent-workbench validate
 
 # Render native marketplaces and catalog/lock.json.
-python3 -m agent_workbench render
-python3 -m agent_workbench render --check
+agent-workbench render
+agent-workbench render --check
 
 # Preview an installation without changing the machine.
-python3 -m agent_workbench --profile pstack plan --target hermes
+agent-workbench --profile pstack plan --target hermes
 
 # Apply it. Existing exact links require explicit adoption once.
-python3 -m agent_workbench --profile pstack install --target hermes --adopt
+agent-workbench --profile pstack install --target hermes --adopt
 
 # Inspect current desired-versus-actual state.
-python3 -m agent_workbench --profile pstack status --target hermes
+agent-workbench --profile pstack status --target hermes
 
 # Remove only paths recorded as owned by this workbench.
-python3 -m agent_workbench --profile pstack uninstall --target hermes
+agent-workbench --profile pstack uninstall --target hermes
 
 # Advance the reviewed upstream source, then render and validate.
-python3 -m agent_workbench update --source cursor-plugins
+agent-workbench update --source cursor-plugins
 ```
 
 `--destination` overrides the skills directory. `--project-root` selects project directories for components. `--state-dir` overrides machine-local ownership storage.
@@ -71,9 +107,9 @@ python3 -m agent_workbench update --source cursor-plugins
 To install pstack agents into a project:
 
 ```bash
-python3 -m agent_workbench --profile pstack plan --target cursor --component agents --project-root /path/to/project
-python3 -m agent_workbench --profile pstack install --target cursor --component agents --project-root /path/to/project
-python3 -m agent_workbench --profile pstack uninstall --target cursor --project-root /path/to/project
+agent-workbench --profile pstack plan --target cursor --component agents --project-root /path/to/project
+agent-workbench --profile pstack install --target cursor --component agents --project-root /path/to/project
+agent-workbench --profile pstack uninstall --target cursor --project-root /path/to/project
 ```
 
 Repeat `--component` to select more than one kind, such as `--component skills --component agents`. The same flags apply to `plan`, `install`, and `status`. Text and JSON operations identify the component and resource kind. Unsupported requests produce `COMPONENT_UNSUPPORTED` conflicts before mutation, even when selected plugins export none of that component.
@@ -96,9 +132,9 @@ Cursor and Claude support explicit activation of their exact hook formats and MC
 To activate Cursor hooks and MCP for a project, first inspect the plan and its trust tokens:
 
 ```bash
-python3 -m agent_workbench trust --target cursor --project-root /path/to/project \
+agent-workbench trust --target cursor --project-root /path/to/project \
   --component hooks --component mcp --json
-python3 -m agent_workbench install --target cursor --project-root /path/to/project \
+agent-workbench install --target cursor --project-root /path/to/project \
   --component hooks --component mcp \
   --trust aw-trust-v1:<hooks-token> --trust aw-trust-v1:<mcp-token>
 ```
@@ -187,23 +223,12 @@ The lock report records source revisions, plugin versions, artifact roots, and p
 
 ```text
 agent-workbench/
-├── agent_workbench/           # typed runtime and CLI
-│   ├── adapters/              # native renderers and install targets
-│   ├── codec.py               # strict JSON boundary
-│   ├── model.py               # immutable domain values
-│   ├── installation.py        # plan, reconcile, apply, uninstall
-│   ├── state.py               # atomic ownership state
-│   ├── bundles.py             # inert trees and managed directory copies
-│   ├── shared_config.py       # Exact JSON slots and document revisions
-│   ├── trust.py               # content-bound activation tokens
-│   ├── transactions.py        # shared lock, journal, and recovery
-│   └── validation.py
+├── rust/                      # default CLI crate
 ├── catalog/                   # canonical catalog, schema, lock report
 ├── profiles/                  # package and target selections
 ├── plugins/                   # locally owned or curated packages
 ├── vendor/                    # pinned upstream sources
-├── tests/                     # isolated behavior tests
-└── scripts/                   # compatibility wrappers
+└── scripts/                   # parity gates, packager, and the default CLI wrapper
 ```
 
 ## Adding a plugin

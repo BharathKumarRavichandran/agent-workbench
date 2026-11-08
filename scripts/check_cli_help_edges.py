@@ -12,7 +12,7 @@ import unicodedata
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'scripts'))
-from parity_oracle import require_python312
+from parity_oracle import oracle_pythonpath, require_python312
 
 RUST = REPO / 'rust/target/debug/agent-workbench-rs'
 COMMANDS = ('', 'validate', 'render', 'plan', 'install', 'status', 'trust', 'uninstall', 'update')
@@ -58,7 +58,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='e6-help-', dir=os.environ['TMPDIR']) as name:
         base = Path(name)
         env = dict(os.environ, HOME=str(base / 'home'), XDG_STATE_HOME=str(base / 'state'),
-                   PYTHONPATH=str(REPO), PYTHONDONTWRITEBYTECODE='1')
+                   PYTHONPATH=oracle_pythonpath(str(REPO)), PYTHONDONTWRITEBYTECODE='1')
         for label, columns, argv, expected in rows(group):
             env.pop('COLUMNS', None)
             if columns is not None:

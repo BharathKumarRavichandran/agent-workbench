@@ -20,6 +20,8 @@ pub mod capabilities;
 mod cli;
 mod cli_help;
 mod lifecycle;
+#[cfg(test)]
+mod platform_parity_tests;
 mod rendering;
 mod resource;
 mod shared_document;
@@ -1128,10 +1130,52 @@ mod tests {
         }
     }
 
+    fn pinned_oracle_root() -> PathBuf {
+        let tmp = std::env::var("TMPDIR").expect("explicit scratch TMPDIR required");
+        let dest = PathBuf::from(tmp).join("pinned-python-oracle");
+        if dest.join("agent_workbench").join("__init__.py").is_file() {
+            return dest;
+        }
+        std::fs::create_dir_all(&dest).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let archive = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "archive",
+                "04502a0054fcd3c666e06f4e20ef7603293cfed3",
+                "agent_workbench",
+                "tests",
+            ])
+            .output()
+            .expect("git archive pinned producer");
+        assert!(
+            archive.status.success(),
+            "{}",
+            String::from_utf8_lossy(&archive.stderr)
+        );
+        let mut tar = std::process::Command::new("tar")
+            .current_dir(&dest)
+            .arg("-x")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("tar extract pinned producer");
+        {
+            use std::io::Write;
+            tar.stdin
+                .as_mut()
+                .unwrap()
+                .write_all(&archive.stdout)
+                .unwrap();
+        }
+        assert!(tar.wait().unwrap().success());
+        dest
+    }
+
     fn python_resource_contract() -> serde_json::Value {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         let output = std::process::Command::new("python3")
             .current_dir(root)
+            .env("PYTHONPATH", pinned_oracle_root())
             .arg("-c")
             .arg(include_str!("resource_contract.py"))
             .output()

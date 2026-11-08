@@ -2586,7 +2586,9 @@ def transaction_durable_rows(base: Path) -> None:
 
 def main() -> int:
     from parity_oracle import require_python312
+    from check_python_baseline_upgrade import require_pinned_baseline
     require_python312()
+    require_pinned_baseline()
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
         sys.stderr.write(build.stderr)
@@ -2594,14 +2596,18 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="agent-workbench-lifecycle-") as raw:
             base = Path(raw).resolve()
-            for script in ("parity_oracle.py", "check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
+            for script in ("parity_oracle.py", "check_platform_primitives.py", "check_cursor_activation_parity.py", "check_cursor_activation_edges.py",
                            "check_cursor_activation_recovery.py", "check_claude_activation_parity.py",
                            "check_claude_activation_edges.py", "check_claude_activation_recovery.py",
                            "check_claude_native_contract.py", "check_activation_inertness.py",
                            "check_artifact_inspection_parity.py", "check_artifact_inventory.py",
                            "check_validate_parity.py", "check_render_parity.py", "check_render_failures.py",
                            "check_lifecycle_text_parity.py", "check_cli_parity.py",
-                           "check_cli_defaults_parity.py", "check_cli_help_edges.py"):
+                           "check_cli_defaults_parity.py", "check_cli_help_edges.py",
+                           "check_python_baseline_upgrade.py", "check_python_rust_recovery_handoff.py",
+                           "check_release_executable.py", "check_invocation_compatibility.py",
+                           "check_intentional_differences.py", "check_default_cutover.py",
+                           "check_python_removal.py"):
                 activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
                 assert activation.returncode == 0, activation.stdout + activation.stderr
                 print(activation.stdout.strip())
