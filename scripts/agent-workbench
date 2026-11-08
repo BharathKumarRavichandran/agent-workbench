@@ -1,6 +1,5 @@
 #!/bin/sh
 # Transition wrapper for the default Rust CLI.
-# The Python module form remains the frozen oracle until F8.
 # This script is not $PREFIX/bin/agent-workbench and must not be installed
 # in its place.
 set -eu

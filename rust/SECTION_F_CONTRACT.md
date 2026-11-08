@@ -61,7 +61,7 @@ rows.
 
 ## Later units (not F1–F7)
 
-F8 Python removal.
+F8 Python removal is documented below.
 
 ## Observed RED → GREEN
 
@@ -416,3 +416,37 @@ the box already checked.
 | Authorized differences stay the F6 catalog | `f6_catalog_required` |
 | F6 catalog and migration evidence remain required | `f6_catalog_required`; umbrella still runs `check_intentional_differences.py` |
 | Document the default cutover | `documentation_records_cutover` |
+
+## F8 — Python removal
+
+Rust is the documented default CLI. A clean-install release candidate and an
+existing-state (producer-written ownership) release candidate pass end to end
+on that default before the in-tree Python runtime is removed.
+
+Then `agent_workbench/`, `python3 -m` as a supported runtime, Python package
+tests, and the F5 shebang wrappers (`validate.py`, `render_marketplaces.py`,
+`update.py`, `install_skills.py`) are removed. Catalog CI jobs run the default
+Rust CLI. Remaining oracle gates materialize the pinned Section E producer into
+scratch; they do not depend on an in-tree `agent_workbench/` directory. F6
+catalog IDs and producer→rewrite / fail-closed reverse/downgrade evidence
+remain required. Do not invent divergences, hide them in a generic normalizer,
+or publish Git tags or GitHub releases.
+
+`scripts/check_python_removal.py` runs unconditionally in the umbrella parity
+gate. It requires explicit scratch `TMPDIR`. Remaining gates that still need
+the pinned oracle use Python 3.12. The F8 TODO box is checked only after local
+gates; this test must not require the box already checked.
+
+### Acceptance-to-test map
+
+| F8 acceptance | Runnable evidence in `check_python_removal.py` |
+| --- | --- |
+| Document Python removal in README and this map | `documentation_records_removal` |
+| In-tree `agent_workbench/` and Python package tests are gone | `leftover_python_runtime_removed` |
+| Catalog CI and Makefile no longer exec `python3 -m agent_workbench` or unittest-discover the deleted package | `catalog_ci_uses_default_cli` |
+| `python3 -m` is not a supported runtime | `python_module_not_supported` |
+| Oracle shebang wrappers are removed | `shebang_oracle_wrappers_removed` |
+| Clean-install release candidate on the default Rust CLI | `clean_install_release_candidate` |
+| Existing-state (producer-written ownership) release candidate on the default Rust CLI | `existing_state_release_candidate` |
+| Unsupported reverse/downgrade still fail closed; evidence is not discarded | `reverse_and_downgrade_fail_closed` |
+| Authorized differences stay the F6 catalog | `f6_catalog_required` |

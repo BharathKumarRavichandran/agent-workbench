@@ -77,7 +77,7 @@ Convert the workbench to a standalone Rust CLI without extending product behavio
 - [x] Preserve existing invocation compatibility or ship an explicit, tested wrapper during the transition.
 - [x] Record every intentional behavioral difference and its state/config migration before changing the default executable.
 - [x] Make Rust the default only after all supported commands, targets, states, generated artifacts, and recovery paths pass parity gates.
-- [ ] Remove Python runtime code and compatibility scaffolding only after a clean-install and existing-state release candidate passes end to end.
+- [x] Remove Python runtime code and compatibility scaffolding only after a clean-install and existing-state release candidate passes end to end.
 
 ## Feature #8 — Generated compatibility matrix
 

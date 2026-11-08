@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """F1: clean-install and upgrade from pinned-Python ownership state.
 
-No Git tags or GitHub releases exist. The producer is in-tree
-`python3 -m agent_workbench` at Section E merge
-04502a0054fcd3c666e06f4e20ef7603293cfed3. Rust consumes that CLI-written
-state; it does not consume Python plans or results.
+No Git tags or GitHub releases exist. The producer is the pinned
+`python3 -m agent_workbench` package at Section E merge
+04502a0054fcd3c666e06f4e20ef7603293cfed3, materialized into scratch for
+remaining oracle gates. Rust consumes that CLI-written state; it does not
+consume Python plans or results. The in-tree runtime package is gone.
 """
 from __future__ import annotations
 
@@ -19,15 +20,38 @@ import sys
 import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(REPO), str(REPO / "scripts"), str(REPO / "tests")]
+sys.path[:0] = [str(REPO), str(REPO / "scripts")]
 from parity_oracle import require_python312
 from check_rust_plan_parity import TARGETS, fixture
-from check_cursor_activation_parity import prepare
-from agent_workbench.state import load_state, write_state
 
 RUST = REPO / "rust/target/debug/agent-workbench-rs"
 PINNED_BASELINE = "04502a0054fcd3c666e06f4e20ef7603293cfed3"
 PINNED_PYTHON_TREE = "01c263007031df3ea599813796e2d3c127f4b4ce"
+
+
+def materialize_pinned_oracle() -> Path:
+    scratch = os.environ.get("TMPDIR")
+    if not scratch:
+        raise SystemExit("explicit isolated scratch TMPDIR required")
+    dest = Path(scratch) / "pinned-python-oracle"
+    marker = dest / ".pin"
+    if (
+        marker.is_file()
+        and marker.read_text(encoding="utf-8") == PINNED_BASELINE
+        and (dest / "agent_workbench" / "__init__.py").is_file()
+        and (dest / "tests" / "test_workbench.py").is_file()
+    ):
+        return dest
+    dest.mkdir(parents=True, exist_ok=True)
+    archive = subprocess.run(
+        ["git", "archive", PINNED_BASELINE, "agent_workbench", "tests"],
+        cwd=REPO,
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(["tar", "-x", "-C", str(dest)], input=archive.stdout, check=True)
+    marker.write_text(PINNED_BASELINE, encoding="utf-8")
+    return dest
 
 
 def require_pinned_baseline() -> None:
@@ -39,11 +63,15 @@ def require_pinned_baseline() -> None:
     if releases.returncode == 0 and releases.stdout.strip():
         raise SystemExit(f"GitHub releases exist; update the F1 pin before claiming coverage:\n{releases.stdout}")
     tree = subprocess.run(
-        ["git", "rev-parse", "HEAD:agent_workbench"], cwd=REPO, capture_output=True, text=True, check=True
+        ["git", "rev-parse", f"{PINNED_BASELINE}:agent_workbench"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
     if tree != PINNED_PYTHON_TREE:
         raise SystemExit(
-            f"production package agent_workbench drifted from pinned tree {PINNED_PYTHON_TREE}: {tree}"
+            f"pinned producer {PINNED_BASELINE}:agent_workbench drifted from {PINNED_PYTHON_TREE}: {tree}"
         )
     has_pin = subprocess.run(
         ["git", "cat-file", "-e", f"{PINNED_BASELINE}^{{commit}}"],
@@ -56,6 +84,14 @@ def require_pinned_baseline() -> None:
         )
         if present.returncode:
             raise SystemExit(f"pinned Python baseline {PINNED_BASELINE} is not an ancestor of HEAD")
+    root = materialize_pinned_oracle()
+    for path in (str(root), str(root / "tests")):
+        current = os.environ.get("PYTHONPATH", "")
+        parts = [item for item in current.split(os.pathsep) if item]
+        if path not in parts:
+            os.environ["PYTHONPATH"] = path + (os.pathsep + current if current else "")
+        if path not in sys.path:
+            sys.path.insert(0, path)
 
 
 def env_for(root: Path) -> dict[str, str]:
@@ -232,6 +268,8 @@ def skills_clean(base: Path, target: str) -> int:
 
 
 def rewrite_v2(path: Path) -> None:
+    from agent_workbench.state import load_state, write_state
+
     state = load_state(path)
     write_state(path, replace(state, schema_version=2, destination_roots={}, slots={}))
     payload = json.loads(path.read_text())
@@ -395,6 +433,8 @@ def activation_args(root: Path, repository: Path, target: str, action: str) -> l
 
 
 def python_install_activation(root_parent: Path, target: str) -> tuple[Path, Path]:
+    from check_cursor_activation_parity import prepare
+
     root, repository = prepare(root_parent, "mixed", target)
     source = repository / "plugins/sample/hooks/stop.sh"
     source.write_text("#!/bin/sh\nexit 0\n")
@@ -511,6 +551,8 @@ def reverse_and_downgrade(base: Path) -> int:
         ),
     ):
         parent = fresh(base / f"downgrade-{name}")
+        from check_cursor_activation_parity import prepare
+
         root, repository = prepare(parent, "mixed", "cursor")
         for key in root.rglob("*.transaction-key"):
             key.unlink()

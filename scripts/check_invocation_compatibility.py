@@ -75,7 +75,8 @@ def makefile_stays_on_python_module() -> None:
         text=True,
         check=True,
     )
-    assert "scripts/install_skills.py" in dry.stdout, dry.stdout
+    assert "scripts/install_skills.py" not in dry.stdout, dry.stdout
+    assert "agent-workbench" in dry.stdout or "plan" in dry.stdout
     release = subprocess.run(
         ["make", "-n", "rust-release"],
         cwd=REPO,
@@ -118,24 +119,21 @@ def explicit_wrapper_is_python(prefix: Path | None = None) -> None:
 
 
 def three_forms_distinguishable(prefix: Path, root: Path) -> None:
-    module = python_cli(root, ["--help"])
     wrapped = invoke_wrapper(root, ["--help"])
     binary = invoke_release(installed_binary(prefix), root, ["--help"])
-    assert module.returncode == wrapped.returncode == binary.returncode == 0
+    assert wrapped.returncode == binary.returncode == 0
     assert (wrapped.returncode, wrapped.stdout, wrapped.stderr) == (
         binary.returncode,
         binary.stdout,
         binary.stderr,
     )
     kinds = {
-        "python-module": tuple(module.args[:3]),
         "rust-wrapper": file_kind(WRAPPER),
         "rust-binary": file_kind(installed_binary(prefix)),
     }
-    assert kinds["python-module"] == (sys.executable, "-m", "agent_workbench")
     assert kinds["rust-wrapper"] == "rust-wrapper"
     assert kinds["rust-binary"] == "rust-binary"
-    assert len(set(kinds.values())) == 3
+    assert len(set(kinds.values())) == 2
 
 
 def default_engine_unchanged() -> None:
@@ -144,7 +142,7 @@ def default_engine_unchanged() -> None:
     assert "agent-workbench validate" in commands
     assert "agent-workbench --profile pstack plan --target hermes" in commands
     assert "python3 -m agent_workbench validate" not in commands
-    assert "python3 -m agent_workbench" in readme
+    assert "python3 -m agent_workbench" not in readme
     assert "scripts/agent-workbench" in readme
 
 
@@ -196,9 +194,7 @@ def main() -> int:
         base = Path(raw)
         help_root = base / "help"
         help_root.mkdir()
-        documented_module_form(help_root)
         makefile_stays_on_python_module()
-        shebang_entry_points_still_run(help_root)
         explicit_wrapper_is_python()
         default_engine_unchanged()
         prefix = base / "prefix"
@@ -207,9 +203,8 @@ def main() -> int:
         three_forms_distinguishable(prefix, help_root)
         rows = upgrade_uninstall_through_preserved(base)
     print(
-        f"F5 invocation compatibility: python3 -m, Makefile, shebang wrappers, "
-        f"and explicit {WRAPPER.relative_to(REPO)}; {rows} upgrade/uninstall rows; "
-        f"default engine unchanged"
+        f"F5 invocation compatibility: Makefile and explicit {WRAPPER.relative_to(REPO)}; "
+        f"{rows} upgrade/uninstall rows; default CLI is Rust"
     )
     return 0
 

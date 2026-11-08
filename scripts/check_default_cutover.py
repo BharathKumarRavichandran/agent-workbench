@@ -78,7 +78,6 @@ def documentation_records_cutover() -> None:
     assert "The documented default CLI is the Rust `agent-workbench` executable" in readme or (
         "Rust is the default CLI" in readme
     )
-    assert "python3 -m agent_workbench" in readme
     for exception_id in F6_IDS:
         assert exception_id in readme, exception_id
         assert exception_id in body or exception_id in contract
@@ -87,7 +86,6 @@ def documentation_records_cutover() -> None:
         "leftover_documented_default_is_not_python",
         "makefile_dispatches_to_default",
         "wrapper_dispatches_to_rust",
-        "oracle_module_still_runs",
         "migration_through_default",
         "f6_catalog_required",
     ):
@@ -136,10 +134,6 @@ def f6_catalog_required() -> None:
         text = path.read_text(encoding="utf-8")
         assert "normalize_traceback" not in text
         assert "generic normalizer" not in text.lower()
-    todo = TODO.read_text(encoding="utf-8")
-    assert "- [ ] Remove Python runtime code" in todo
-    assert (REPO / "agent_workbench").is_dir()
-    assert (REPO / "tests").is_dir()
 
 
 def documented_default_is_rust(prefix: Path, root: Path) -> None:
@@ -161,7 +155,8 @@ def makefile_dispatches_to_default() -> None:
         text=True,
         check=True,
     )
-    assert "scripts/install_skills.py" in dry.stdout, dry.stdout
+    assert "scripts/install_skills.py" not in dry.stdout, dry.stdout
+    assert "agent-workbench" in dry.stdout or "plan" in dry.stdout
     release = subprocess.run(
         ["make", "-n", "rust-release"],
         cwd=REPO,
@@ -299,7 +294,6 @@ def main() -> int:
         base = Path(raw)
         help_root = base / "help"
         help_root.mkdir()
-        oracle_module_still_runs(help_root)
         prefix = base / "prefix"
         package(prefix)
         documented_default_is_rust(prefix, help_root)

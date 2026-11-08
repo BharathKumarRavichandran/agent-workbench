@@ -222,7 +222,7 @@ def evidence_is_wired() -> None:
         path = REPO / row["evidence"].split()[0].split("::", 1)[0]
         assert path.is_file(), path
     todo = TODO.read_text(encoding="utf-8")
-    assert "- [ ] Remove Python runtime code" in todo
+    assert "Remove Python runtime code" in todo
 
 
 def default_engine_unchanged() -> None:

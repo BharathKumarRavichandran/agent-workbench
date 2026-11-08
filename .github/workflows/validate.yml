@@ -12,23 +12,16 @@ permissions:
 jobs:
   catalog:
     runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        python: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - run: python3 -m unittest discover -s tests -v
-        env:
-          TMPDIR: ${{ runner.temp }}
-      - run: python3 -m agent_workbench validate
-      - run: python3 -m agent_workbench render --check
-      - run: python3 scripts/install_skills.py --target agents --dry-run --dest "$RUNNER_TEMP/skills"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --manifest-path rust/Cargo.toml
+      - run: ./scripts/agent-workbench validate
+      - run: ./scripts/agent-workbench render --check
+      - run: ./scripts/agent-workbench --profile pstack plan --target agents --destination "$RUNNER_TEMP/skills"
 
   rust-plan-parity:
     name: rust-plan-parity (${{ matrix.os }})
@@ -44,6 +37,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -62,4 +56,3 @@ jobs:
       - run: cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path rust/Cargo.toml
       - run: python3 scripts/check_rust_plan_parity.py
-      - run: python3 -m unittest discover -s tests -q

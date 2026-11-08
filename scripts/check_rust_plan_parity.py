@@ -2586,7 +2586,9 @@ def transaction_durable_rows(base: Path) -> None:
 
 def main() -> int:
     from parity_oracle import require_python312
+    from check_python_baseline_upgrade import require_pinned_baseline
     require_python312()
+    require_pinned_baseline()
     build = run(["cargo", "build", "--quiet", "--manifest-path", "rust/Cargo.toml"])
     if build.returncode:
         sys.stderr.write(build.stderr)
@@ -2604,7 +2606,8 @@ def main() -> int:
                            "check_cli_defaults_parity.py", "check_cli_help_edges.py",
                            "check_python_baseline_upgrade.py", "check_python_rust_recovery_handoff.py",
                            "check_release_executable.py", "check_invocation_compatibility.py",
-                           "check_intentional_differences.py", "check_default_cutover.py"):
+                           "check_intentional_differences.py", "check_default_cutover.py",
+                           "check_python_removal.py"):
                 activation = run([sys.executable, str(REPOSITORY / "scripts" / script)])
                 assert activation.returncode == 0, activation.stdout + activation.stderr
                 print(activation.stdout.strip())

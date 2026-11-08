@@ -38,7 +38,7 @@ cd agent-workbench
 make check
 ```
 
-The runtime uses only the Python standard library and supports Python 3.9 or newer. Rust is the default CLI.
+The default CLI is the Rust `agent-workbench` executable. Remaining parity gates materialize a pinned Python 3.12 producer when they still compare against the frozen oracle; the in-tree Python runtime is removed.
 
 ## Default CLI
 
@@ -60,18 +60,17 @@ agent-workbench --profile pstack uninstall --target hermes
 
 ## Transition invocations
 
-Rust is the default CLI. Makefile targets (`make validate`, `make render`, `make update`, `make plan-hermes`) dispatch to that default through `scripts/agent-workbench`. Command-specific shebang wrappers remain at `scripts/validate.py`, `scripts/render_marketplaces.py`, `scripts/update.py`, and `scripts/install_skills.py` for the Python oracle.
+Rust is the default CLI. Makefile targets (`make validate`, `make render`, `make update`, `make plan-hermes`) dispatch to that default through `scripts/agent-workbench`.
 
-`python3 -m agent_workbench` still runs as the frozen oracle. `scripts/agent-workbench` is a transition wrapper that execs the Rust `agent-workbench` executable. It does not replace `$PREFIX/bin/agent-workbench`:
+The Python runtime is removed. `python3 -m` is not a supported runtime. `scripts/agent-workbench` is a transition wrapper that execs the Rust `agent-workbench` executable. It does not replace `$PREFIX/bin/agent-workbench`:
 
 ```bash
-python3 -m agent_workbench --help
 scripts/agent-workbench --profile pstack status --target hermes
 ```
 
 ## Intentional Python/Rust differences
 
-Rust is the default CLI. Python remains the frozen oracle until a later removal unit. The default executable matches Python except the authorized differences `E1`, `E2`, `VAL-GIT-1`, `RENDER-GIT-1`, `UPDATE-GIT-1`, and `UPDATE-CONFIG-1`. Each has a permanent paired regression that asserts the oracle and replacement separately. None is hidden in a generic normalizer or extended to another command.
+Rust is the default CLI. The Python runtime is removed. Remaining oracle gates materialize the pinned producer commit. The default executable matches that producer except the authorized differences `E1`, `E2`, `VAL-GIT-1`, `RENDER-GIT-1`, `UPDATE-GIT-1`, and `UPDATE-CONFIG-1`. Each has a permanent paired regression that asserts the oracle and replacement separately. None is hidden in a generic normalizer or extended to another command.
 
 State/config migration for the default CLI: `PYTHON-TO-RUST-UPGRADE` consumes producer-written ownership in place. `REVERSE-STATUS-NOT-SUPPORTED` and `REJECT-V4-AS-V3` fail closed without discarding evidence.
 
@@ -224,23 +223,12 @@ The lock report records source revisions, plugin versions, artifact roots, and p
 
 ```text
 agent-workbench/
-├── agent_workbench/           # typed runtime and CLI
-│   ├── adapters/              # native renderers and install targets
-│   ├── codec.py               # strict JSON boundary
-│   ├── model.py               # immutable domain values
-│   ├── installation.py        # plan, reconcile, apply, uninstall
-│   ├── state.py               # atomic ownership state
-│   ├── bundles.py             # inert trees and managed directory copies
-│   ├── shared_config.py       # Exact JSON slots and document revisions
-│   ├── trust.py               # content-bound activation tokens
-│   ├── transactions.py        # shared lock, journal, and recovery
-│   └── validation.py
+├── rust/                      # default CLI crate
 ├── catalog/                   # canonical catalog, schema, lock report
 ├── profiles/                  # package and target selections
 ├── plugins/                   # locally owned or curated packages
 ├── vendor/                    # pinned upstream sources
-├── tests/                     # isolated behavior tests
-└── scripts/                   # compatibility wrappers
+└── scripts/                   # parity gates, packager, and the default CLI wrapper
 ```
 
 ## Adding a plugin

@@ -11,7 +11,7 @@ import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / 'scripts')]
-from parity_oracle import require_python312
+from parity_oracle import oracle_pythonpath, require_python312
 from check_cursor_activation_parity import snapshot
 from check_rust_plan_parity import fixture
 RUST = REPO / 'rust/target/debug/agent-workbench-rs'
@@ -43,7 +43,7 @@ def scenario(base, name, *, environment=None, options=(), profile_options=None,
             catalog = json.loads(path.read_text())
             catalog.update(catalog_annotation)
             path.write_text(json.dumps(catalog))
-        env = dict(os.environ, HOME=str(directory / 'home'), PYTHONPATH=str(REPO),
+        env = dict(os.environ, HOME=str(directory / 'home'), PYTHONPATH=oracle_pythonpath(str(REPO)),
                    PYTHONDONTWRITEBYTECODE='1', COLUMNS='80')
         env.pop('XDG_STATE_HOME', None)
         env.pop('CODEX_HOME', None)
@@ -90,7 +90,7 @@ def scenario(base, name, *, environment=None, options=(), profile_options=None,
 
 def missing_roots(base):
     env = dict(os.environ, HOME=str(base / 'home'), XDG_STATE_HOME=str(base / 'state'),
-               PYTHONPATH=str(REPO), PYTHONDONTWRITEBYTECODE='1')
+               PYTHONPATH=oracle_pythonpath(str(REPO)), PYTHONDONTWRITEBYTECODE='1')
     before = snapshot(base)
     count = 0
     for root in ('missing', './missing', str(base / 'missing')):

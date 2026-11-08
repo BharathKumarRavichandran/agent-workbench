@@ -36,10 +36,12 @@ def main() -> None:
             'schemaVersion': 2, 'id': 'default', 'plugins': {'include': ['*'], 'exclude': []},
             'targets': [{'id': 'cursor', 'components': ['hooks', 'mcp'], 'projectRoot': str(project)}]}))
         state = base / 'state'
-        environment = dict(os.environ, PYTHONPATH=str(repository))
+        binary = repository / 'rust/target/debug/agent-workbench-rs'
+        environment = dict(os.environ)
+        environment.pop('PYTHONPATH', None)
 
         def cli(command: str, flags: list[str] | None = None, expected: int = 0) -> list[dict[str, object]]:
-            result = subprocess.run([sys.executable, '-m', 'agent_workbench', '--root', str(root),
+            result = subprocess.run([str(binary), '--root', str(root),
                 command, '--target', 'cursor', '--state-dir', str(state), '--json'] + (flags or []),
                 cwd=repository, env=environment, capture_output=True, text=True)
             if result.returncode != expected:
