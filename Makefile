@@ -1,4 +1,3 @@
-PYTHON ?= python3
 PREFIX ?= $(HOME)/.local
 CLI ?= ./scripts/agent-workbench
 
@@ -25,4 +24,6 @@ install-dry-run:
 	$(CLI) --profile pstack plan --target agents
 
 rust-release:
-	$(PYTHON) scripts/package_release.py --prefix "$(PREFIX)"
+	cargo build --release --manifest-path rust/Cargo.toml
+	mkdir -p "$(PREFIX)/bin"
+	install -m 0755 rust/target/release/agent-workbench-rs "$(PREFIX)/bin/agent-workbench"

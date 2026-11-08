@@ -38,15 +38,14 @@ cd agent-workbench
 make check
 ```
 
-The default CLI is the Rust `agent-workbench` executable. Remaining parity gates materialize a pinned Python 3.12 producer when they still compare against the frozen oracle; the in-tree Python runtime is removed.
+The default CLI is the Rust `agent-workbench` executable. Rust is the specification. There is no live Python oracle.
 
 ## Default CLI
 
 The documented default CLI is the Rust `agent-workbench` executable. An install places one binary at `$PREFIX/bin/agent-workbench`. It does not publish Git tags or GitHub releases.
 
 ```bash
-python3 scripts/package_release.py --prefix ~/.local
-# equivalent: make rust-release PREFIX=$HOME/.local
+make rust-release PREFIX=$HOME/.local
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -68,13 +67,11 @@ The Python runtime is removed. `python3 -m` is not a supported runtime. `scripts
 scripts/agent-workbench --profile pstack status --target hermes
 ```
 
-## Intentional Python/Rust differences
+## Intentional differences
 
-Rust is the default CLI. The Python runtime is removed. Remaining oracle gates materialize the pinned producer commit. The default executable matches that producer except the authorized differences `E1`, `E2`, `VAL-GIT-1`, `RENDER-GIT-1`, `UPDATE-GIT-1`, and `UPDATE-CONFIG-1`. Each has a permanent paired regression that asserts the oracle and replacement separately. None is hidden in a generic normalizer or extended to another command.
+Rust is the specification. The F6 catalog IDs `E1`, `E2`, `VAL-GIT-1`, `RENDER-GIT-1`, `UPDATE-GIT-1`, `UPDATE-CONFIG-1`, `PYTHON-TO-RUST-UPGRADE`, `REVERSE-STATUS-NOT-SUPPORTED`, and `REJECT-V4-AS-V3` remain historical documentation only. They are not re-proven by paired Python/Rust processes.
 
-State/config migration for the default CLI: `PYTHON-TO-RUST-UPGRADE` consumes producer-written ownership in place. `REVERSE-STATUS-NOT-SUPPORTED` and `REJECT-V4-AS-V3` fail closed without discarding evidence.
-
-Exact command, failure boundary, stdout/stderr class, exit status, and state/config effect for each row: [`rust/SECTION_F_CONTRACT.md`](rust/SECTION_F_CONTRACT.md) (F6) and [`rust/PARITY_EXCEPTIONS.md`](rust/PARITY_EXCEPTIONS.md).
+Exact command, failure boundary, stdout/stderr class, exit status, and state/config effect for each historical row: [`rust/SECTION_F_CONTRACT.md`](rust/SECTION_F_CONTRACT.md) (F6) and [`rust/PARITY_EXCEPTIONS.md`](rust/PARITY_EXCEPTIONS.md).
 
 ## Commands
 
@@ -164,8 +161,6 @@ MCP ownership covers individual `mcpServers/<name>` objects. Hook ownership cove
 
 Cursor and Claude activation use one shared document lock and a private recovery journal under `.cursor` or `.claude`. The journal may contain config values and bundle backups, has mode `0600`, and is removed after commit. On interruption, run `status` with the same profile, state directory, and scope to restore the prior activation. Other profiles wait for that recovery. If an external edit prevents safe recovery, the command fails and retains the journal and bundle evidence for repair. A pending journal makes `trust` fail without modifying anything.
 
-Run `python3 scripts/check_claude_activation.py` for the isolated Claude-native CLI lifecycle, or `python3 scripts/check_cursor_activation.py` to repeat the isolated CLI scenario with the vendored ralph-loop hooks and Playwright MCP definition. The script checks installed bytes, modes, state, reinstall, and foreign-content preservation after uninstall.
-
 ## Profiles
 
 - `default`: all plugins;
@@ -228,7 +223,7 @@ agent-workbench/
 ├── profiles/                  # package and target selections
 ├── plugins/                   # locally owned or curated packages
 ├── vendor/                    # pinned upstream sources
-└── scripts/                   # parity gates, packager, and the default CLI wrapper
+└── scripts/                   # default CLI wrapper
 ```
 
 ## Adding a plugin
