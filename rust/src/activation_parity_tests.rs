@@ -8,8 +8,7 @@ fn differential_public_activation() {
     let base = PathBuf::from(env::var_os("AW_PUBLIC_ACTIVATION_BASE").unwrap());
     let args: Vec<String> =
         serde_json::from_slice(&fs::read(base.join("args.json")).unwrap()).unwrap();
-    let cli =
-        crate::parse_cli(std::iter::once("agent-workbench-rs".to_owned()).chain(args)).unwrap();
+    let cli = crate::parse_cli(std::iter::once("agent-workbench".to_owned()).chain(args)).unwrap();
     let edge = env::var("AW_PUBLIC_ACTIVATION_EDGE").unwrap();
     let mut hit = false;
     let result = crate::activation::run_with(&cli, |boundary| {
@@ -50,8 +49,7 @@ fn inert_native_validation() {
     let base = PathBuf::from(env::var_os("AW_PUBLIC_ACTIVATION_BASE").unwrap());
     let args: Vec<String> =
         serde_json::from_slice(&fs::read(base.join("args.json")).unwrap()).unwrap();
-    let cli =
-        crate::parse_cli(std::iter::once("agent-workbench-rs".to_owned()).chain(args)).unwrap();
+    let cli = crate::parse_cli(std::iter::once("agent-workbench".to_owned()).chain(args)).unwrap();
     let policy = crate::activation::Policy::for_target(cli.target).unwrap();
     let root = fs::canonicalize(&cli.root).unwrap();
     let catalog = crate::decode_catalog(&root.join("catalog/plugins.json")).unwrap();

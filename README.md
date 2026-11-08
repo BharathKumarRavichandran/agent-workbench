@@ -71,7 +71,7 @@ scripts/agent-workbench --profile pstack status --target hermes
 
 Rust is the specification. The F6 catalog IDs `E1`, `E2`, `VAL-GIT-1`, `RENDER-GIT-1`, `UPDATE-GIT-1`, `UPDATE-CONFIG-1`, `PYTHON-TO-RUST-UPGRADE`, `REVERSE-STATUS-NOT-SUPPORTED`, and `REJECT-V4-AS-V3` remain historical documentation only. They are not re-proven by paired Python/Rust processes.
 
-Exact command, failure boundary, stdout/stderr class, exit status, and state/config effect for each historical row: [`rust/SECTION_F_CONTRACT.md`](rust/SECTION_F_CONTRACT.md) (F6) and [`rust/PARITY_EXCEPTIONS.md`](rust/PARITY_EXCEPTIONS.md).
+Exact command, failure boundary, stdout/stderr class, exit status, and state/config effect for each historical row: [`docs/SECTION_F_CONTRACT.md`](docs/SECTION_F_CONTRACT.md) (F6) and [`docs/PARITY_EXCEPTIONS.md`](docs/PARITY_EXCEPTIONS.md).
 
 ## Commands
 
@@ -218,7 +218,8 @@ The lock report records source revisions, plugin versions, artifact roots, and p
 
 ```text
 agent-workbench/
-├── rust/                      # default CLI crate
+├── rust/                      # CLI crate
+├── docs/                      # historical rewrite contracts
 ├── catalog/                   # canonical catalog, schema, lock report
 ├── profiles/                  # package and target selections
 ├── plugins/                   # locally owned or curated packages

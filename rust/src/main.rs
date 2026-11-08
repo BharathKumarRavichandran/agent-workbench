@@ -1,4 +1,4 @@
-use agent_workbench_rs::execute;
+use agent_workbench::execute;
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 

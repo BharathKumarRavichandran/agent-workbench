@@ -1,4 +1,4 @@
-use agent_workbench_rs::{decode_catalog, decode_profile};
+use agent_workbench::{decode_catalog, decode_profile};
 use std::fs;
 use tempfile::TempDir;
 
